@@ -92,16 +92,6 @@ func (b *Bot) handleOrderUpdate(event *types.OrderEvent) {
 	if err := b.redis.PublishOrderUpdate(b.ctx, event); err != nil {
 		log.Printf("Failed to publish order update: %v", err)
 	}
-
-	// Save to MongoDB
-	if err := b.mongo.SaveOrderUpdate(b.ctx, event); err != nil {
-		log.Printf("Failed to save order update: %v", err)
-	}
-
-	// Handle filled orders
-	if event.Status == "FILLED" {
-		b.handleFilledOrder(event)
-	}
 }
 
 // handleFill processes trade executions
@@ -191,11 +181,6 @@ func (b *Bot) reconnectUserStream() {
 	log.Printf("❌ Failed to reconnect user stream after %d attempts", maxRetries)
 	log.Println("⚠️  Bot will continue without real-time updates")
 	b.streamConnected = false
-}
-
-// handleFilledOrder processes fully filled orders
-func (b *Bot) handleFilledOrder(event *types.OrderEvent) {
-	log.Printf("Order filled: %s %s", event.OrderID, event.Side)
 }
 
 // checkForCompletedDeals checks if a fill completes a grid deal
