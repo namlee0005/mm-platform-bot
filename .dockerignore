@@ -1,0 +1,41 @@
+# Git
+.git
+.gitignore
+
+# IDEs
+.idea
+.vscode
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Temporary files
+tmp/
+temp/
+*.log
+
+# Docker
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# Documentation
+README.md
+*.md
+
+# CI/CD
+.github
+.gitlab-ci.yml
