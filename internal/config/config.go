@@ -1,47 +1,54 @@
 package config
 
 import (
-	"encoding/json"
+	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
 	"strconv"
+	"time"
 
 	"github.com/joho/godotenv"
+	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/bson/primitive"
+	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
 type TradingConfig struct {
-	Symbol     string `json:"symbol"`
-	BaseAsset  string `json:"base_asset"`
-	QuoteAsset string `json:"quote_asset"`
+	Type       string `json:"type" bson:"type"`
+	Symbol     string `json:"symbol" bson:"symbol"`
+	BaseAsset  string `json:"base_asset" bson:"base_asset"`
+	QuoteAsset string `json:"quote_asset" bson:"quote_asset"`
 
 	// Inventory target
-	TargetRatio float64 `json:"target_ratio"` // Target inventory ratio (0.5 = 50/50)
+	TargetRatio float64 `json:"target_ratio" bson:"target_ratio"` // Target inventory ratio (0.5 = 50/50)
 
 	// Ladder configuration
-	OffsetsBps    []int     `json:"offsets_bps"`     // Offsets from mid in basis points (must be increasing)
-	SizeMult      []float64 `json:"size_mult"`       // Size multipliers for each level (must be non-increasing)
-	QuotePerOrder float64   `json:"quote_per_order"` // Base quote amount per order
+	OffsetsBps    []int     `json:"offsets_bps" bson:"offsets_bps"`         // Offsets from mid in basis points (must be increasing)
+	SizeMult      []float64 `json:"size_mult" bson:"size_mult"`             // Size multipliers for each level (must be non-increasing)
+	QuotePerOrder float64   `json:"quote_per_order" bson:"quote_per_order"` // Base quote amount per order
 
 	// Skew parameters
-	Deadzone           float64 `json:"deadzone"`                // Inventory deviation deadzone (no skew if within)
-	K                  float64 `json:"k"`                       // Skew sensitivity factor
-	MaxSkewBps         int     `json:"max_skew_bps"`            // Maximum skew in basis points
-	MinOffsetBps       int     `json:"min_offset_bps"`          // Minimum offset from mid in basis points
-	DSkewMaxBpsPerTick int     `json:"d_skew_max_bps_per_tick"` // Maximum skew change per tick (rate limit)
+	Deadzone           float64 `json:"deadzone" bson:"deadzone"`                               // Inventory deviation deadzone (no skew if within)
+	K                  float64 `json:"k" bson:"k"`                                             // Skew sensitivity factor
+	MaxSkewBps         int     `json:"max_skew_bps" bson:"max_skew_bps"`                       // Maximum skew in basis points
+	MinOffsetBps       int     `json:"min_offset_bps" bson:"min_offset_bps"`                   // Minimum offset from mid in basis points
+	DSkewMaxBpsPerTick int     `json:"d_skew_max_bps_per_tick" bson:"d_skew_max_bps_per_tick"` // Maximum skew change per tick (rate limit)
 
 	// Replace thresholds
-	ReplaceThresholds ReplaceThresholds `json:"replace_thresholds"`
+	ReplaceThresholds ReplaceThresholds `json:"replace_thresholds" bson:"replace_thresholds"`
 
 	// Risk thresholds
-	RiskThresholds RiskThresholds `json:"risk_thresholds"`
+	RiskThresholds RiskThresholds `json:"risk_thresholds" bson:"risk_thresholds"`
 
 	// Risk actions
-	RiskActions RiskActions `json:"risk_actions"`
+	RiskActions RiskActions `json:"risk_actions" bson:"risk_actions"`
 
 	// Refresh configuration
-	RefreshBaseSec   int     `json:"refresh_base_sec"`   // Base refresh interval in seconds
-	RefreshJitterPct float64 `json:"refresh_jitter_pct"` // Refresh jitter percentage (e.g., 0.15 = ±15%)
+	RefreshBaseSec   int     `json:"refresh_base_sec" bson:"refresh_base_sec"`     // Base refresh interval in seconds
+	RefreshJitterPct float64 `json:"refresh_jitter_pct" bson:"refresh_jitter_pct"` // Refresh jitter percentage (e.g., 0.15 = ±15%)
 }
 
 type Config struct {
@@ -70,9 +77,9 @@ type Config struct {
 	LogLevel string
 }
 
-// Load reads configuration from environment variables
+// Load reads configuration from environment variables and MongoDB
 // Automatically loads from .env file if it exists
-func Load(path string) (*Config, error) {
+func Load() (*Config, error) {
 	// Load .env file if it exists (optional)
 	if err := godotenv.Load(); err != nil {
 		log.Println("No .env file found, using system environment variables")
@@ -80,50 +87,137 @@ func Load(path string) (*Config, error) {
 		log.Println("Loaded configuration from .env file")
 	}
 
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read config file: %w", err)
-	}
-	var tradingConfig TradingConfig
-	if err := json.Unmarshal(data, &tradingConfig); err != nil {
-		return nil, fmt.Errorf("failed to parse config JSON: %w", err)
+	userExchangeKeyID := getEnv("USER_EXCHANGE_KEY_ID", "")
+	if userExchangeKeyID == "" {
+		return nil, errors.New("USER_EXCHANGE_KEY_ID is required")
 	}
 
-	if err := tradingConfig.Validate(); err != nil {
-		return nil, fmt.Errorf("invalid config: %w", err)
+	mongoURI := getEnv("MONGO_URI", "mongodb://localhost:27017")
+	mongoDB := getEnv("MONGO_DB", "mm-platform")
+
+	// Query MongoDB for user exchange key and exchange config
+	userExchangeKey, exchange, err := loadUserExchangeKeyWithExchange(mongoURI, mongoDB, userExchangeKeyID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load config from MongoDB: %w", err)
 	}
+
+	// Check if key is active
+	if !userExchangeKey.IsActive {
+		return nil, errors.New("user exchange key is not active")
+	}
+
+	if userExchangeKey.IsDeleted {
+		return nil, errors.New("user exchange key is deleted")
+	}
+
+	// Decrypt API keys
+	masterKey := getEnv("APP_MASTER_KEY", "")
+	if masterKey == "" {
+		return nil, errors.New("APP_MASTER_KEY is required")
+	}
+
+	// Step 1: Decrypt user secret using master key
+	userSecret, err := DecryptUserSecret(userExchangeKey.EncryptedUserSecret, masterKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decrypt user secret: %w", err)
+	}
+
+	// Step 2: Decrypt API key using user secret
+	apiKey, err := DecryptPrivateKey(userExchangeKey.APIKey, userSecret)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decrypt API key: %w", err)
+	}
+
+	// Step 3: Decrypt API secret using user secret
+	apiSecret, err := DecryptPrivateKey(userExchangeKey.APISecret, userSecret)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decrypt API secret: %w", err)
+	}
+
+	log.Printf("Successfully decrypted API credentials for key: %s", userExchangeKey.KeyName)
 
 	cfg := &Config{
-		// Exchange
-		ExchangeAPIKey:    getEnv("EXCHANGE_API_KEY", ""),
-		ExchangeAPISecret: getEnv("EXCHANGE_API_SECRET", ""),
-		ExchangeBaseURL:   getEnv("EXCHANGE_BASE_URL", "https://api.mexc.com"),
+		// Exchange settings - decrypted
+		ExchangeAPIKey:    apiKey,
+		ExchangeAPISecret: apiSecret,
+		ExchangeBaseURL:   exchange.BaseURL,
 
-		// Trading
-		TradingConfig: tradingConfig,
+		// Trading settings from MongoDB
+		TradingConfig: userExchangeKey.Config,
 
-		// Redis
+		// Redis settings from env
 		RedisAddr:     getEnv("REDIS_ADDR", "localhost:6379"),
 		RedisPassword: getEnv("REDIS_PASSWORD", ""),
 		RedisDB:       getEnvInt("REDIS_DB", 0),
 
-		// MongoDB
-		MongoURI:        getEnv("MONGO_URI", "mongodb://localhost:27017"),
-		MongoDB:         getEnv("MONGO_DB", "bot_engine"),
-		MongoCollection: getEnv("MONGO_COLLECTION", "fills"),
+		// MongoDB settings
+		MongoURI: mongoURI,
+		MongoDB:  mongoDB,
 
-		// HTTP
+		// HTTP server settings
 		HTTPPort: getEnvInt("HTTP_PORT", 8080),
 
-		// Operational
+		// Operational settings
 		LogLevel: getEnv("LOG_LEVEL", "info"),
 	}
 
-	if err := cfg.Validate(); err != nil {
-		return nil, fmt.Errorf("config validation failed: %w", err)
+	return cfg, nil
+}
+
+// loadUserExchangeKeyWithExchange queries MongoDB to get the user exchange key and exchange configuration
+func loadUserExchangeKeyWithExchange(mongoURI, dbName, keyID string) (*UserExchangeKey, *Exchange, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// Connect to MongoDB
+	client, err := mongo.Connect(ctx, options.Client().ApplyURI(mongoURI))
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to connect to MongoDB: %w", err)
+	}
+	defer func() {
+		if err := client.Disconnect(ctx); err != nil {
+			log.Printf("Error disconnecting from MongoDB: %v", err)
+		}
+	}()
+
+	// Ping to verify connection
+	if err := client.Ping(ctx, nil); err != nil {
+		return nil, nil, fmt.Errorf("failed to ping MongoDB: %w", err)
 	}
 
-	return cfg, nil
+	db := client.Database(dbName)
+
+	// Parse the ObjectID
+	objectID, err := primitive.ObjectIDFromHex(keyID)
+	if err != nil {
+		return nil, nil, fmt.Errorf("invalid ObjectID format: %w", err)
+	}
+
+	// Query user_exchange_keys by _id
+	var userExchangeKey UserExchangeKey
+	err = db.Collection("user_exchange_keys").FindOne(ctx, bson.M{"_id": objectID}).Decode(&userExchangeKey)
+	if err != nil {
+		if errors.Is(err, mongo.ErrNoDocuments) {
+			return nil, nil, fmt.Errorf("user exchange key not found with ID: %s", keyID)
+		}
+		return nil, nil, fmt.Errorf("failed to query user exchange key: %w", err)
+	}
+
+	log.Printf("Loaded user exchange key: %s (keyName: %s)", keyID, userExchangeKey.KeyName)
+
+	// Query exchanges by exchangeId
+	var exchange Exchange
+	err = db.Collection("exchanges").FindOne(ctx, bson.M{"_id": userExchangeKey.ExchangeID}).Decode(&exchange)
+	if err != nil {
+		if errors.Is(err, mongo.ErrNoDocuments) {
+			return nil, nil, fmt.Errorf("exchange not found with ID: %s", userExchangeKey.ExchangeID.Hex())
+		}
+		return nil, nil, fmt.Errorf("failed to query exchange: %w", err)
+	}
+
+	log.Printf("Loaded exchange: %s (baseUrl: %s)", exchange.Name, exchange.BaseURL)
+
+	return &userExchangeKey, &exchange, nil
 }
 
 // Validate checks if required configuration values are set
@@ -214,23 +308,54 @@ func getEnvFloat(key string, defaultValue float64) float64 {
 }
 
 type ReplaceThresholds struct {
-	RepriceThresholdBps int     `json:"reprice_threshold_bps"` // Reprice if mid moves by this many bps
-	InvDevThreshold     float64 `json:"inv_dev_threshold"`     // Replace if inventory deviation changes by this amount
-	MaxOrderAgeSec      int     `json:"max_order_age_sec"`     // Maximum order age before replacement
+	RepriceThresholdBps int     `json:"reprice_threshold_bps" bson:"reprice_threshold_bps"` // Reprice if mid moves by this many bps
+	InvDevThreshold     float64 `json:"inv_dev_threshold" bson:"inv_dev_threshold"`         // Replace if inventory deviation changes by this amount
+	MaxOrderAgeSec      int     `json:"max_order_age_sec" bson:"max_order_age_sec"`         // Maximum order age before replacement
 }
 
 // RiskThresholds defines conditions that trigger RISK mode
 type RiskThresholds struct {
-	TtfFastSec       float64 `json:"ttf_fast_sec"`        // Fast time-to-fill threshold (seconds)
-	FillSpikePerMin  float64 `json:"fill_spike_per_min"`  // Fill spike threshold (fills per minute)
-	ImbHigh          float64 `json:"imb_high"`            // High imbalance threshold
-	ImbLow           float64 `json:"imb_low"`             // Low imbalance threshold
-	DriftFastPerHour float64 `json:"drift_fast_per_hour"` // Fast drift threshold (per hour)
+	TtfFastSec       float64 `json:"ttf_fast_sec" bson:"ttf_fast_sec"`               // Fast time-to-fill threshold (seconds)
+	FillSpikePerMin  float64 `json:"fill_spike_per_min" bson:"fill_spike_per_min"`   // Fill spike threshold (fills per minute)
+	ImbHigh          float64 `json:"imb_high" bson:"imb_high"`                       // High imbalance threshold
+	ImbLow           float64 `json:"imb_low" bson:"imb_low"`                         // Low imbalance threshold
+	DriftFastPerHour float64 `json:"drift_fast_per_hour" bson:"drift_fast_per_hour"` // Fast drift threshold (per hour)
 }
 
 // RiskActions defines how to modify behavior in RISK mode
 type RiskActions struct {
-	RiskSpreadMult  float64 `json:"risk_spread_mult"`  // Multiply spreads by this factor in RISK mode
-	RiskSizeMult    float64 `json:"risk_size_mult"`    // Multiply sizes by this factor in RISK mode
-	RiskRefreshMult float64 `json:"risk_refresh_mult"` // Multiply refresh interval by this factor in RISK mode
+	RiskSpreadMult  float64 `json:"risk_spread_mult" bson:"risk_spread_mult"`   // Multiply spreads by this factor in RISK mode
+	RiskSizeMult    float64 `json:"risk_size_mult" bson:"risk_size_mult"`       // Multiply sizes by this factor in RISK mode
+	RiskRefreshMult float64 `json:"risk_refresh_mult" bson:"risk_refresh_mult"` // Multiply refresh interval by this factor in RISK mode
+}
+
+// UserExchangeKey represents the MongoDB document structure for user_exchange_keys collection
+type UserExchangeKey struct {
+	ID                  primitive.ObjectID  `bson:"_id,omitempty"`
+	UserID              string              `bson:"userId"`
+	ExchangeID          primitive.ObjectID  `bson:"exchangeId"`
+	PairID              primitive.ObjectID  `bson:"pairId"`
+	EncryptedUserSecret EncryptedUserSecret `bson:"encryptedUserSecret"`
+	KeyName             string              `bson:"keyName"`
+	APIKey              EncryptedData       `bson:"apiKey"`
+	APISecret           EncryptedData       `bson:"apiSecret"`
+	Passphrase          EncryptedData       `bson:"passphrase"`
+	EnableSpot          bool                `bson:"enableSpot"`
+	EnableFuture        bool                `bson:"enableFuture"`
+	IsDeleted           bool                `bson:"isDeleted"`
+	IsActive            bool                `bson:"isActive"`
+	IsRunning           bool                `bson:"isRunning"`
+	Config              TradingConfig       `bson:"config"`
+	CreatedAt           time.Time           `bson:"createdAt"`
+	UpdatedAt           time.Time           `bson:"updatedAt"`
+}
+
+// Exchange represents the MongoDB document structure for exchanges collection
+type Exchange struct {
+	ID        primitive.ObjectID `bson:"_id,omitempty"`
+	Name      string             `bson:"name"`
+	BaseURL   string             `bson:"baseUrl"`
+	IsDeleted bool               `bson:"isDeleted"`
+	CreatedAt time.Time          `bson:"createdAt"`
+	UpdatedAt time.Time          `bson:"updatedAt"`
 }
