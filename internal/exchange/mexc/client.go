@@ -98,7 +98,6 @@ func (c *Client) sign(queryString string) string {
 // doRequest performs an authenticated HTTP request
 func (c *Client) doRequest(ctx context.Context, method, endpoint string, params url.Values, sign bool) ([]byte, error) {
 	reqURL := c.baseURL + endpoint
-
 	if sign {
 		// Add timestamp
 		timestamp := strconv.FormatInt(time.Now().UnixMilli(), 10)

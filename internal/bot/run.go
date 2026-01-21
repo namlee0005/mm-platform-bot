@@ -75,6 +75,29 @@ func (b *Bot) run(ctx context.Context) error {
 	// Evaluate and get plan
 	plan := b.evaluateDN(*marketData, *balState, metrics)
 
+	// Debug: Show plan details
+	debugMid := (marketData.BestBid + marketData.BestAsk) / 2
+	debugBaseValue := (balState.BaseFree + balState.BaseLocked) * debugMid
+	debugQuoteValue := balState.QuoteFree + balState.QuoteLocked
+	debugTotalValue := debugBaseValue + debugQuoteValue
+	debugInvRatio := debugBaseValue / debugTotalValue
+	debugInvDev := debugInvRatio - b.cfg.TradingConfig.TargetRatio
+
+	fmt.Printf("\n========== PLAN DEBUG ==========\n")
+	fmt.Printf("k=%.2f, max_skew_bps=%d, min_offset_bps=%d, d_skew_max_bps_per_tick=%d\n", b.cfg.TradingConfig.K, b.cfg.TradingConfig.MaxSkewBps, b.cfg.TradingConfig.MinOffsetBps, b.cfg.TradingConfig.DSkewMaxBpsPerTick)
+	fmt.Printf("Market: BestBid=%.6f, BestAsk=%.6f, Mid=%.6f\n", marketData.BestBid, marketData.BestAsk, debugMid)
+	fmt.Printf("Balance: BaseFree=%.2f, QuoteFree=%.2f\n", balState.BaseFree, balState.QuoteFree)
+	fmt.Printf("Inventory: BaseValue=%.2f, QuoteValue=%.2f, Total=%.2f\n", debugBaseValue, debugQuoteValue, debugTotalValue)
+	fmt.Printf("InvRatio=%.4f (target=%.2f), InvDev=%.4f\n", debugInvRatio, b.cfg.TradingConfig.TargetRatio, debugInvDev)
+	fmt.Printf("Skew: LastSkewBps=%.2f\n", b.state.LastSkewBps)
+	fmt.Printf("Plan: State=%s, Action=%s, Reason=%s\n", plan.State, plan.Action, plan.Reason)
+	fmt.Printf("Orders (%d):\n", len(plan.Orders))
+	for i, o := range plan.Orders {
+		fmt.Printf("  [%d] %s: Price=%.6f, Qty=%.2f, Notional=%.2f, Tag=%s\n",
+			i, o.Side, o.Price, o.Qty, o.Price*o.Qty, o.Tag)
+	}
+	fmt.Printf("=================================\n\n")
+
 	// Execute the plan
 	if err := b.executePlan(ctx, plan, marketData); err != nil {
 		return fmt.Errorf("failed to execute plan: %w", err)
@@ -308,7 +331,10 @@ func (b *Bot) computeSkew(invDev float64) float64 {
 	// Clamp to max skew
 	skewBps := utils.Clamp(rawSkewBps, float64(-b.cfg.TradingConfig.MaxSkewBps), float64(b.cfg.TradingConfig.MaxSkewBps))
 
-	// Apply rate limit (max change per tick)
+	// Note: Rate limiting disabled to allow immediate skew adjustment
+	// This ensures the bot reacts quickly to inventory imbalance
+	// If you want smoother transitions, uncomment the rate limiting below:
+	//
 	maxChange := float64(b.cfg.TradingConfig.DSkewMaxBpsPerTick)
 	if utils.Abs(skewBps-b.state.LastSkewBps) > maxChange {
 		if skewBps > b.state.LastSkewBps {
@@ -335,8 +361,20 @@ func (b *Bot) buildLadder(
 	// Generate unique batch ID using timestamp + random suffix
 	batchID := fmt.Sprintf("%d_%04d", timestamp, rand.Intn(10000))
 
+	// Size skew disabled - using price skew only for inventory rebalancing
+	// The idea is to place BID orders far from mid (unlikely to fill) and ASK orders close to mid (easy to fill)
+	// This achieves rebalancing without reducing order sizes
+	fmt.Printf("Price Skew: skewBps=%.2f (no size skew applied)\n", skewBps)
+
 	for i, baseOffset := range offsets {
-		// Compute offsets with skew
+		// Compute offsets with skew (ADDITIVE formula)
+		// When skewBps > 0 (too much base/AMI):
+		//   - BID offset = baseOffset + skewBps (pushed far from mid)
+		//   - ASK offset = baseOffset - skewBps (pulled close to mid, clamped to min)
+		// When skewBps < 0 (too much quote/USDT):
+		//   - BID offset = baseOffset + skewBps (pulled close to mid, skewBps is negative)
+		//   - ASK offset = baseOffset - skewBps (pushed far from mid, skewBps is negative so this adds)
+
 		bidOffsetBps := float64(baseOffset) + skewBps
 		askOffsetBps := float64(baseOffset) - skewBps
 
@@ -356,7 +394,7 @@ func (b *Bot) buildLadder(
 			}
 		}
 
-		// Compute quantities
+		// Compute quantities (no size skew - using price skew only)
 		quoteAmount := b.cfg.TradingConfig.QuotePerOrder * sizeMult[i]
 		bidQty := utils.FloorToStep(quoteAmount/bidPrice, snap.StepSize)
 		askQty := utils.FloorToStep(quoteAmount/askPrice, snap.StepSize)
