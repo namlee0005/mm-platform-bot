@@ -52,7 +52,7 @@ func NewBot(cfg *config.Config) (*Bot, error) {
 	}
 
 	// Create MongoDB store
-	mongoStore, err := store.NewMongoStore(cfg.MongoURI, cfg.MongoDB, cfg.MongoCollection)
+	mongoStore, err := store.NewMongoStore(cfg.MongoURI, cfg.MongoDB)
 	if err != nil {
 		_ = redisStore.Close()
 		return nil, fmt.Errorf("failed to create mongo store: %w", err)
@@ -123,6 +123,14 @@ func (b *Bot) Start(ctx context.Context) error {
 		return fmt.Errorf("failed to start user stream: %w", err)
 	}
 
+	// Initialize metrics aggregator and load fill history
+	windowMs := int64(5 * 60 * 1000) // 5 minutes window
+	b.metricsAgg = NewMetricsAggregator(windowMs)
+	if err := b.loadFillHistory(b.ctx, windowMs); err != nil {
+		log.Printf("WARNING: Failed to load fill history: %v", err)
+		// Continue despite error - metrics will start fresh
+	}
+
 	// Start main trading loop in goroutine
 	go b.mainLoop()
 
@@ -174,6 +182,31 @@ func (b *Bot) IsRunning() bool {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 	return b.running
+}
+
+// loadFillHistory loads fill history from MongoDB to warm up metrics
+func (b *Bot) loadFillHistory(ctx context.Context, windowMs int64) error {
+	symbol := b.cfg.TradingConfig.Symbol
+	sinceTime := time.Now().Add(-time.Duration(windowMs) * time.Millisecond)
+
+	log.Printf("Loading fill history for %s since %s...", symbol, sinceTime.Format("15:04:05"))
+
+	fills, err := b.mongo.GetFillsInWindow(ctx, symbol, sinceTime)
+	if err != nil {
+		return fmt.Errorf("failed to get fills from MongoDB: %w", err)
+	}
+
+	// Add fills to metrics aggregator
+	for _, fill := range fills {
+		side := types.OrderSideBuy
+		if fill.Side == "SELL" {
+			side = types.OrderSideSell
+		}
+		b.metricsAgg.RecordFill(side, fill.Price, fill.Quantity, fill.Timestamp.UnixMilli())
+	}
+
+	log.Printf("Loaded %d fills from history into metrics aggregator", len(fills))
+	return nil
 }
 
 // mainLoop runs the main trading loop

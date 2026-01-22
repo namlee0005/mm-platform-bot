@@ -63,7 +63,7 @@ func (m *MetricsAggregator) RecordTimeToFill(seconds float64) {
 }
 
 // ComputeMetrics computes the rolling metrics at the given timestamp
-func (m *MetricsAggregator) ComputeMetrics(nowMs int64, lastInvRatio, prevInvRatio float64, hourMs int64) types.RollingMetrics {
+func (m *MetricsAggregator) ComputeMetrics(nowMs int64, lastInvRatio, prevInvRatio float64) types.RollingMetrics {
 	// Clean old data outside the window
 	m.cleanOldData(nowMs)
 
@@ -95,13 +95,12 @@ func (m *MetricsAggregator) ComputeMetrics(nowMs int64, lastInvRatio, prevInvRat
 		ttfP50 = computeMedian(m.ttfSamples)
 	}
 
-	// Compute inventory drift per hour
+	// Compute inventory drift per hour (normalized to hourly rate)
+	const hourMs = int64(3600000) // 1 hour in milliseconds
 	invDrift := 0.0
-	if hourMs > 0 {
-		windowHours := float64(m.windowMs) / float64(hourMs)
-		if windowHours > utils.Epsilon {
-			invDrift = (lastInvRatio - prevInvRatio) / windowHours
-		}
+	windowHours := float64(m.windowMs) / float64(hourMs)
+	if windowHours > utils.Epsilon {
+		invDrift = (lastInvRatio - prevInvRatio) / windowHours
 	}
 
 	// Compute cancel rate

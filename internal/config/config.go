@@ -66,9 +66,8 @@ type Config struct {
 	RedisDB       int
 
 	// MongoDB settings
-	MongoURI        string
-	MongoDB         string
-	MongoCollection string
+	MongoURI string
+	MongoDB  string
 
 	// HTTP server settings
 	HTTPPort int

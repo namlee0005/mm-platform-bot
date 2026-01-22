@@ -3,6 +3,7 @@ package bot
 import (
 	"context"
 	"fmt"
+	"log"
 	"math"
 	"math/rand"
 	"mm-platform-engine/internal/exchange"
@@ -69,7 +70,6 @@ func (b *Bot) run(ctx context.Context) error {
 		marketData.NowUnixMs,
 		currentInvRatio,
 		prevInvRatio,
-		3600000, // 1 hour in milliseconds
 	)
 
 	// Evaluate and get plan
@@ -571,13 +571,13 @@ func (b *Bot) executePlan(ctx context.Context, plan types.ReplacePlan, marketDat
 	symbol := b.cfg.TradingConfig.Symbol
 
 	// Log the plan decision
-	fmt.Printf("[%s] State=%s Action=%s Reason=%s Orders=%d\n",
+	log.Printf("[%s] State=%s Action=%s Reason=%s Orders=%d",
 		symbol, plan.State, plan.Action, plan.Reason, len(plan.Orders))
 
 	switch plan.Action {
 	case types.ActionCancelAll:
 		// Cancel all orders and stop
-		fmt.Printf("[%s] Cancelling all orders (paused state)\n", symbol)
+		log.Printf("[%s] Cancelling all orders (paused state)", symbol)
 		if err := b.exchange.CancelAllOrders(ctx, symbol); err != nil {
 			return fmt.Errorf("failed to cancel all orders: %w", err)
 		}
@@ -585,20 +585,20 @@ func (b *Bot) executePlan(ctx context.Context, plan types.ReplacePlan, marketDat
 
 	case types.ActionKeep:
 		// Keep existing orders, do nothing
-		fmt.Printf("[%s] Keeping existing orders\n", symbol)
+		log.Printf("[%s] Keeping existing orders", symbol)
 		return nil
 
 	case types.ActionReplace:
 		// Cancel all existing orders
-		fmt.Printf("[%s] Replacing orders: cancelling old orders\n", symbol)
+		log.Printf("[%s] Replacing orders: cancelling old orders", symbol)
 		if err := b.exchange.CancelAllOrders(ctx, symbol); err != nil {
 			return fmt.Errorf("failed to cancel orders before replace: %w", err)
 		}
 
 		// Clear all orders from Redis
-		fmt.Printf("[%s] Clearing orders from Redis\n", symbol)
+		log.Printf("[%s] Clearing orders from Redis", symbol)
 		if err := b.redis.ClearAllOrders(ctx, symbol); err != nil {
-			fmt.Printf("[%s] WARNING: Failed to clear orders from Redis: %v\n", symbol, err)
+			log.Printf("[%s] WARNING: Failed to clear orders from Redis: %v", symbol, err)
 			// Continue despite Redis error
 		}
 
@@ -621,7 +621,7 @@ func (b *Bot) executePlan(ctx context.Context, plan types.ReplacePlan, marketDat
 		}
 
 		// Place orders using batch API
-		fmt.Printf("[%s] Placing %d new orders via batch API\n", symbol, len(orderReqs))
+		log.Printf("[%s] Placing %d new orders via batch API", symbol, len(orderReqs))
 		batchResp, err := b.exchange.BatchPlaceOrders(ctx, orderReqs)
 		if err != nil {
 			return fmt.Errorf("failed to place batch orders: %w", err)
@@ -632,7 +632,7 @@ func (b *Bot) executePlan(ctx context.Context, plan types.ReplacePlan, marketDat
 		failedCount := len(batchResp.Errors)
 
 		for _, order := range batchResp.Orders {
-			fmt.Printf("[%s] Placed order %s: %s %.8f @ %.8f\n",
+			log.Printf("[%s] Placed order %s: %s %.8f @ %.8f",
 				symbol, order.OrderID, order.Side, order.Quantity, order.Price)
 
 			// Note: Order will be saved to Redis automatically via WebSocket handler
@@ -640,10 +640,10 @@ func (b *Bot) executePlan(ctx context.Context, plan types.ReplacePlan, marketDat
 		}
 
 		for _, errMsg := range batchResp.Errors {
-			fmt.Printf("[%s] %s\n", symbol, errMsg)
+			log.Printf("[%s] %s", symbol, errMsg)
 		}
 
-		fmt.Printf("[%s] Batch order complete: %d placed, %d failed\n", symbol, placedCount, failedCount)
+		log.Printf("[%s] Batch order complete: %d placed, %d failed", symbol, placedCount, failedCount)
 
 		if failedCount > 0 && placedCount == 0 {
 			return fmt.Errorf("failed to place any orders: %d failures", failedCount)

@@ -101,6 +101,27 @@ func (b *Bot) handleFill(event *types.FillEvent) {
 	log.Printf("✅ [USER STREAM] FILL: %s %s %.8f @ %.8f (TradeID: %s, OrderID: %s)",
 		event.Symbol, event.Side, event.Quantity, event.Price, event.TradeID, event.OrderID)
 
+	// Record fill in metrics aggregator
+	if b.metricsAgg != nil {
+		side := types.OrderSideBuy
+		if event.Side == "SELL" {
+			side = types.OrderSideSell
+		}
+		fillTimestamp := event.Timestamp.UnixMilli()
+		b.metricsAgg.RecordFill(side, event.Price, event.Quantity, fillTimestamp)
+
+		// Calculate TTF (time-to-fill) if we have order creation time
+		orderInfo, err := b.redis.GetOrder(b.ctx, event.Symbol, event.OrderID)
+		if err == nil && orderInfo != nil && orderInfo.CreatedAt > 0 {
+			ttfMs := fillTimestamp - orderInfo.CreatedAt
+			ttfSec := float64(ttfMs) / 1000.0
+			if ttfSec > 0 && ttfSec < 3600 { // Sanity check: TTF < 1 hour
+				b.metricsAgg.RecordTimeToFill(ttfSec)
+				log.Printf("   ⏱️  TTF: %.2f seconds", ttfSec)
+			}
+		}
+	}
+
 	// Publish to Redis
 	if err := b.redis.PublishFill(b.ctx, event); err != nil {
 		log.Printf("Failed to publish fill: %v", err)

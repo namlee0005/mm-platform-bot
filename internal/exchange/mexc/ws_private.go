@@ -139,28 +139,6 @@ func (ws *WSConnection) Start(ctx context.Context) error {
 
 // handleMessage processes incoming WebSocket messages
 func (ws *WSConnection) handleMessage(message []byte) error {
-	// LOG RAW MESSAGE for debugging
-	log.Printf("🔍 [RAW MESSAGE] Length: %d bytes", len(message))
-
-	// Check if message is printable (likely JSON) or binary (protobuf)
-	isPrintable := true
-	for _, b := range message {
-		if b < 32 && b != '\n' && b != '\r' && b != '\t' {
-			isPrintable = false
-			break
-		}
-	}
-
-	if isPrintable {
-		log.Printf("📄 [JSON?] %s", string(message))
-	} else {
-		previewLen := 32
-		if len(message) < previewLen {
-			previewLen = len(message)
-		}
-		log.Printf("📦 [BINARY/PROTOBUF] First %d bytes (hex): %x", previewLen, message[:previewLen])
-	}
-
 	// Try to parse as JSON first (for subscription responses)
 	var baseMsg map[string]interface{}
 	if err := json.Unmarshal(message, &baseMsg); err == nil {
@@ -170,46 +148,6 @@ func (ws *WSConnection) handleMessage(message []byte) error {
 
 	// This is a protobuf message - parse it
 	return ws.handleProtobufMessage(message)
-
-	// Check if this is a subscription response
-	if method, ok := baseMsg["msg"].(string); ok {
-		if method == "SUBSCRIPTION" {
-			log.Printf("✓ Subscription confirmed: %s", string(message))
-			return nil
-		}
-	}
-
-	// Check for error messages
-	if code, ok := baseMsg["code"].(float64); ok {
-		if code != 0 {
-			log.Printf("❌ WebSocket error response: %s", string(message))
-			return fmt.Errorf("websocket error: %s", string(message))
-		}
-		// code == 0 means success response
-		log.Printf("✓ Success response: %s", string(message))
-		return nil
-	}
-
-	eventType, ok := baseMsg["e"].(string)
-	if !ok {
-		// Not a user stream event, might be a system message
-		log.Printf("📨 Received message (not an event): %s", string(message))
-		return nil
-	}
-
-	switch eventType {
-	case "outboundAccountPosition":
-		return ws.handleAccountUpdate(message)
-	case "executionReport":
-		return ws.handleOrderUpdate(message)
-	case "trade":
-		// Handle deals/trade events from spot@private.deals.v3.api
-		return ws.handleTradeEvent(message)
-	default:
-		log.Printf("⚠️  Unknown event type: %s, message: %s", eventType, string(message))
-	}
-
-	return nil
 }
 
 // handleAccountUpdate processes account update events
@@ -356,23 +294,22 @@ func (ws *WSConnection) handleTradeEvent(message []byte) error {
 // handleJSONMessage processes JSON messages (subscription responses)
 func (ws *WSConnection) handleJSONMessage(baseMsg map[string]interface{}, message []byte) error {
 	// Check if this is a subscription response
-	if method, ok := baseMsg["msg"].(string); ok {
-		log.Printf("✓ Subscription confirmed: %s", method)
+	if _, ok := baseMsg["msg"].(string); ok {
+		// Subscription confirmed - no need to log
 		return nil
 	}
 
 	// Check for error messages
 	if code, ok := baseMsg["code"].(float64); ok {
 		if code != 0 {
-			log.Printf("❌ WebSocket error response: %s", string(message))
+			log.Printf("WebSocket error: %s", string(message))
 			return fmt.Errorf("websocket error: %s", string(message))
 		}
 		// code == 0 means success response
-		log.Printf("✓ Success response: %s", string(message))
 		return nil
 	}
 
-	log.Printf("📨 Unknown JSON message: %s", string(message))
+	// Unknown JSON message - ignore silently
 	return nil
 }
 
@@ -384,8 +321,6 @@ func (ws *WSConnection) handleProtobufMessage(message []byte) error {
 		return fmt.Errorf("failed to unmarshal protobuf wrapper: %w", err)
 	}
 
-	log.Printf("📦 [PROTOBUF] Channel: %s", wrapper.Channel)
-
 	// Handle based on channel type
 	switch wrapper.Channel {
 	case "spot@private.account.v3.api.pb":
@@ -395,7 +330,7 @@ func (ws *WSConnection) handleProtobufMessage(message []byte) error {
 	case "spot@private.deals.v3.api.pb":
 		return ws.handleProtobufDeal(wrapper)
 	default:
-		log.Printf("⚠️  Unknown channel: %s", wrapper.Channel)
+		// Unknown channel - ignore silently
 		return nil
 	}
 }
