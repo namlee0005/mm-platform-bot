@@ -98,6 +98,7 @@ type Filter struct {
 	FilterType        string `json:"filterType"`
 	BidMultiplierUp   string `json:"bidMultiplierUp,omitempty"`
 	AskMultiplierDown string `json:"askMultiplierDown,omitempty"`
+	MinNotional       string `json:"minNotional,omitempty"`
 }
 
 type Depth struct {

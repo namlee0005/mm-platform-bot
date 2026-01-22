@@ -166,96 +166,104 @@ type OrderInfo struct {
 	Status        string  `json:"status"`
 }
 
-// SaveOrder saves order information to Redis
+// SaveOrder saves order information to Redis List
+// Key format: order:{symbol}
 func (s *RedisStore) SaveOrder(ctx context.Context, order *OrderInfo) error {
-	key := fmt.Sprintf("order:%s:%s", order.Symbol, order.OrderID)
+	key := fmt.Sprintf("order:%s", order.Symbol)
 
 	data, err := json.Marshal(order)
 	if err != nil {
 		return fmt.Errorf("failed to marshal order: %w", err)
 	}
 
-	// Save with 24h expiration (orders shouldn't live that long in MM)
-	if err := s.client.Set(ctx, key, data, 24*time.Hour).Err(); err != nil {
-		return fmt.Errorf("failed to save order: %w", err)
+	// Add to list (RPUSH)
+	if err := s.client.RPush(ctx, key, data).Err(); err != nil {
+		return fmt.Errorf("failed to save order to list: %w", err)
 	}
+
+	// Set expiration on the list key (24h)
+	s.client.Expire(ctx, key, 24*time.Hour)
 
 	return nil
 }
 
-// GetOrder retrieves order information from Redis by orderId
+// GetOrder retrieves order information from Redis List by orderId
 func (s *RedisStore) GetOrder(ctx context.Context, symbol, orderID string) (*OrderInfo, error) {
-	key := fmt.Sprintf("order:%s:%s", symbol, orderID)
+	key := fmt.Sprintf("order:%s", symbol)
 
-	data, err := s.client.Get(ctx, key).Bytes()
-	if err == redis.Nil {
-		return nil, nil // Order not found
-	}
+	// Get all items from list
+	items, err := s.client.LRange(ctx, key, 0, -1).Result()
 	if err != nil {
-		return nil, fmt.Errorf("failed to get order: %w", err)
+		return nil, fmt.Errorf("failed to get orders from list: %w", err)
 	}
 
-	var order OrderInfo
-	if err := json.Unmarshal(data, &order); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal order: %w", err)
+	// Find the order by orderId
+	for _, item := range items {
+		var order OrderInfo
+		if err := json.Unmarshal([]byte(item), &order); err != nil {
+			continue
+		}
+		if order.OrderID == orderID {
+			return &order, nil
+		}
 	}
 
-	return &order, nil
+	return nil, nil // Order not found
 }
 
-// DeleteOrder removes order from Redis by orderId
+// DeleteOrder removes order from Redis List by orderId
 func (s *RedisStore) DeleteOrder(ctx context.Context, symbol, orderID string) error {
-	key := fmt.Sprintf("order:%s:%s", symbol, orderID)
+	key := fmt.Sprintf("order:%s", symbol)
 
-	if err := s.client.Del(ctx, key).Err(); err != nil {
-		return fmt.Errorf("failed to delete order: %w", err)
+	// Get all items to find the one to remove
+	items, err := s.client.LRange(ctx, key, 0, -1).Result()
+	if err != nil {
+		return fmt.Errorf("failed to get orders from list: %w", err)
+	}
+
+	// Find and remove the order
+	for _, item := range items {
+		var order OrderInfo
+		if err := json.Unmarshal([]byte(item), &order); err != nil {
+			continue
+		}
+		if order.OrderID == orderID {
+			// Remove this item from list (LREM removes by value)
+			s.client.LRem(ctx, key, 1, item)
+			break
+		}
 	}
 
 	return nil
 }
 
-// GetAllOrders retrieves all orders for a symbol
+// GetAllOrders retrieves all orders for a symbol from Redis List
 func (s *RedisStore) GetAllOrders(ctx context.Context, symbol string) ([]*OrderInfo, error) {
-	pattern := fmt.Sprintf("order:%s:*", symbol)
+	key := fmt.Sprintf("order:%s", symbol)
 
-	keys, err := s.client.Keys(ctx, pattern).Result()
+	items, err := s.client.LRange(ctx, key, 0, -1).Result()
 	if err != nil {
-		return nil, fmt.Errorf("failed to get order keys: %w", err)
+		return nil, fmt.Errorf("failed to get orders from list: %w", err)
 	}
 
-	orders := make([]*OrderInfo, 0, len(keys))
-	for _, key := range keys {
-		data, err := s.client.Get(ctx, key).Bytes()
-		if err != nil {
-			continue // Skip if error
-		}
-
+	orders := make([]*OrderInfo, 0, len(items))
+	for _, item := range items {
 		var order OrderInfo
-		if err := json.Unmarshal(data, &order); err != nil {
+		if err := json.Unmarshal([]byte(item), &order); err != nil {
 			continue // Skip if unmarshal error
 		}
-
 		orders = append(orders, &order)
 	}
 
 	return orders, nil
 }
 
-// ClearAllOrders deletes all orders for a symbol from Redis
+// ClearAllOrders deletes all orders for a symbol from Redis (deletes the list)
 func (s *RedisStore) ClearAllOrders(ctx context.Context, symbol string) error {
-	pattern := fmt.Sprintf("order:%s:*", symbol)
+	key := fmt.Sprintf("order:%s", symbol)
 
-	keys, err := s.client.Keys(ctx, pattern).Result()
-	if err != nil {
-		return fmt.Errorf("failed to get order keys: %w", err)
-	}
-
-	if len(keys) == 0 {
-		return nil // No orders to clear
-	}
-
-	if err := s.client.Del(ctx, keys...).Err(); err != nil {
-		return fmt.Errorf("failed to delete orders: %w", err)
+	if err := s.client.Del(ctx, key).Err(); err != nil {
+		return fmt.Errorf("failed to delete orders list: %w", err)
 	}
 
 	return nil

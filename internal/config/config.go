@@ -53,6 +53,7 @@ type TradingConfig struct {
 
 type Config struct {
 	// Exchange settings
+	ExchangeName      string // "mexc", "gate", etc.
 	ExchangeAPIKey    string
 	ExchangeAPISecret string
 	ExchangeBaseURL   string
@@ -137,6 +138,7 @@ func Load() (*Config, error) {
 
 	cfg := &Config{
 		// Exchange settings - decrypted
+		ExchangeName:      exchange.Name,
 		ExchangeAPIKey:    apiKey,
 		ExchangeAPISecret: apiSecret,
 		ExchangeBaseURL:   exchange.BaseURL,

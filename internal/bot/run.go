@@ -174,15 +174,20 @@ func (b *Bot) getMarketData(ctx context.Context) (*types.MarketData, error) {
 	}
 
 	var bidMulUp, askMulDown float64
+	var minNotional float64 = 5 // Default fallback
 	for _, f := range sym.Filters {
-		if f.FilterType == "PERCENT_PRICE_BY_SIDE" {
+		switch f.FilterType {
+		case "PERCENT_PRICE_BY_SIDE":
 			bidMulUp, _ = strconv.ParseFloat(f.BidMultiplierUp, 64)
 			askMulDown, _ = strconv.ParseFloat(f.AskMultiplierDown, 64)
-			break
+		case "MIN_NOTIONAL", "NOTIONAL":
+			if f.MinNotional != "" {
+				minNotional, _ = strconv.ParseFloat(f.MinNotional, 64)
+			}
 		}
 	}
 
-	// 4. Derive constraints
+	// Derive constraints
 	tickSize := math.Pow10(-sym.QuoteAssetPrecision)
 	stepSize := math.Pow10(-sym.BaseAssetPrecision)
 
@@ -205,7 +210,7 @@ func (b *Bot) getMarketData(ctx context.Context) (*types.MarketData, error) {
 		StepSize:          stepSize,
 		BidMultiplierUp:   bidMulUp,
 		AskMultiplierDown: askMulDown,
-		MinNotional:       5,
+		MinNotional:       minNotional,
 		NowUnixMs:         exchangeInfo.ServerTime,
 	}, nil
 }

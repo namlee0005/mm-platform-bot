@@ -4,14 +4,17 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strings"
+	"sync"
+	"time"
+
 	"mm-platform-engine/internal/config"
 	"mm-platform-engine/internal/exchange"
+	"mm-platform-engine/internal/exchange/gate"
 	"mm-platform-engine/internal/exchange/mexc"
 	"mm-platform-engine/internal/http"
 	"mm-platform-engine/internal/store"
 	"mm-platform-engine/internal/types"
-	"sync"
-	"time"
 )
 
 // Bot represents the main trading bot
@@ -43,7 +46,22 @@ type Bot struct {
 
 // NewBot New creates a new Bot instance
 func NewBot(cfg *config.Config) (*Bot, error) {
-	mexcClient := mexc.NewClient(cfg.ExchangeAPIKey, cfg.ExchangeAPISecret, cfg.ExchangeBaseURL)
+	// Create exchange client based on exchange name
+	var exchangeClient exchange.Exchange
+	exchangeName := strings.ToLower(cfg.ExchangeName)
+
+	switch exchangeName {
+	case "mexc":
+		exchangeClient = mexc.NewClient(cfg.ExchangeAPIKey, cfg.ExchangeAPISecret, cfg.ExchangeBaseURL)
+		log.Printf("Using MEXC exchange client")
+	case "gate":
+		// Convert symbol to Gate.io format (e.g., "BTCUSDT" -> "BTC_USDT")
+		gateSymbol := convertToGateSymbol(cfg.TradingConfig.Symbol)
+		exchangeClient = gate.NewClient(cfg.ExchangeAPIKey, cfg.ExchangeAPISecret, cfg.ExchangeBaseURL, gateSymbol)
+		log.Printf("Using Gate.io exchange client for %s", gateSymbol)
+	default:
+		return nil, fmt.Errorf("unsupported exchange: %s (supported: mexc, gate)", cfg.ExchangeName)
+	}
 
 	// Create Redis store
 	redisStore, err := store.NewRedisStore(cfg.RedisAddr, cfg.RedisPassword, cfg.RedisDB)
@@ -59,11 +77,11 @@ func NewBot(cfg *config.Config) (*Bot, error) {
 	}
 
 	// Create HTTP server
-	httpServer := http.NewServer(cfg.HTTPPort, mexcClient)
+	httpServer := http.NewServer(cfg.HTTPPort, exchangeClient)
 
 	return &Bot{
 		cfg:           cfg,
-		exchange:      mexcClient,
+		exchange:      exchangeClient,
 		redis:         redisStore,
 		mongo:         mongoStore,
 		http:          httpServer,
@@ -214,7 +232,7 @@ func (b *Bot) mainLoop() {
 	log.Println("Starting main trading loop...")
 
 	// Tick interval: 3 seconds (can be made configurable later)
-	tickInterval := 10 * time.Second
+	tickInterval := 3 * time.Second
 
 	ticker := time.NewTicker(tickInterval)
 	defer ticker.Stop()
@@ -242,4 +260,21 @@ func (b *Bot) mainLoop() {
 			}
 		}
 	}
+}
+
+// convertToGateSymbol converts symbol from "BTCUSDT" to "BTC_USDT" format
+func convertToGateSymbol(symbol string) string {
+	// If already contains underscore, return as is
+	if strings.Contains(symbol, "_") {
+		return symbol
+	}
+	// Common quote currencies
+	quotes := []string{"USDT", "USDC", "BTC", "ETH", "USD"}
+	for _, quote := range quotes {
+		if strings.HasSuffix(symbol, quote) {
+			base := strings.TrimSuffix(symbol, quote)
+			return base + "_" + quote
+		}
+	}
+	return symbol
 }
