@@ -225,13 +225,34 @@ func (ws *WSConnection) handleOrderUpdate(result interface{}) error {
 
 		updateTime, _ := strconv.ParseInt(order.UpdateTime, 10, 64)
 
+		// Map event to status if status is empty
+		status := order.Status
+		if status == "" {
+			// Gate.io uses "event" field for order lifecycle: put, update, finish
+			switch order.Event {
+			case "put":
+				status = "open"
+			case "update":
+				status = "open" // Still open, partially filled
+			case "finish":
+				// Check finish_as for more detail
+				if order.FinishAs == "filled" {
+					status = "closed"
+				} else if order.FinishAs == "cancelled" {
+					status = "cancelled"
+				} else {
+					status = "closed"
+				}
+			}
+		}
+
 		ws.handlers.OnOrderUpdate(&types.OrderEvent{
 			OrderID:            order.ID,
 			ClientOrderID:      strings.TrimPrefix(order.Text, "t-"),
 			Symbol:             convertSymbolBack(order.CurrencyPair),
 			Side:               strings.ToUpper(order.Side),
 			Type:               strings.ToUpper(order.Type),
-			Status:             convertOrderStatus(order.Status),
+			Status:             convertOrderStatus(status),
 			Price:              price,
 			Quantity:           amount,
 			ExecutedQty:        executedQty,
