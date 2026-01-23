@@ -387,14 +387,11 @@ func (b *Bot) buildLadder(
 		bidOffsetBps = utils.Max(bidOffsetBps, float64(b.cfg.TradingConfig.MinOffsetBps))
 		askOffsetBps = utils.Max(askOffsetBps, float64(b.cfg.TradingConfig.MinOffsetBps))
 
-		// Compute base prices
-		bidPrice := utils.RoundDown(mid*(1.0-bidOffsetBps/10000.0), snap.TickSize)
-		askPrice := utils.RoundUp(mid*(1.0+askOffsetBps/10000.0), snap.TickSize)
-
-		// Add price jitter: random offset of 0-3 ticks
-		priceJitterTicks := rand.Intn(4) // 0, 1, 2, or 3 ticks
-		bidPrice = bidPrice - float64(priceJitterTicks)*snap.TickSize
-		askPrice = askPrice + float64(priceJitterTicks)*snap.TickSize
+		// Compute base prices with separate jitter for bid and ask
+		bidPriceJitter := rand.Intn(4) // 0-3 ticks
+		askPriceJitter := rand.Intn(4) // 0-3 ticks
+		bidPrice := utils.RoundDown(mid*(1.0-bidOffsetBps/10000.0), snap.TickSize) - float64(bidPriceJitter)*snap.TickSize
+		askPrice := utils.RoundUp(mid*(1.0+askOffsetBps/10000.0), snap.TickSize) + float64(askPriceJitter)*snap.TickSize
 
 		// Ensure bid < ask (uncross if needed)
 		if bidPrice >= askPrice {
@@ -404,11 +401,12 @@ func (b *Bot) buildLadder(
 			}
 		}
 
-		// Compute quantities with jitter (±5% random variation)
-		qtyJitter := 0.95 + rand.Float64()*0.10 // Range: 0.95 to 1.05
-		quoteAmount := b.cfg.TradingConfig.QuotePerOrder * sizeMult[i] * qtyJitter
-		bidQty := utils.FloorToStep(quoteAmount/bidPrice, snap.StepSize)
-		askQty := utils.FloorToStep(quoteAmount/askPrice, snap.StepSize)
+		// Compute quantities with separate jitter for bid and ask (±5% random variation)
+		baseQuoteAmount := b.cfg.TradingConfig.QuotePerOrder * sizeMult[i]
+		bidQtyJitter := 0.95 + rand.Float64()*0.10 // 0.95 to 1.05
+		askQtyJitter := 0.95 + rand.Float64()*0.10 // 0.95 to 1.05
+		bidQty := utils.FloorToStep((baseQuoteAmount*bidQtyJitter)/bidPrice, snap.StepSize)
+		askQty := utils.FloorToStep((baseQuoteAmount*askQtyJitter)/askPrice, snap.StepSize)
 
 		// Check minimum notional and non-zero quantity
 		bidNotional := bidPrice * bidQty
