@@ -92,10 +92,10 @@ func Load() (*Config, error) {
 		return nil, errors.New("USER_EXCHANGE_KEY_ID is required")
 	}
 
+	log.Printf("mongoURI: %s\n", getEnv("MONGO_URI", "mongodb"))
+
 	mongoURI := getEnv("MONGO_URI", "mongodb://localhost:27017")
 	mongoDB := getEnv("MONGO_DB", "mm-platform")
-
-	log.Printf("mongoURI: %s\n", mongoURI)
 
 	// Query MongoDB for user exchange key and exchange config
 	userExchangeKey, exchange, err := loadUserExchangeKeyWithExchange(mongoURI, mongoDB, userExchangeKeyID)
