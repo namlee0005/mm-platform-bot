@@ -95,6 +95,8 @@ func Load() (*Config, error) {
 	mongoURI := getEnv("MONGO_URI", "mongodb://localhost:27017")
 	mongoDB := getEnv("MONGO_DB", "mm-platform")
 
+	log.Printf("mongoURI: %s\n", mongoURI)
+
 	// Query MongoDB for user exchange key and exchange config
 	userExchangeKey, exchange, err := loadUserExchangeKeyWithExchange(mongoURI, mongoDB, userExchangeKeyID)
 	if err != nil {
@@ -133,6 +135,8 @@ func Load() (*Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to decrypt API secret: %w", err)
 	}
+
+	log.Printf("REDIS_ADDR: %s\n", getEnv("REDIS_ADDR", "array"))
 
 	log.Printf("Successfully decrypted API credentials for key: %s", userExchangeKey.KeyName)
 
