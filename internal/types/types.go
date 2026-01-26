@@ -77,3 +77,59 @@ type EngineState struct {
 	OldestOrderAgeMs int64   // Age of oldest order in milliseconds
 	LastRefreshMs    int64   // Last refresh timestamp in milliseconds
 }
+
+// TradingConfigUpdate represents trading config from MongoDB for hot reload
+type TradingConfigUpdate struct {
+	Type       string `bson:"type"`
+	Symbol     string `bson:"symbol"`
+	BaseAsset  string `bson:"base_asset"`
+	QuoteAsset string `bson:"quote_asset"`
+
+	// Inventory target
+	TargetRatio float64 `bson:"target_ratio"`
+
+	// Ladder configuration
+	OffsetsBps    []int     `bson:"offsets_bps"`
+	SizeMult      []float64 `bson:"size_mult"`
+	QuotePerOrder float64   `bson:"quote_per_order"`
+
+	// Skew parameters
+	Deadzone           float64 `bson:"deadzone"`
+	K                  float64 `bson:"k"`
+	MaxSkewBps         int     `bson:"max_skew_bps"`
+	MinOffsetBps       int     `bson:"min_offset_bps"`
+	DSkewMaxBpsPerTick int     `bson:"d_skew_max_bps_per_tick"`
+
+	// Replace thresholds
+	ReplaceThresholds ReplaceThresholds `bson:"replace_thresholds"`
+
+	// Risk thresholds
+	RiskThresholds RiskThresholds `bson:"risk_thresholds"`
+
+	// Risk actions
+	RiskActions RiskActions `bson:"risk_actions"`
+
+	// Refresh configuration
+	RefreshBaseSec   int     `bson:"refresh_base_sec"`
+	RefreshJitterPct float64 `bson:"refresh_jitter_pct"`
+}
+
+type ReplaceThresholds struct {
+	RepriceThresholdBps int     `bson:"reprice_threshold_bps"`
+	InvDevThreshold     float64 `bson:"inv_dev_threshold"`
+	MaxOrderAgeSec      int     `bson:"max_order_age_sec"`
+}
+
+type RiskThresholds struct {
+	TtfFastSec       float64 `bson:"ttf_fast_sec"`
+	FillSpikePerMin  float64 `bson:"fill_spike_per_min"`
+	ImbHigh          float64 `bson:"imb_high"`
+	ImbLow           float64 `bson:"imb_low"`
+	DriftFastPerHour float64 `bson:"drift_fast_per_hour"`
+}
+
+type RiskActions struct {
+	RiskSpreadMult  float64 `bson:"risk_spread_mult"`
+	RiskSizeMult    float64 `bson:"risk_size_mult"`
+	RiskRefreshMult float64 `bson:"risk_refresh_mult"`
+}

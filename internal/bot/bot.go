@@ -19,11 +19,12 @@ import (
 
 // Bot represents the main trading bot
 type Bot struct {
-	cfg      *config.Config
-	exchange exchange.Exchange
-	redis    *store.RedisStore
-	mongo    *store.MongoStore
-	http     *http.Server
+	cfg               *config.Config
+	userExchangeKeyID string // MongoDB ID for config reload
+	exchange          exchange.Exchange
+	redis             *store.RedisStore
+	mongo             *store.MongoStore
+	http              *http.Server
 
 	// State
 	mu         sync.RWMutex
@@ -80,13 +81,14 @@ func NewBot(cfg *config.Config) (*Bot, error) {
 	httpServer := http.NewServer(cfg.HTTPPort, exchangeClient)
 
 	return &Bot{
-		cfg:           cfg,
-		exchange:      exchangeClient,
-		redis:         redisStore,
-		mongo:         mongoStore,
-		http:          httpServer,
-		running:       false,
-		cachedBalance: make(map[string]*types.Balance),
+		cfg:               cfg,
+		userExchangeKeyID: cfg.UserExchangeKeyID,
+		exchange:          exchangeClient,
+		redis:             redisStore,
+		mongo:             mongoStore,
+		http:              httpServer,
+		running:           false,
+		cachedBalance:     make(map[string]*types.Balance),
 	}, nil
 }
 
@@ -232,7 +234,7 @@ func (b *Bot) mainLoop() {
 	log.Println("Starting main trading loop...")
 
 	// Tick interval: 3 seconds (can be made configurable later)
-	tickInterval := 3 * time.Second
+	tickInterval := 5 * time.Second
 
 	ticker := time.NewTicker(tickInterval)
 	defer ticker.Stop()
@@ -251,6 +253,9 @@ func (b *Bot) mainLoop() {
 			return
 
 		case <-ticker.C:
+			// Check for config updates before each tick
+			b.checkAndReloadConfig()
+
 			log.Printf("Running tick at %s...", time.Now().Format("15:04:05"))
 			// Run the trading logic
 			if err := b.run(b.ctx); err != nil {
@@ -260,6 +265,76 @@ func (b *Bot) mainLoop() {
 			}
 		}
 	}
+}
+
+// checkAndReloadConfig checks if config has been updated in MongoDB and reloads it
+func (b *Bot) checkAndReloadConfig() {
+	if b.userExchangeKeyID == "" {
+		return
+	}
+
+	configUpdate, err := b.mongo.CheckConfigUpdate(b.ctx, b.userExchangeKeyID)
+	if err != nil {
+		log.Printf("WARNING: Failed to check config update: %v", err)
+		return
+	}
+
+	if !configUpdate.IsUpdated || configUpdate.Config == nil {
+		return
+	}
+
+	log.Printf("Config update detected, reloading trading config...")
+
+	// Update trading config
+	b.mu.Lock()
+	b.cfg.TradingConfig.TargetRatio = configUpdate.Config.TargetRatio
+	b.cfg.TradingConfig.OffsetsBps = configUpdate.Config.OffsetsBps
+	b.cfg.TradingConfig.SizeMult = configUpdate.Config.SizeMult
+	b.cfg.TradingConfig.QuotePerOrder = configUpdate.Config.QuotePerOrder
+	b.cfg.TradingConfig.Deadzone = configUpdate.Config.Deadzone
+	b.cfg.TradingConfig.K = configUpdate.Config.K
+	b.cfg.TradingConfig.MaxSkewBps = configUpdate.Config.MaxSkewBps
+	b.cfg.TradingConfig.MinOffsetBps = configUpdate.Config.MinOffsetBps
+	b.cfg.TradingConfig.DSkewMaxBpsPerTick = configUpdate.Config.DSkewMaxBpsPerTick
+	b.cfg.TradingConfig.RefreshBaseSec = configUpdate.Config.RefreshBaseSec
+	b.cfg.TradingConfig.RefreshJitterPct = configUpdate.Config.RefreshJitterPct
+
+	// Update thresholds
+	b.cfg.TradingConfig.ReplaceThresholds.RepriceThresholdBps = configUpdate.Config.ReplaceThresholds.RepriceThresholdBps
+	b.cfg.TradingConfig.ReplaceThresholds.InvDevThreshold = configUpdate.Config.ReplaceThresholds.InvDevThreshold
+	b.cfg.TradingConfig.ReplaceThresholds.MaxOrderAgeSec = configUpdate.Config.ReplaceThresholds.MaxOrderAgeSec
+
+	b.cfg.TradingConfig.RiskThresholds.TtfFastSec = configUpdate.Config.RiskThresholds.TtfFastSec
+	b.cfg.TradingConfig.RiskThresholds.FillSpikePerMin = configUpdate.Config.RiskThresholds.FillSpikePerMin
+	b.cfg.TradingConfig.RiskThresholds.ImbHigh = configUpdate.Config.RiskThresholds.ImbHigh
+	b.cfg.TradingConfig.RiskThresholds.ImbLow = configUpdate.Config.RiskThresholds.ImbLow
+	b.cfg.TradingConfig.RiskThresholds.DriftFastPerHour = configUpdate.Config.RiskThresholds.DriftFastPerHour
+
+	b.cfg.TradingConfig.RiskActions.RiskSpreadMult = configUpdate.Config.RiskActions.RiskSpreadMult
+	b.cfg.TradingConfig.RiskActions.RiskSizeMult = configUpdate.Config.RiskActions.RiskSizeMult
+	b.cfg.TradingConfig.RiskActions.RiskRefreshMult = configUpdate.Config.RiskActions.RiskRefreshMult
+	b.mu.Unlock()
+
+	// Cancel all orders on exchange and clear Redis to force new orders with new config
+	symbol := b.cfg.TradingConfig.Symbol
+	log.Printf("Cancelling all orders for %s due to config reload...", symbol)
+
+	if err := b.exchange.CancelAllOrders(b.ctx, symbol); err != nil {
+		log.Printf("WARNING: Failed to cancel orders on config reload: %v", err)
+	}
+
+	if err := b.redis.ClearAllOrders(b.ctx, symbol); err != nil {
+		log.Printf("WARNING: Failed to clear Redis orders on config reload: %v", err)
+	}
+
+	// Reset engine state to force immediate order placement
+	b.state = &types.EngineState{}
+
+	log.Printf("Config reloaded successfully: TargetRatio=%.2f, QuotePerOrder=%.2f, K=%.2f, Levels=%d",
+		configUpdate.Config.TargetRatio,
+		configUpdate.Config.QuotePerOrder,
+		configUpdate.Config.K,
+		len(configUpdate.Config.OffsetsBps))
 }
 
 // convertToGateSymbol converts symbol from "BTCUSDT" to "BTC_USDT" format

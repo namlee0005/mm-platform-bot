@@ -52,6 +52,9 @@ type TradingConfig struct {
 }
 
 type Config struct {
+	// User exchange key ID (for config reload)
+	UserExchangeKeyID string
+
 	// Exchange settings
 	ExchangeName      string // "mexc", "gate", etc.
 	ExchangeAPIKey    string
@@ -141,6 +144,9 @@ func Load() (*Config, error) {
 	log.Printf("Successfully decrypted API credentials for key: %s", userExchangeKey.KeyName)
 
 	cfg := &Config{
+		// User exchange key ID (for config reload)
+		UserExchangeKeyID: userExchangeKeyID,
+
 		// Exchange settings - decrypted
 		ExchangeName:      exchange.Name,
 		ExchangeAPIKey:    apiKey,
@@ -350,6 +356,7 @@ type UserExchangeKey struct {
 	IsDeleted           bool                `bson:"isDeleted"`
 	IsActive            bool                `bson:"isActive"`
 	IsRunning           bool                `bson:"isRunning"`
+	IsConfigUpdated     *bool               `bson:"isConfigUpdated,omitempty"`
 	Config              TradingConfig       `bson:"config"`
 	CreatedAt           time.Time           `bson:"createdAt"`
 	UpdatedAt           time.Time           `bson:"updatedAt"`
