@@ -98,6 +98,11 @@ type SimpleConfigUpdate struct {
 	MaxSkewBps         int     `bson:"max_skew_bps,omitempty"`
 	ImbalanceThreshold float64 `bson:"imbalance_threshold,omitempty"`
 	TickIntervalMs     int     `bson:"tick_interval_ms,omitempty"`
+
+	// Simple Maker specific params
+	LadderRegenBps    float64 `bson:"ladder_regen_bps,omitempty"`
+	MinBalanceToTrade float64 `bson:"min_balance_to_trade,omitempty"`
+	LevelGapTicksMax  int     `bson:"level_gap_ticks_max,omitempty"`
 }
 
 type ReplaceThresholds struct {

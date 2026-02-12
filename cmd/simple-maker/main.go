@@ -54,6 +54,14 @@ func main() {
 	defer redis.Close()
 	log.Println("Connected to Redis")
 
+	// Create MongoDB store for config updates
+	mongo, err := store.NewMongoStore(cfg.MongoURI, cfg.MongoDB)
+	if err != nil {
+		log.Fatalf("Failed to create MongoDB store: %v", err)
+	}
+	defer mongo.Close(context.Background())
+	log.Println("Connected to MongoDB for config updates")
+
 	// Bot ID for identifying this instance
 	botID := cfg.UserExchangeKeyID
 
@@ -89,6 +97,8 @@ func main() {
 		LadderRegenBps:      simpleConfig.LadderRegenBps,
 		MinBalanceToTrade:   simpleConfig.MinBalanceToTrade,
 		LevelGapTicksMax:    simpleConfig.LevelGapTicksMax,
+		Exchange:            exchangeName,
+		BotID:               botID,
 	}
 
 	// Set defaults if not configured
@@ -115,7 +125,7 @@ func main() {
 		makerCfg.BotSide, makerCfg.SpreadBps, makerCfg.NumLevels, makerCfg.LevelGapTicksMax, makerCfg.TargetDepthNotional, makerCfg.LadderRegenBps)
 
 	// Create simple maker
-	maker := engine.NewSimpleMaker(makerCfg, exch, redis)
+	maker := engine.NewSimpleMaker(makerCfg, exch, redis, mongo)
 
 	// Wire up Redis Stream for order events
 	maker.SetOrderEventCallback(func(event engine.OrderEvent) {

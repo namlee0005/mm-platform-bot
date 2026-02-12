@@ -45,6 +45,10 @@ type SimpleMakerConfig struct {
 
 	// Level spacing - random gap between levels
 	LevelGapTicksMax int `json:"level_gap_ticks_max"` // max random ticks between levels (default 3)
+
+	// Bot identification for Redis
+	Exchange string `json:"exchange"` // exchange name (mexc, gate, etc.)
+	BotID    string `json:"bot_id"`   // unique bot instance ID
 }
 
 // SimpleMaker is a minimal market maker that only places orders on one side
@@ -52,6 +56,7 @@ type SimpleMaker struct {
 	cfg   *SimpleMakerConfig
 	exch  exchange.Exchange
 	redis *store.RedisStore
+	mongo *store.MongoStore
 
 	// State
 	mu      sync.RWMutex
@@ -76,6 +81,10 @@ type SimpleMaker struct {
 	cachedBalance  float64
 	ladderRegenBps float64 // bps change in mid to trigger regeneration (e.g., 50 = 0.5%)
 	lastOrderCount int     // track order count to detect fills
+
+	// Config check counter
+	tickCount           int
+	configCheckInterval int // check config every N ticks
 }
 
 // NewSimpleMaker creates a new simple maker bot
@@ -83,6 +92,7 @@ func NewSimpleMaker(
 	cfg *SimpleMakerConfig,
 	exch exchange.Exchange,
 	redis *store.RedisStore,
+	mongo *store.MongoStore,
 ) *SimpleMaker {
 	// Set defaults
 	if cfg.TickIntervalMs == 0 {
@@ -108,12 +118,20 @@ func NewSimpleMaker(
 		ladderRegenBps = 50 // default 0.5%
 	}
 
+	// Calculate config check interval (every 10 seconds worth of ticks)
+	configCheckInterval := 10000 / cfg.TickIntervalMs
+	if configCheckInterval < 1 {
+		configCheckInterval = 1
+	}
+
 	return &SimpleMaker{
-		cfg:            cfg,
-		exch:           exch,
-		redis:          redis,
-		liveOrders:     make(map[string]*LiveOrder),
-		ladderRegenBps: ladderRegenBps,
+		cfg:                 cfg,
+		exch:                exch,
+		redis:               redis,
+		mongo:               mongo,
+		liveOrders:          make(map[string]*LiveOrder),
+		ladderRegenBps:      ladderRegenBps,
+		configCheckInterval: configCheckInterval,
 	}
 }
 
@@ -237,10 +255,25 @@ func (m *SimpleMaker) loadMarketInfo() error {
 // getAvailableBalance returns the available balance for trading
 // For maker-bid: returns quote asset (USDT) free balance
 // For maker-ask: returns base asset (BTC) free balance * mid price (as notional)
+// BalanceInfo holds free and locked balance
+type BalanceInfo struct {
+	Free   float64
+	Locked float64
+}
+
 func (m *SimpleMaker) getAvailableBalance() (float64, error) {
-	acct, err := m.exch.GetAccount(m.ctx)
+	info, err := m.getBalanceInfo()
 	if err != nil {
 		return 0, err
+	}
+	return info.Free, nil
+}
+
+// getBalanceInfo returns both free and locked balance for the target asset
+func (m *SimpleMaker) getBalanceInfo() (*BalanceInfo, error) {
+	acct, err := m.exch.GetAccount(m.ctx)
+	if err != nil {
+		return nil, err
 	}
 
 	var targetAsset string
@@ -252,23 +285,24 @@ func (m *SimpleMaker) getAvailableBalance() (float64, error) {
 
 	for _, b := range acct.Balances {
 		if b.Asset == targetAsset {
+			free := b.Free
+			locked := b.Locked
+
 			if m.cfg.BotSide == BotSideAsk {
 				// For ask, we need to convert base to notional value
-				// Get current price to convert
 				depth, err := m.exch.GetDepth(m.ctx, m.cfg.Symbol)
-				if err != nil {
-					return b.Free, nil // Return raw balance if can't get price
-				}
-				if len(depth.Bids) > 0 {
+				if err == nil && len(depth.Bids) > 0 {
 					bestBid, _ := strconv.ParseFloat(depth.Bids[0][0], 64)
-					return b.Free * bestBid, nil // Return notional value
+					free = b.Free * bestBid
+					locked = b.Locked * bestBid
 				}
 			}
-			return b.Free, nil
+
+			return &BalanceInfo{Free: free, Locked: locked}, nil
 		}
 	}
 
-	return 0, nil
+	return &BalanceInfo{}, nil
 }
 
 // cancelAllOrders cancels all orders for this bot's side
@@ -325,16 +359,63 @@ func (m *SimpleMaker) mainLoop() {
 			if err := m.tick(); err != nil {
 				log.Printf("[SIMPLE_MAKER] Tick error: %v", err)
 			}
+
+			// Check for config updates periodically
+			m.tickCount++
+			if m.tickCount >= m.configCheckInterval {
+				m.tickCount = 0
+				m.checkConfigUpdate()
+			}
 		}
 	}
+}
+
+// checkConfigUpdate checks MongoDB for config updates and applies them
+func (m *SimpleMaker) checkConfigUpdate() {
+	if m.mongo == nil || m.cfg.BotID == "" {
+		return
+	}
+
+	update, err := m.mongo.CheckConfigUpdate(m.ctx, m.cfg.BotID)
+	if err != nil {
+		log.Printf("[CONFIG] Failed to check config update: %v", err)
+		return
+	}
+
+	if !update.IsUpdated || update.SimpleConfig == nil {
+		return
+	}
+
+	log.Println("[CONFIG] Config updated, applying new settings...")
+
+	// Build and apply new config
+	newCfg := &SimpleMakerConfig{
+		SpreadBps:           update.SimpleConfig.SpreadMinBps,
+		NumLevels:           update.SimpleConfig.NumLevels,
+		TargetDepthNotional: update.SimpleConfig.TargetDepthNotional,
+		LadderRegenBps:      update.SimpleConfig.LadderRegenBps,
+		MinBalanceToTrade:   update.SimpleConfig.MinBalanceToTrade,
+		LevelGapTicksMax:    update.SimpleConfig.LevelGapTicksMax,
+	}
+
+	m.UpdateConfig(newCfg)
+	log.Println("[CONFIG] New config applied successfully")
 }
 
 // tick executes one cycle: check balance -> get market data -> compute desired orders -> place/cancel
 func (m *SimpleMaker) tick() error {
 	// 1. Check balance first - only trade if we have enough funds
-	availableBalance, err := m.getAvailableBalance()
+	balanceInfo, err := m.getBalanceInfo()
 	if err != nil {
 		return fmt.Errorf("get balance failed: %w", err)
+	}
+	availableBalance := balanceInfo.Free
+
+	// Save balance to Redis: balance:{exchange}:{symbol} -> {botId}: {free, locked, total}
+	if m.redis != nil && m.cfg.Exchange != "" && m.cfg.BotID != "" {
+		if err := m.redis.SetMMBalance(m.ctx, m.cfg.Exchange, m.cfg.Symbol, m.cfg.BotID, balanceInfo.Free, balanceInfo.Locked); err != nil {
+			log.Printf("[SIMPLE_MAKER] Failed to save balance to Redis: %v", err)
+		}
 	}
 
 	// Check if we have minimum balance to trade
@@ -752,4 +833,28 @@ func (m *SimpleMaker) roundToStep(qty float64) float64 {
 // GetSide returns the bot side
 func (m *SimpleMaker) GetSide() BotSide {
 	return m.cfg.BotSide
+}
+
+// UpdateConfig updates the maker config and clears cached ladder to force regeneration
+func (m *SimpleMaker) UpdateConfig(newCfg *SimpleMakerConfig) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// Update config fields that can be changed at runtime
+	m.cfg.SpreadBps = newCfg.SpreadBps
+	m.cfg.NumLevels = newCfg.NumLevels
+	m.cfg.TargetDepthNotional = newCfg.TargetDepthNotional
+	m.cfg.TickIntervalMs = newCfg.TickIntervalMs
+	m.cfg.LadderRegenBps = newCfg.LadderRegenBps
+	m.cfg.MinBalanceToTrade = newCfg.MinBalanceToTrade
+	m.cfg.LevelGapTicksMax = newCfg.LevelGapTicksMax
+	m.cfg.SizeJitterPct = newCfg.SizeJitterPct
+
+	// Clear cached ladder to force regeneration with new config
+	m.cachedLadder = nil
+	m.cachedMid = 0
+	m.cachedBalance = 0
+
+	log.Printf("[SIMPLE_MAKER] Config updated: spread=%.0fbps, levels=%d, depth=$%.0f, regenBps=%.0f",
+		m.cfg.SpreadBps, m.cfg.NumLevels, m.cfg.TargetDepthNotional, m.cfg.LadderRegenBps)
 }

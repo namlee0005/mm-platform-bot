@@ -177,6 +177,38 @@ func (s *RedisStore) GetBalance(ctx context.Context, symbol, asset string) (free
 	return free, locked, nil
 }
 
+// MMBalance represents balance info for MM bot
+type MMBalance struct {
+	Free      float64 `json:"free"`
+	Locked    float64 `json:"locked"`
+	Total     float64 `json:"total"`
+	UpdatedAt int64   `json:"updated_at"`
+}
+
+// SetMMBalance stores MM bot balance in Redis
+// Key: balance:{exchange}:{symbol}, Field: {botId}, Value: JSON {free, locked, total, updated_at}
+func (s *RedisStore) SetMMBalance(ctx context.Context, exchange, symbol, botID string, free, locked float64) error {
+	key := fmt.Sprintf("balance:%s:%s", exchange, symbol)
+
+	balanceData := MMBalance{
+		Free:      free,
+		Locked:    locked,
+		Total:     free + locked,
+		UpdatedAt: time.Now().Unix(),
+	}
+
+	jsonData, err := json.Marshal(balanceData)
+	if err != nil {
+		return fmt.Errorf("failed to marshal balance: %w", err)
+	}
+
+	if err := s.client.HSet(ctx, key, botID, string(jsonData)).Err(); err != nil {
+		return fmt.Errorf("failed to set MM balance: %w", err)
+	}
+
+	return nil
+}
+
 // SetStatus stores bot status in Redis
 func (s *RedisStore) SetStatus(ctx context.Context, symbol, status string) error {
 	key := fmt.Sprintf("status:%s", symbol)
