@@ -100,6 +100,10 @@ type SimpleMaker struct {
 	lastPlacedCount int  // number of orders placed last tick
 	skipNextDiff    bool // skip diff check on next tick
 
+	// Fill cooldown - delay before replacing filled orders
+	fillCooldowns  map[float64]int64 // price -> fill timestamp (unix ms)
+	fillCooldownMs int64             // cooldown duration in ms (5000-10000)
+
 	// Partner bot for ratio balancing
 	partnerBotID string
 }
@@ -149,6 +153,8 @@ func NewSimpleMaker(
 		liveOrders:          make(map[string]*LiveOrder),
 		ladderRegenBps:      ladderRegenBps,
 		configCheckInterval: configCheckInterval,
+		fillCooldowns:       make(map[float64]int64),
+		fillCooldownMs:      5000 + rand.Int63n(5000), // random 5-10 seconds
 	}
 }
 
@@ -303,6 +309,13 @@ func (m *SimpleMaker) subscribeUserStream() error {
 			// Log fill event (important - keep this)
 			log.Printf("[FILL] %s %s @ %.8f x %.6f (order=%s)",
 				event.Side, event.Symbol, event.Price, event.Quantity, event.OrderID)
+
+			// Record fill cooldown - wait 5-10s before replacing this level
+			fillPrice := m.roundToTick(event.Price)
+			m.fillCooldowns[fillPrice] = time.Now().UnixMilli()
+			// Randomize cooldown for next fill (5-10 seconds)
+			m.fillCooldownMs = 5000 + rand.Int63n(5000)
+			log.Printf("[FILL] Cooldown set for price %.8f, will wait %dms before replacing", fillPrice, m.fillCooldownMs)
 
 			// Save fill to MongoDB and Redis (silent)
 			if m.redis != nil {
@@ -939,6 +952,27 @@ func (m *SimpleMaker) executeOrderDiff(desired []SimpleDesiredOrder, current []*
 	// Place orders for unmatched desired levels
 	for i, d := range desired {
 		if !matchedDesiredIdx[i] {
+			// Check fill cooldown - don't place if recently filled near this price
+			// Use price tolerance (same as order matching) to handle random gaps
+			inCooldown := false
+			for fillPrice, fillTime := range m.fillCooldowns {
+				priceDiff := math.Abs(d.Price - fillPrice)
+				if priceDiff <= priceTolerance {
+					elapsed := now - fillTime
+					if elapsed < m.fillCooldownMs {
+						remaining := (m.fillCooldownMs - elapsed) / 1000
+						log.Printf("[SIMPLE_MAKER] Cooldown: L%d @ %.8f, waiting %ds more", d.Level, d.Price, remaining)
+						inCooldown = true
+						break
+					}
+					// Cooldown expired, remove from map
+					delete(m.fillCooldowns, fillPrice)
+				}
+			}
+			if inCooldown {
+				continue // Skip this level, still in cooldown
+			}
+
 			reason := "new_level"
 			if len(current) == 0 {
 				reason = "ladder_init"
@@ -946,6 +980,14 @@ func (m *SimpleMaker) executeOrderDiff(desired []SimpleDesiredOrder, current []*
 			if m.placeOrder(d, now, reason) {
 				placedCount++
 			}
+		}
+	}
+
+	// Clean up old cooldowns (older than 30 seconds)
+	cutoff := now - 30000
+	for price, fillTime := range m.fillCooldowns {
+		if fillTime < cutoff {
+			delete(m.fillCooldowns, price)
 		}
 	}
 
