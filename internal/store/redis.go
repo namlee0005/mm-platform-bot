@@ -465,6 +465,38 @@ func (s *RedisStore) ClearAllOrders(ctx context.Context, symbol string) error {
 	return nil
 }
 
+// ClearOrdersByBotID removes only orders belonging to a specific bot
+// This is safer than ClearAllOrders when multiple bots share the same symbol
+func (s *RedisStore) ClearOrdersByBotID(ctx context.Context, symbol, botID string) (int, error) {
+	key := fmt.Sprintf("order:%s", symbol)
+
+	// Get all items from list
+	items, err := s.client.LRange(ctx, key, 0, -1).Result()
+	if err != nil {
+		return 0, fmt.Errorf("failed to get orders from list: %w", err)
+	}
+
+	// Find and remove orders belonging to this bot
+	removedCount := 0
+	for _, item := range items {
+		var order OrderInfo
+		if err := json.Unmarshal([]byte(item), &order); err != nil {
+			continue
+		}
+		if order.BotID == botID {
+			removed, err := s.client.LRem(ctx, key, 1, item).Result()
+			if err != nil {
+				continue // Log but don't fail
+			}
+			if removed > 0 {
+				removedCount++
+			}
+		}
+	}
+
+	return removedCount, nil
+}
+
 // MMOrderEvent represents an MM engine order event for FE
 type MMOrderEvent struct {
 	Type      string  `json:"type"` // "place", "cancel", "amend", "fill"

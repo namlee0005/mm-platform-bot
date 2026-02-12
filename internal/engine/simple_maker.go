@@ -104,6 +104,9 @@ type SimpleMaker struct {
 	fillCooldowns  map[float64]int64 // price -> fill timestamp (unix ms)
 	fillCooldownMs int64             // cooldown duration in ms (5000-10000)
 
+	// Track internal cancels (by bot) to distinguish from external cancels (from UI)
+	internalCancels map[string]bool // orderID -> true if cancelled by bot
+
 	// Partner bot for ratio balancing
 	partnerBotID string
 }
@@ -155,6 +158,7 @@ func NewSimpleMaker(
 		configCheckInterval: configCheckInterval,
 		fillCooldowns:       make(map[float64]int64),
 		fillCooldownMs:      5000 + rand.Int63n(5000), // random 5-10 seconds
+		internalCancels:     make(map[string]bool),
 	}
 }
 
@@ -233,10 +237,13 @@ func (m *SimpleMaker) Stop(ctx context.Context) error {
 		log.Printf("[SIMPLE_MAKER] Cancelled all %s orders", m.cfg.BotSide)
 	}
 
-	// 4. Clear Redis order list
-	if m.redis != nil {
-		if err := m.redis.ClearAllOrders(ctx, m.cfg.Symbol); err != nil {
+	// 4. Clear Redis order list (only orders for this bot)
+	if m.redis != nil && m.cfg.BotID != "" {
+		removed, err := m.redis.ClearOrdersByBotID(ctx, m.cfg.Symbol, m.cfg.BotID)
+		if err != nil {
 			log.Printf("[SIMPLE_MAKER] WARNING: Failed to clear Redis: %v", err)
+		} else {
+			log.Printf("[SIMPLE_MAKER] Cleared %d orders from Redis for bot %s", removed, m.cfg.BotID)
 		}
 	}
 
@@ -344,7 +351,48 @@ func (m *SimpleMaker) subscribeUserStream() error {
 			// This prevents cancelling all orders and replacing them with new random gaps
 		},
 		OnOrderUpdate: func(event *types.OrderEvent) {
-			// Silent - we already log fills and cancels elsewhere
+			// Log order updates
+			log.Printf("[WS_ORDER] %s %s @ %.8f status=%s (order=%s)",
+				event.Side, event.Symbol, event.Price, event.Status, event.OrderID)
+
+			// If order was cancelled, check if it was internal (by bot) or external (from UI)
+			if event.Status == "CANCELED" || event.Status == "PARTIALLY_CANCELED" {
+				// Delete from Redis for ALL cancels (internal or external)
+				if m.redis != nil {
+					if err := m.redis.DeleteOrder(m.ctx, m.cfg.Symbol, event.OrderID); err != nil {
+						// Ignore "not found" errors - order might already be deleted
+						log.Printf("[REDIS] Delete order %s: %v", event.OrderID, err)
+					}
+				}
+
+				if m.internalCancels[event.OrderID] {
+					// Internal cancel - no cooldown needed, clean up tracking
+					delete(m.internalCancels, event.OrderID)
+				} else {
+					// External cancel (from UI) - add long cooldown before replacing
+					cancelPrice := m.roundToTick(event.Price)
+					m.fillCooldowns[cancelPrice] = time.Now().UnixMilli()
+					// Longer cooldown for external cancels: 30-60 seconds
+					m.fillCooldownMs = 30000 + rand.Int63n(30000)
+					log.Printf("[WS_ORDER] EXTERNAL cancel detected @ %.8f, cooldown %ds before replacing",
+						cancelPrice, m.fillCooldownMs/1000)
+
+					// Emit cancel event to Redis Stream (for FE to know about external cancels)
+					if m.onOrderEvent != nil {
+						m.onOrderEvent(OrderEvent{
+							Type:      OrderEventCancel,
+							Symbol:    event.Symbol,
+							OrderID:   event.OrderID,
+							Side:      event.Side,
+							Price:     event.Price,
+							Qty:       event.Quantity,
+							Level:     0,
+							Reason:    "external_cancel",
+							Timestamp: time.Now().UnixMilli(),
+						})
+					}
+				}
+			}
 		},
 		OnError: func(err error) {
 			log.Printf("[WS] Error: %v", err)
@@ -1029,7 +1077,9 @@ func (m *SimpleMaker) placeOrder(d SimpleDesiredOrder, timestamp int64, reason s
 			Status:        "NEW",
 			BotID:         m.cfg.BotID,
 		}
-		m.redis.SaveOrder(m.ctx, orderInfo)
+		if err := m.redis.SaveOrder(m.ctx, orderInfo); err != nil {
+			log.Printf("[REDIS] Failed to save order %s: %v", order.OrderID, err)
+		}
 	}
 
 	// Emit event
@@ -1052,9 +1102,13 @@ func (m *SimpleMaker) placeOrder(d SimpleDesiredOrder, timestamp int64, reason s
 
 // cancelOrder cancels a single order
 func (m *SimpleMaker) cancelOrder(o *exchange.Order, timestamp int64, reason string) {
+	// Mark as internal cancel BEFORE sending request (to distinguish from UI cancels)
+	m.internalCancels[o.OrderID] = true
+
 	err := m.exch.CancelOrder(m.ctx, m.cfg.Symbol, o.OrderID)
 	if err != nil {
 		log.Printf("[SIMPLE_MAKER] Cancel order failed: %v", err)
+		delete(m.internalCancels, o.OrderID) // Remove mark if failed
 		return
 	}
 
