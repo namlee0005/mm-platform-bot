@@ -97,6 +97,7 @@ func main() {
 		LadderRegenBps:      simpleConfig.LadderRegenBps,
 		MinBalanceToTrade:   simpleConfig.MinBalanceToTrade,
 		LevelGapTicksMax:    simpleConfig.LevelGapTicksMax,
+		DepthBps:            simpleConfig.DepthBps,
 		Exchange:            exchangeName,
 		BotID:               botID,
 	}
@@ -120,9 +121,12 @@ func main() {
 	if makerCfg.LevelGapTicksMax == 0 {
 		makerCfg.LevelGapTicksMax = 3 // default: 1-3 ticks random gap
 	}
+	if makerCfg.DepthBps == 0 {
+		makerCfg.DepthBps = 200 // default: 200 bps = ±2% from mid
+	}
 
-	log.Printf("Simple Maker config: side=%s, spread=%.0fbps, levels=%d, gapTicks=1-%d, depth=$%.0f, regenBps=%.0f",
-		makerCfg.BotSide, makerCfg.SpreadBps, makerCfg.NumLevels, makerCfg.LevelGapTicksMax, makerCfg.TargetDepthNotional, makerCfg.LadderRegenBps)
+	log.Printf("Simple Maker config: side=%s, spread=%.0fbps, levels=%d, gapTicks=1-%d, depth=$%.0f, depthBps=%.0f, regenBps=%.0f",
+		makerCfg.BotSide, makerCfg.SpreadBps, makerCfg.NumLevels, makerCfg.LevelGapTicksMax, makerCfg.TargetDepthNotional, makerCfg.DepthBps, makerCfg.LadderRegenBps)
 
 	// Create simple maker
 	maker := engine.NewSimpleMaker(makerCfg, exch, redis, mongo)

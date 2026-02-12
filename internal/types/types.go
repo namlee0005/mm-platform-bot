@@ -103,6 +103,7 @@ type SimpleConfigUpdate struct {
 	LadderRegenBps    float64 `bson:"ladder_regen_bps,omitempty"`
 	MinBalanceToTrade float64 `bson:"min_balance_to_trade,omitempty"`
 	LevelGapTicksMax  int     `bson:"level_gap_ticks_max,omitempty"`
+	DepthBps          float64 `bson:"depth_bps,omitempty"` // max distance from mid in bps (e.g., 200 = 2%)
 }
 
 type ReplaceThresholds struct {

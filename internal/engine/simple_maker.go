@@ -12,6 +12,7 @@ import (
 
 	"mm-platform-engine/internal/exchange"
 	"mm-platform-engine/internal/store"
+	"mm-platform-engine/internal/types"
 )
 
 // BotSide defines which side this bot handles
@@ -33,6 +34,9 @@ type SimpleMakerConfig struct {
 	TargetDepthNotional float64 `json:"target_depth_notional"` // total depth in quote currency
 	TickIntervalMs      int     `json:"tick_interval_ms"`      // tick interval in milliseconds
 
+	// Depth limit - all orders must be within ±DepthBps from mid
+	DepthBps float64 `json:"depth_bps"` // max distance from mid in bps (e.g., 200 = 2%)
+
 	// Randomization params (0.0 - 1.0)
 	PriceJitterPct float64 `json:"price_jitter_pct"` // price randomization ±% (e.g., 0.2 = ±20% of spread)
 	SizeJitterPct  float64 `json:"size_jitter_pct"`  // size randomization ±% (e.g., 0.3 = ±30% of size)
@@ -47,8 +51,14 @@ type SimpleMakerConfig struct {
 	LevelGapTicksMax int `json:"level_gap_ticks_max"` // max random ticks between levels (default 3)
 
 	// Bot identification for Redis
-	Exchange string `json:"exchange"` // exchange name (mexc, gate, etc.)
-	BotID    string `json:"bot_id"`   // unique bot instance ID
+	Exchange   string `json:"exchange"`    // exchange name (mexc, gate, etc.)
+	ExchangeID string `json:"exchange_id"` // exchange ObjectID for finding partner
+	BotID      string `json:"bot_id"`      // unique bot instance ID
+	BotType    string `json:"bot_type"`    // "maker-bid" or "maker-ask"
+
+	// Target ratio (inventory balancing)
+	TargetRatio float64 `json:"target_ratio"` // target base/total ratio (0.5 = 50/50)
+	RatioK      float64 `json:"ratio_k"`      // sensitivity factor for ratio adjustment (default 2.0)
 }
 
 // SimpleMaker is a minimal market maker that only places orders on one side
@@ -85,6 +95,9 @@ type SimpleMaker struct {
 	// Config check counter
 	tickCount           int
 	configCheckInterval int // check config every N ticks
+
+	// Partner bot for ratio balancing
+	partnerBotID string
 }
 
 // NewSimpleMaker creates a new simple maker bot
@@ -158,6 +171,12 @@ func (m *SimpleMaker) Start(ctx context.Context) error {
 		return fmt.Errorf("exchange start failed: %w", err)
 	}
 
+	// Subscribe to WebSocket user stream for real-time balance updates
+	if err := m.subscribeUserStream(); err != nil {
+		log.Printf("[SIMPLE_MAKER] WARNING: Failed to subscribe user stream: %v", err)
+		// Continue without WebSocket - will use polling instead
+	}
+
 	// Cancel any stale orders
 	if err := m.exch.CancelAllOrders(m.ctx, m.cfg.Symbol); err != nil {
 		log.Printf("[SIMPLE_MAKER] WARNING: Failed to cancel stale orders: %v", err)
@@ -184,37 +203,37 @@ func (m *SimpleMaker) Stop(ctx context.Context) error {
 		m.mu.Unlock()
 		return nil
 	}
+	m.running = false // Mark as not running to prevent new ticks
 	m.mu.Unlock()
 
 	log.Printf("[SIMPLE_MAKER] Stopping %s bot...", m.cfg.BotSide)
 
-	// Cancel only orders on this bot's side (not all orders!)
+	// 1. Stop mainLoop FIRST by cancelling context
+	if m.cancel != nil {
+		m.cancel()
+	}
+
+	// 2. Wait a bit for mainLoop to stop
+	time.Sleep(100 * time.Millisecond)
+
+	// 3. Now cancel all orders on exchange
 	if err := m.cancelAllOrdersWithContext(ctx); err != nil {
 		log.Printf("[SIMPLE_MAKER] WARNING: Cancel failed: %v", err)
 	} else {
 		log.Printf("[SIMPLE_MAKER] Cancelled all %s orders", m.cfg.BotSide)
 	}
 
-	// Clear Redis
+	// 4. Clear Redis order list
 	if m.redis != nil {
 		if err := m.redis.ClearAllOrders(ctx, m.cfg.Symbol); err != nil {
 			log.Printf("[SIMPLE_MAKER] WARNING: Failed to clear Redis: %v", err)
 		}
 	}
 
-	// Stop context
-	if m.cancel != nil {
-		m.cancel()
-	}
-
-	// Stop exchange
+	// 5. Stop exchange connection
 	if err := m.exch.Stop(ctx); err != nil {
 		log.Printf("[SIMPLE_MAKER] WARNING: Exchange stop failed: %v", err)
 	}
-
-	m.mu.Lock()
-	m.running = false
-	m.mu.Unlock()
 
 	log.Printf("[SIMPLE_MAKER] Stopped %s bot", m.cfg.BotSide)
 	return nil
@@ -252,6 +271,59 @@ func (m *SimpleMaker) loadMarketInfo() error {
 	return nil
 }
 
+// subscribeUserStream subscribes to WebSocket user stream for real-time balance updates
+func (m *SimpleMaker) subscribeUserStream() error {
+	handlers := exchange.UserStreamHandlers{
+		OnAccountUpdate: func(event *types.AccountEvent) {
+			// Update balances in Redis when balance changes via WebSocket
+			if m.redis == nil || m.cfg.Exchange == "" || m.cfg.BotID == "" {
+				return
+			}
+
+			var allBalances []store.AssetBalance
+			for _, b := range event.Balances {
+				if b.Free > 0 || b.Locked > 0 {
+					allBalances = append(allBalances, store.AssetBalance{
+						Asset:  b.Asset,
+						Free:   b.Free,
+						Locked: b.Locked,
+					})
+				}
+			}
+
+			if len(allBalances) > 0 {
+				if err := m.redis.SetMMBalances(m.ctx, m.cfg.Exchange, m.cfg.Symbol, m.cfg.BotID, allBalances); err != nil {
+					log.Printf("[WS] Failed to update balances in Redis: %v", err)
+				} else {
+					log.Printf("[WS] Updated %d balances in Redis", len(allBalances))
+				}
+			}
+		},
+		OnFill: func(event *types.FillEvent) {
+			// Log fill event
+			log.Printf("[WS] Fill: %s %s @ %.8f x %.6f (order=%s)",
+				event.Side, event.Symbol, event.Price, event.Quantity, event.OrderID)
+
+			// Clear cached ladder to force regeneration on next tick
+			m.mu.Lock()
+			m.cachedLadder = nil
+			m.mu.Unlock()
+		},
+		OnOrderUpdate: func(event *types.OrderEvent) {
+			// Log order status changes
+			if event.Status == "CANCELED" || event.Status == "FILLED" {
+				log.Printf("[WS] Order %s: %s %s @ %.8f (status=%s)",
+					event.OrderID, event.Side, event.Symbol, event.Price, event.Status)
+			}
+		},
+		OnError: func(err error) {
+			log.Printf("[WS] Error: %v", err)
+		},
+	}
+
+	return m.exch.SubscribeUserStream(m.ctx, handlers)
+}
+
 // getAvailableBalance returns the available balance for trading
 // For maker-bid: returns quote asset (USDT) free balance
 // For maker-ask: returns base asset (BTC) free balance * mid price (as notional)
@@ -270,10 +342,30 @@ func (m *SimpleMaker) getAvailableBalance() (float64, error) {
 }
 
 // getBalanceInfo returns both free and locked balance for the target asset
+// Also saves all balances to Redis if enabled
 func (m *SimpleMaker) getBalanceInfo() (*BalanceInfo, error) {
 	acct, err := m.exch.GetAccount(m.ctx)
 	if err != nil {
 		return nil, err
+	}
+
+	// Save ALL balances to Redis: balance:{exchange}:{symbol} -> {botId}: {balances}
+	if m.redis != nil && m.cfg.Exchange != "" && m.cfg.BotID != "" {
+		var allBalances []store.AssetBalance
+		for _, b := range acct.Balances {
+			if b.Free > 0 || b.Locked > 0 {
+				allBalances = append(allBalances, store.AssetBalance{
+					Asset:  b.Asset,
+					Free:   b.Free,
+					Locked: b.Locked,
+				})
+			}
+		}
+		if len(allBalances) > 0 {
+			if err := m.redis.SetMMBalances(m.ctx, m.cfg.Exchange, m.cfg.Symbol, m.cfg.BotID, allBalances); err != nil {
+				log.Printf("[SIMPLE_MAKER] Failed to save balances to Redis: %v", err)
+			}
+		}
 	}
 
 	var targetAsset string
@@ -323,14 +415,40 @@ func (m *SimpleMaker) cancelAllOrdersWithContext(ctx context.Context) error {
 		side = "SELL"
 	}
 
+	now := time.Now().UnixMilli()
 	cancelledCount := 0
 	for _, o := range openOrders {
 		if o.Side == side {
 			if err := m.exch.CancelOrder(ctx, m.cfg.Symbol, o.OrderID); err != nil {
 				log.Printf("[SIMPLE_MAKER] Failed to cancel order %s: %v", o.OrderID, err)
-			} else {
-				log.Printf("[SIMPLE_MAKER] Cancelled %s @ %.8f (id=%s)", o.Side, o.Price, o.OrderID)
-				cancelledCount++
+				continue
+			}
+
+			log.Printf("[SIMPLE_MAKER] Cancelled %s @ %.8f (id=%s)", o.Side, o.Price, o.OrderID)
+			cancelledCount++
+
+			// Delete order from Redis
+			if m.redis != nil {
+				if err := m.redis.DeleteOrder(ctx, m.cfg.Symbol, o.OrderID); err != nil {
+					log.Printf("[SIMPLE_MAKER] Failed to delete order from Redis: %v", err)
+				} else {
+					log.Printf("[REDIS] Deleted order %s from order:%s", o.OrderID, m.cfg.Symbol)
+				}
+			}
+
+			// Emit cancel event
+			if m.onOrderEvent != nil {
+				m.onOrderEvent(OrderEvent{
+					Type:      OrderEventCancel,
+					Symbol:    m.cfg.Symbol,
+					OrderID:   o.OrderID,
+					Side:      o.Side,
+					Price:     o.Price,
+					Qty:       o.Quantity,
+					Level:     0,
+					Reason:    "shutdown",
+					Timestamp: now,
+				})
 			}
 		}
 	}
@@ -396,6 +514,7 @@ func (m *SimpleMaker) checkConfigUpdate() {
 		LadderRegenBps:      update.SimpleConfig.LadderRegenBps,
 		MinBalanceToTrade:   update.SimpleConfig.MinBalanceToTrade,
 		LevelGapTicksMax:    update.SimpleConfig.LevelGapTicksMax,
+		DepthBps:            update.SimpleConfig.DepthBps,
 	}
 
 	m.UpdateConfig(newCfg)
@@ -404,19 +523,21 @@ func (m *SimpleMaker) checkConfigUpdate() {
 
 // tick executes one cycle: check balance -> get market data -> compute desired orders -> place/cancel
 func (m *SimpleMaker) tick() error {
+	// Check if still running (prevent executing during shutdown)
+	m.mu.RLock()
+	running := m.running
+	m.mu.RUnlock()
+	if !running {
+		return nil
+	}
+
 	// 1. Check balance first - only trade if we have enough funds
+	// Note: getBalanceInfo() also saves ALL balances to Redis
 	balanceInfo, err := m.getBalanceInfo()
 	if err != nil {
 		return fmt.Errorf("get balance failed: %w", err)
 	}
 	availableBalance := balanceInfo.Free
-
-	// Save balance to Redis: balance:{exchange}:{symbol} -> {botId}: {free, locked, total}
-	if m.redis != nil && m.cfg.Exchange != "" && m.cfg.BotID != "" {
-		if err := m.redis.SetMMBalance(m.ctx, m.cfg.Exchange, m.cfg.Symbol, m.cfg.BotID, balanceInfo.Free, balanceInfo.Locked); err != nil {
-			log.Printf("[SIMPLE_MAKER] Failed to save balance to Redis: %v", err)
-		}
-	}
 
 	// Check if we have minimum balance to trade
 	minBalance := m.cfg.MinBalanceToTrade
@@ -612,6 +733,20 @@ func (m *SimpleMaker) computeDesiredOrdersWithBalance(mid float64, availableBala
 
 	var totalNotionalUsed float64
 
+	// Calculate depth limit prices (±depth_bps from mid)
+	depthBps := m.cfg.DepthBps
+	if depthBps <= 0 {
+		depthBps = 200 // default 200 bps = 2%
+	}
+	var minPrice, maxPrice float64
+	if m.cfg.BotSide == BotSideBid {
+		minPrice = mid * (1.0 - depthBps/10000.0) // lowest bid allowed
+		maxPrice = mid                            // highest bid = mid
+	} else {
+		minPrice = mid                            // lowest ask = mid
+		maxPrice = mid * (1.0 + depthBps/10000.0) // highest ask allowed
+	}
+
 	// Calculate first level price (at spread_bps from mid)
 	offsetMult := m.cfg.SpreadBps / 10000.0
 	var firstPrice float64
@@ -627,6 +762,19 @@ func (m *SimpleMaker) computeDesiredOrdersWithBalance(mid float64, availableBala
 	if maxGapTicks <= 0 {
 		maxGapTicks = 3
 	}
+
+	// DEBUG: Log ladder calculation params
+	priceRange := maxPrice - minPrice
+	if m.cfg.BotSide == BotSideBid {
+		priceRange = firstPrice - minPrice
+	} else {
+		priceRange = maxPrice - firstPrice
+	}
+	ticksAvailable := int(priceRange / m.tickSize)
+	log.Printf("[DEBUG] Ladder params: mid=%.8f, tickSize=%.8f, depthBps=%.0f", mid, m.tickSize, depthBps)
+	log.Printf("[DEBUG] Price range: min=%.8f, max=%.8f, first=%.8f", minPrice, maxPrice, firstPrice)
+	log.Printf("[DEBUG] Ticks available: %d, numLevels=%d, gapTicksMax=%d", ticksAvailable, m.cfg.NumLevels, maxGapTicks)
+	log.Printf("[DEBUG] Size per level: $%.2f (total=$%.2f, balance=$%.2f)", baseSizeNotional, effectiveDepth, availableBalance)
 
 	// Current price starts at first level
 	currentPrice := firstPrice
@@ -654,6 +802,16 @@ func (m *SimpleMaker) computeDesiredOrdersWithBalance(mid float64, availableBala
 			price = currentPrice
 		}
 		price = m.roundToTick(price)
+
+		// Check depth limit - stop if price is outside allowed range
+		if m.cfg.BotSide == BotSideBid && price < minPrice {
+			log.Printf("[SIMPLE_MAKER] Depth limit reached at level %d (price %.8f < min %.8f)", level, price, minPrice)
+			break
+		}
+		if m.cfg.BotSide == BotSideAsk && price > maxPrice {
+			log.Printf("[SIMPLE_MAKER] Depth limit reached at level %d (price %.8f > max %.8f)", level, price, maxPrice)
+			break
+		}
 
 		// Only randomize SIZE, not price
 		sizeJitter := 1.0 + m.cfg.SizeJitterPct*(2*rand.Float64()-1)
@@ -762,7 +920,11 @@ func (m *SimpleMaker) placeOrder(d SimpleDesiredOrder, timestamp int64) {
 		}
 		if err := m.redis.SaveOrder(m.ctx, orderInfo); err != nil {
 			log.Printf("[SIMPLE_MAKER] Failed to save order to Redis: %v", err)
+		} else {
+			log.Printf("[REDIS] Saved order %s to order:%s", order.OrderID, m.cfg.Symbol)
 		}
+	} else {
+		log.Printf("[SIMPLE_MAKER] WARNING: Redis is nil, cannot save order")
 	}
 
 	// Emit event
@@ -795,7 +957,11 @@ func (m *SimpleMaker) cancelOrder(o *exchange.Order, timestamp int64) {
 	if m.redis != nil {
 		if err := m.redis.DeleteOrder(m.ctx, m.cfg.Symbol, o.OrderID); err != nil {
 			log.Printf("[SIMPLE_MAKER] Failed to delete order from Redis: %v", err)
+		} else {
+			log.Printf("[REDIS] Deleted order %s from order:%s", o.OrderID, m.cfg.Symbol)
 		}
+	} else {
+		log.Printf("[SIMPLE_MAKER] WARNING: Redis is nil, cannot delete order")
 	}
 
 	// Emit event
@@ -849,12 +1015,13 @@ func (m *SimpleMaker) UpdateConfig(newCfg *SimpleMakerConfig) {
 	m.cfg.MinBalanceToTrade = newCfg.MinBalanceToTrade
 	m.cfg.LevelGapTicksMax = newCfg.LevelGapTicksMax
 	m.cfg.SizeJitterPct = newCfg.SizeJitterPct
+	m.cfg.DepthBps = newCfg.DepthBps
 
 	// Clear cached ladder to force regeneration with new config
 	m.cachedLadder = nil
 	m.cachedMid = 0
 	m.cachedBalance = 0
 
-	log.Printf("[SIMPLE_MAKER] Config updated: spread=%.0fbps, levels=%d, depth=$%.0f, regenBps=%.0f",
-		m.cfg.SpreadBps, m.cfg.NumLevels, m.cfg.TargetDepthNotional, m.cfg.LadderRegenBps)
+	log.Printf("[SIMPLE_MAKER] Config updated: spread=%.0fbps, levels=%d, depth=$%.0f, depthBps=%.0f, regenBps=%.0f",
+		m.cfg.SpreadBps, m.cfg.NumLevels, m.cfg.TargetDepthNotional, m.cfg.DepthBps, m.cfg.LadderRegenBps)
 }

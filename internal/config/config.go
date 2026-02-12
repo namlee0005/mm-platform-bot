@@ -395,6 +395,7 @@ type SimpleConfig struct {
 	MinBalanceToTrade float64 `json:"min_balance_to_trade,omitempty" bson:"min_balance_to_trade,omitempty"` // minimum balance to trade
 	LevelStepBps      float64 `json:"level_step_bps,omitempty" bson:"level_step_bps,omitempty"`             // DEPRECATED: use level_gap_ticks_max
 	LevelGapTicksMax  int     `json:"level_gap_ticks_max,omitempty" bson:"level_gap_ticks_max,omitempty"`   // max random ticks between levels (default 3)
+	DepthBps          float64 `json:"depth_bps,omitempty" bson:"depth_bps,omitempty"`                       // max distance from mid in bps (e.g., 200 = 2%)
 }
 
 // ToTradingConfig converts SimpleConfig to TradingConfig with auto-generated ladder

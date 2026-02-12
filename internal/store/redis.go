@@ -209,6 +209,121 @@ func (s *RedisStore) SetMMBalance(ctx context.Context, exchange, symbol, botID s
 	return nil
 }
 
+// GetMMBalance retrieves MM bot balance from Redis
+// Key: balance:{exchange}:{symbol}, Field: {botId}
+func (s *RedisStore) GetMMBalance(ctx context.Context, exchange, symbol, botID string) (*MMBalance, error) {
+	key := fmt.Sprintf("balance:%s:%s", exchange, symbol)
+
+	jsonData, err := s.client.HGet(ctx, key, botID).Result()
+	if err != nil {
+		if err == redis.Nil {
+			return nil, nil // No balance found
+		}
+		return nil, fmt.Errorf("failed to get MM balance: %w", err)
+	}
+
+	var balance MMBalance
+	if err := json.Unmarshal([]byte(jsonData), &balance); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal balance: %w", err)
+	}
+
+	return &balance, nil
+}
+
+// AssetBalance represents balance for a single asset
+type AssetBalance struct {
+	Asset  string  `json:"asset"`
+	Free   float64 `json:"free"`
+	Locked float64 `json:"locked"`
+}
+
+// BotBalances represents all asset balances for a bot
+type BotBalances struct {
+	Balances  map[string]MMBalance `json:"balances"` // asset -> balance
+	UpdatedAt int64                `json:"updated_at"`
+}
+
+// SetMMBalances stores all asset balances for a bot in Redis
+// Key: balance:{exchange}:{symbol}, Field: {botId}, Value: JSON {balances: {asset: {free, locked, total}}, updated_at}
+func (s *RedisStore) SetMMBalances(ctx context.Context, exchange, symbol, botID string, balances []AssetBalance) error {
+	key := fmt.Sprintf("balance:%s:%s", exchange, symbol)
+	now := time.Now().Unix()
+
+	// Build balances map
+	balanceMap := make(map[string]MMBalance)
+	for _, b := range balances {
+		// Skip zero balances
+		if b.Free == 0 && b.Locked == 0 {
+			continue
+		}
+		balanceMap[b.Asset] = MMBalance{
+			Free:      b.Free,
+			Locked:    b.Locked,
+			Total:     b.Free + b.Locked,
+			UpdatedAt: now,
+		}
+	}
+
+	botBalances := BotBalances{
+		Balances:  balanceMap,
+		UpdatedAt: now,
+	}
+
+	jsonData, err := json.Marshal(botBalances)
+	if err != nil {
+		return fmt.Errorf("failed to marshal balances: %w", err)
+	}
+
+	if err := s.client.HSet(ctx, key, botID, string(jsonData)).Err(); err != nil {
+		return fmt.Errorf("failed to set MM balances: %w", err)
+	}
+
+	return nil
+}
+
+// GetMMBalances retrieves all bot balances for a symbol from Redis
+// Key: balance:{exchange}:{symbol}
+func (s *RedisStore) GetMMBalances(ctx context.Context, exchange, symbol string) (map[string]*BotBalances, error) {
+	key := fmt.Sprintf("balance:%s:%s", exchange, symbol)
+
+	result, err := s.client.HGetAll(ctx, key).Result()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get MM balances: %w", err)
+	}
+
+	allBalances := make(map[string]*BotBalances)
+	for botID, jsonData := range result {
+		var botBalances BotBalances
+		if err := json.Unmarshal([]byte(jsonData), &botBalances); err != nil {
+			continue
+		}
+		allBalances[botID] = &botBalances
+	}
+
+	return allBalances, nil
+}
+
+// GetBotBalances retrieves balances for a specific bot
+// Key: balance:{exchange}:{symbol}, Field: {botId}
+func (s *RedisStore) GetBotBalances(ctx context.Context, exchange, symbol, botID string) (*BotBalances, error) {
+	key := fmt.Sprintf("balance:%s:%s", exchange, symbol)
+
+	jsonData, err := s.client.HGet(ctx, key, botID).Result()
+	if err != nil {
+		if err == redis.Nil {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("failed to get bot balances: %w", err)
+	}
+
+	var botBalances BotBalances
+	if err := json.Unmarshal([]byte(jsonData), &botBalances); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal balances: %w", err)
+	}
+
+	return &botBalances, nil
+}
+
 // SetStatus stores bot status in Redis
 func (s *RedisStore) SetStatus(ctx context.Context, symbol, status string) error {
 	key := fmt.Sprintf("status:%s", symbol)
@@ -291,6 +406,7 @@ func (s *RedisStore) DeleteOrder(ctx context.Context, symbol, orderID string) er
 	}
 
 	// Find and remove the order
+	found := false
 	for _, item := range items {
 		var order OrderInfo
 		if err := json.Unmarshal([]byte(item), &order); err != nil {
@@ -298,9 +414,19 @@ func (s *RedisStore) DeleteOrder(ctx context.Context, symbol, orderID string) er
 		}
 		if order.OrderID == orderID {
 			// Remove this item from list (LREM removes by value)
-			s.client.LRem(ctx, key, 1, item)
+			removed, err := s.client.LRem(ctx, key, 1, item).Result()
+			if err != nil {
+				return fmt.Errorf("failed to remove order from list: %w", err)
+			}
+			if removed > 0 {
+				found = true
+			}
 			break
 		}
+	}
+
+	if !found {
+		return fmt.Errorf("order %s not found in list", orderID)
 	}
 
 	return nil

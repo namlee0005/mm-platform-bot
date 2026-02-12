@@ -190,3 +190,64 @@ func (s *MongoStore) CheckConfigUpdate(ctx context.Context, keyID string) (*Conf
 		SimpleConfig: &result.SimpleConfig,
 	}, nil
 }
+
+// PartnerBot represents the partner bot info
+type PartnerBot struct {
+	BotID   string `bson:"_id"`
+	BotType string `bson:"bot_type"`
+	Symbol  string `bson:"symbol"`
+}
+
+// FindPartnerBot finds the partner bot with same exchange, symbol but different bot_type
+// e.g., if current bot is maker-bid, find maker-ask for same exchange:symbol
+func (s *MongoStore) FindPartnerBot(ctx context.Context, exchangeID, symbol, currentBotType string) (*PartnerBot, error) {
+	collection := s.database.Collection("user_exchange_keys")
+
+	// Determine partner bot_type
+	var partnerBotType string
+	switch currentBotType {
+	case "maker-bid", "bid":
+		partnerBotType = "maker-ask"
+	case "maker-ask", "ask":
+		partnerBotType = "maker-bid"
+	default:
+		return nil, fmt.Errorf("unknown bot_type: %s", currentBotType)
+	}
+
+	// Parse exchangeID
+	exchangeObjID, err := primitive.ObjectIDFromHex(exchangeID)
+	if err != nil {
+		return nil, fmt.Errorf("invalid exchangeID: %w", err)
+	}
+
+	// Find partner bot
+	var result struct {
+		ID     primitive.ObjectID `bson:"_id"`
+		Config struct {
+			BotType string `bson:"bot_type"`
+			Symbol  string `bson:"symbol"`
+		} `bson:"config"`
+	}
+
+	filter := bson.M{
+		"exchangeId":      exchangeObjID,
+		"config.symbol":   symbol,
+		"config.bot_type": bson.M{"$in": []string{partnerBotType, partnerBotType[6:]}}, // "maker-ask" or "ask"
+		"isActive":        true,
+		"isDeleted":       bson.M{"$ne": true},
+	}
+
+	err = collection.FindOne(ctx, filter).Decode(&result)
+	if err != nil {
+		if err == mongo.ErrNoDocuments {
+			return nil, nil // No partner found
+		}
+		return nil, fmt.Errorf("failed to find partner bot: %w", err)
+	}
+
+	return &PartnerBot{
+		BotID:   result.ID.Hex(),
+		BotType: result.Config.BotType,
+		Symbol:  result.Config.Symbol,
+	}, nil
+}
