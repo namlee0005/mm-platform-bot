@@ -131,9 +131,8 @@ func main() {
 	// Create simple maker
 	maker := engine.NewSimpleMaker(makerCfg, exch, redis, mongo)
 
-	// Wire up Redis Stream for order events
+	// Wire up Redis Stream for order events (silent - no log)
 	maker.SetOrderEventCallback(func(event engine.OrderEvent) {
-		log.Printf("[REDIS] Publishing %s event for order %s", event.Type, event.OrderID)
 		mmEvent := &store.MMOrderEvent{
 			Type:      string(event.Type),
 			Exchange:  exchangeName,
@@ -147,13 +146,8 @@ func main() {
 			Timestamp: event.Timestamp,
 			BotID:     botID,
 		}
-		if err := redis.PublishMMOrderEvent(context.Background(), mmEvent); err != nil {
-			log.Printf("[REDIS] Failed to publish %s event: %v", event.Type, err)
-		} else {
-			log.Printf("[REDIS] Published %s event to mm:stream:%s:%s", event.Type, exchangeName, event.Symbol)
-		}
+		redis.PublishMMOrderEvent(context.Background(), mmEvent)
 	})
-	log.Printf("Order events will be published to Redis stream mm:stream:%s:%s (botID=%s)", exchangeName, makerCfg.Symbol, botID)
 
 	// Setup context
 	ctx, cancel := context.WithCancel(context.Background())

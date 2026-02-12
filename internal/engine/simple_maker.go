@@ -96,6 +96,10 @@ type SimpleMaker struct {
 	tickCount           int
 	configCheckInterval int // check config every N ticks
 
+	// Skip tick after placing to let exchange catch up
+	lastPlacedCount int  // number of orders placed last tick
+	skipNextDiff    bool // skip diff check on next tick
+
 	// Partner bot for ratio balancing
 	partnerBotID string
 }
@@ -292,29 +296,42 @@ func (m *SimpleMaker) subscribeUserStream() error {
 			}
 
 			if len(allBalances) > 0 {
-				if err := m.redis.SetMMBalances(m.ctx, m.cfg.Exchange, m.cfg.Symbol, m.cfg.BotID, allBalances); err != nil {
-					log.Printf("[WS] Failed to update balances in Redis: %v", err)
-				} else {
-					log.Printf("[WS] Updated %d balances in Redis", len(allBalances))
-				}
+				m.redis.SetMMBalances(m.ctx, m.cfg.Exchange, m.cfg.Symbol, m.cfg.BotID, allBalances)
 			}
 		},
 		OnFill: func(event *types.FillEvent) {
-			// Log fill event
-			log.Printf("[WS] Fill: %s %s @ %.8f x %.6f (order=%s)",
+			// Log fill event (important - keep this)
+			log.Printf("[FILL] %s %s @ %.8f x %.6f (order=%s)",
 				event.Side, event.Symbol, event.Price, event.Quantity, event.OrderID)
 
-			// Clear cached ladder to force regeneration on next tick
-			m.mu.Lock()
-			m.cachedLadder = nil
-			m.mu.Unlock()
+			// Save fill to MongoDB and Redis (silent)
+			if m.redis != nil {
+				m.redis.PublishFill(m.ctx, event)
+			}
+			if m.mongo != nil {
+				m.mongo.SaveFill(m.ctx, event)
+			}
+
+			// Emit fill event callback (for mm:stream)
+			if m.onOrderEvent != nil {
+				m.onOrderEvent(OrderEvent{
+					Type:      OrderEventFill,
+					Symbol:    event.Symbol,
+					OrderID:   event.OrderID,
+					Side:      event.Side,
+					Price:     event.Price,
+					Qty:       event.Quantity,
+					Level:     0,
+					Reason:    "filled",
+					Timestamp: event.Timestamp.UnixMilli(),
+				})
+			}
+
+			// DON'T clear cached ladder - let executeOrderDiff handle replacing just the filled level
+			// This prevents cancelling all orders and replacing them with new random gaps
 		},
 		OnOrderUpdate: func(event *types.OrderEvent) {
-			// Log order status changes
-			if event.Status == "CANCELED" || event.Status == "FILLED" {
-				log.Printf("[WS] Order %s: %s %s @ %.8f (status=%s)",
-					event.OrderID, event.Side, event.Symbol, event.Price, event.Status)
-			}
+			// Silent - we already log fills and cancels elsewhere
 		},
 		OnError: func(err error) {
 			log.Printf("[WS] Error: %v", err)
@@ -588,11 +605,24 @@ func (m *SimpleMaker) tick() error {
 		}
 	}
 
-	// 4. Check if we need to regenerate ladder or use cached
+	// 4. Check if we should skip this tick (just placed orders, waiting for exchange to catch up)
+	if m.skipNextDiff && len(currentOrders) == 0 {
+		log.Printf("[SIMPLE_MAKER] %s: Waiting for exchange to confirm orders...", m.cfg.BotSide)
+		m.skipNextDiff = false
+		return nil
+	}
+	m.skipNextDiff = false
+
+	// 5. Check if we need to regenerate ladder or use cached
 	desired := m.getOrRegenerateLadder(mid, availableBalance, len(currentOrders))
 
-	// 5. Compute diff and execute
-	m.executeOrderDiff(desired, currentOrders, mid)
+	// 6. Compute diff and execute
+	placedCount := m.executeOrderDiff(desired, currentOrders, mid)
+
+	// If we placed many orders, skip next tick to let exchange catch up
+	if placedCount >= 3 {
+		m.skipNextDiff = true
+	}
 
 	log.Printf("[SIMPLE_MAKER] %s: mid=%.6f, balance=%.4f, desired=%d, current=%d",
 		m.cfg.BotSide, mid, availableBalance, len(desired), len(currentOrders))
@@ -601,7 +631,8 @@ func (m *SimpleMaker) tick() error {
 }
 
 // shouldRegenerateLadder checks if we need to regenerate the ladder
-// Regenerate when: mid moves 0.5%+ OR fill detected (order count decreased)
+// Regenerate ONLY when: mid moves significantly (ladder_regen_bps)
+// DO NOT regenerate on fill - let executeOrderDiff replace just that level
 func (m *SimpleMaker) shouldRegenerateLadder(mid, balance float64, currentOrderCount int) (bool, string) {
 	// First time - always regenerate
 	if m.cachedMid == 0 || len(m.cachedLadder) == 0 {
@@ -614,11 +645,7 @@ func (m *SimpleMaker) shouldRegenerateLadder(mid, balance float64, currentOrderC
 		return true, fmt.Sprintf("mid_moved_%.1fbps", midChangeBps)
 	}
 
-	// Check if fill detected (order count decreased = order got filled)
-	if m.lastOrderCount > 0 && currentOrderCount < m.lastOrderCount {
-		return true, fmt.Sprintf("fill_detected(%d->%d)", m.lastOrderCount, currentOrderCount)
-	}
-
+	// DON'T regenerate on fill - executeOrderDiff will place missing order at same price
 	return false, ""
 }
 
@@ -632,9 +659,6 @@ func (m *SimpleMaker) getOrRegenerateLadder(mid, balance float64, currentOrderCo
 		m.cachedBalance = balance
 		log.Printf("[SIMPLE_MAKER] Regenerated ladder: reason=%s, levels=%d", reason, len(m.cachedLadder))
 	}
-
-	// Update order count for next tick
-	m.lastOrderCount = currentOrderCount
 
 	return m.cachedLadder
 }
@@ -713,25 +737,23 @@ func (m *SimpleMaker) computeDesiredOrders(mid float64) []SimpleDesiredOrder {
 
 // computeDesiredOrdersWithBalance computes orders considering available balance
 // This ensures we don't place orders that exceed our available funds
+// Uses WEIGHTED distribution: levels closer to mid get more depth
+// TWO-PASS approach: first find how many levels fit, then distribute depth across them
 func (m *SimpleMaker) computeDesiredOrdersWithBalance(mid float64, availableBalance float64) []SimpleDesiredOrder {
-	orders := make([]SimpleDesiredOrder, 0, m.cfg.NumLevels)
+	// target_depth_notional is TOTAL for both sides (±depth_bps)
+	// Each bot (bid or ask) only needs HALF
+	targetDepthOneSide := m.cfg.TargetDepthNotional / 2.0
 
 	// Calculate how much depth we can actually provide based on balance
-	// Use the smaller of target_depth and available_balance
-	effectiveDepth := m.cfg.TargetDepthNotional
+	effectiveDepth := targetDepthOneSide
 	if availableBalance < effectiveDepth {
 		effectiveDepth = availableBalance * 0.9 // Use 90% of available to leave buffer
 	}
-
-	// Size per level
-	baseSizeNotional := effectiveDepth / float64(m.cfg.NumLevels)
 
 	side := "BUY"
 	if m.cfg.BotSide == BotSideAsk {
 		side = "SELL"
 	}
-
-	var totalNotionalUsed float64
 
 	// Calculate depth limit prices (±depth_bps from mid)
 	depthBps := m.cfg.DepthBps
@@ -763,31 +785,12 @@ func (m *SimpleMaker) computeDesiredOrdersWithBalance(mid float64, availableBala
 		maxGapTicks = 3
 	}
 
-	// DEBUG: Log ladder calculation params
-	priceRange := maxPrice - minPrice
-	if m.cfg.BotSide == BotSideBid {
-		priceRange = firstPrice - minPrice
-	} else {
-		priceRange = maxPrice - firstPrice
-	}
-	ticksAvailable := int(priceRange / m.tickSize)
-	log.Printf("[DEBUG] Ladder params: mid=%.8f, tickSize=%.8f, depthBps=%.0f", mid, m.tickSize, depthBps)
-	log.Printf("[DEBUG] Price range: min=%.8f, max=%.8f, first=%.8f", minPrice, maxPrice, firstPrice)
-	log.Printf("[DEBUG] Ticks available: %d, numLevels=%d, gapTicksMax=%d", ticksAvailable, m.cfg.NumLevels, maxGapTicks)
-	log.Printf("[DEBUG] Size per level: $%.2f (total=$%.2f, balance=$%.2f)", baseSizeNotional, effectiveDepth, availableBalance)
-
-	// Current price starts at first level
+	// ============ PASS 1: Generate prices, find how many levels fit ============
+	numLevels := m.cfg.NumLevels
+	levelPrices := make([]float64, 0, numLevels)
 	currentPrice := firstPrice
 
-	for level := 0; level < m.cfg.NumLevels; level++ {
-		// Check if we still have balance left
-		remainingBalance := availableBalance - totalNotionalUsed
-		if remainingBalance < m.minNotional {
-			break // Stop placing orders if not enough balance
-		}
-
-		// Price: random gap between levels (1 to maxGapTicks ticks)
-		// Level 0 uses firstPrice, subsequent levels have random gap
+	for level := 0; level < numLevels; level++ {
 		var price float64
 		if level == 0 {
 			price = currentPrice
@@ -805,15 +808,44 @@ func (m *SimpleMaker) computeDesiredOrdersWithBalance(mid float64, availableBala
 
 		// Check depth limit - stop if price is outside allowed range
 		if m.cfg.BotSide == BotSideBid && price < minPrice {
-			log.Printf("[SIMPLE_MAKER] Depth limit reached at level %d (price %.8f < min %.8f)", level, price, minPrice)
 			break
 		}
 		if m.cfg.BotSide == BotSideAsk && price > maxPrice {
-			log.Printf("[SIMPLE_MAKER] Depth limit reached at level %d (price %.8f > max %.8f)", level, price, maxPrice)
 			break
 		}
 
-		// Only randomize SIZE, not price
+		levelPrices = append(levelPrices, price)
+	}
+
+	actualLevels := len(levelPrices)
+	if actualLevels == 0 {
+		return nil
+	}
+
+	// ============ PASS 2: Calculate weights for ACTUAL levels, place orders ============
+	// WEIGHTED distribution: level 0 gets highest weight, decreasing outward
+	// weight[i] = actualLevels - i → level 0 = N, level 1 = N-1, ... level N-1 = 1
+	// totalWeight = N + (N-1) + ... + 1 = N*(N+1)/2
+	totalWeight := float64(actualLevels * (actualLevels + 1) / 2)
+
+	orders := make([]SimpleDesiredOrder, 0, actualLevels)
+	var totalNotionalUsed float64
+
+	for level := 0; level < actualLevels; level++ {
+		// Check if we still have balance left
+		remainingBalance := availableBalance - totalNotionalUsed
+		if remainingBalance < m.minNotional {
+			break
+		}
+
+		price := levelPrices[level]
+
+		// WEIGHTED notional: closer levels get more depth
+		// weight = actualLevels - level (so level 0 gets highest)
+		weight := float64(actualLevels - level)
+		baseSizeNotional := effectiveDepth * weight / totalWeight
+
+		// Add random jitter to make amounts look natural (not round numbers)
 		sizeJitter := 1.0 + m.cfg.SizeJitterPct*(2*rand.Float64()-1)
 		sizeNotional := baseSizeNotional * sizeJitter
 
@@ -846,14 +878,22 @@ func (m *SimpleMaker) computeDesiredOrdersWithBalance(mid float64, availableBala
 }
 
 // executeOrderDiff cancels orders that don't match and places new ones
-func (m *SimpleMaker) executeOrderDiff(desired []SimpleDesiredOrder, current []*exchange.Order, mid float64) {
+// Returns the count of orders placed (used to skip next tick if many orders placed)
+func (m *SimpleMaker) executeOrderDiff(desired []SimpleDesiredOrder, current []*exchange.Order, mid float64) int {
 	now := time.Now().UnixMilli()
+	placedCount := 0
 
 	// Create map of current orders by price (rounded)
 	currentByPrice := make(map[float64]*exchange.Order)
 	for _, o := range current {
 		priceKey := m.roundToTick(o.Price)
 		currentByPrice[priceKey] = o
+	}
+
+	// Create set of desired prices
+	desiredPrices := make(map[float64]bool)
+	for _, d := range desired {
+		desiredPrices[m.roundToTick(d.Price)] = true
 	}
 
 	// Track which current orders are still needed
@@ -871,22 +911,39 @@ func (m *SimpleMaker) executeOrderDiff(desired []SimpleDesiredOrder, current []*
 				usedOrders[existing.OrderID] = true
 				continue
 			}
+			// Qty changed too much - will cancel and replace
+			reason := fmt.Sprintf("qty_changed(%.0f%%)", qtyDiff*100)
+			m.cancelOrder(existing, now, reason)
 		}
 
 		// Need to place new order
-		m.placeOrder(d, now)
-	}
-
-	// Cancel orders that are not needed
-	for _, o := range current {
-		if !usedOrders[o.OrderID] {
-			m.cancelOrder(o, now)
+		reason := "new_level"
+		if len(current) == 0 {
+			reason = "ladder_init"
+		}
+		if m.placeOrder(d, now, reason) {
+			placedCount++
 		}
 	}
+
+	// Cancel orders that are not needed (price no longer in desired)
+	for _, o := range current {
+		if !usedOrders[o.OrderID] {
+			priceKey := m.roundToTick(o.Price)
+			reason := "price_out_of_range"
+			if !desiredPrices[priceKey] {
+				reason = "level_removed"
+			}
+			m.cancelOrder(o, now, reason)
+		}
+	}
+
+	return placedCount
 }
 
 // placeOrder places a single order
-func (m *SimpleMaker) placeOrder(d SimpleDesiredOrder, timestamp int64) {
+// Returns true if order was placed successfully, false otherwise
+func (m *SimpleMaker) placeOrder(d SimpleDesiredOrder, timestamp int64, reason string) bool {
 	clientOrderID := fmt.Sprintf("SM_%d_L%d_%s", timestamp, d.Level, m.cfg.BotSide)
 
 	order, err := m.exch.PlaceOrder(m.ctx, &exchange.OrderRequest{
@@ -900,13 +957,13 @@ func (m *SimpleMaker) placeOrder(d SimpleDesiredOrder, timestamp int64) {
 
 	if err != nil {
 		log.Printf("[SIMPLE_MAKER] Place order failed: %v", err)
-		return
+		return false
 	}
 
-	log.Printf("[SIMPLE_MAKER] Placed %s L%d @ %.8f x %.6f (id=%s)",
-		d.Side, d.Level, d.Price, d.Qty, order.OrderID)
+	log.Printf("[SIMPLE_MAKER] Placed %s L%d @ %.8f x %.6f (id=%s) reason=%s",
+		d.Side, d.Level, d.Price, d.Qty, order.OrderID, reason)
 
-	// Save order to Redis
+	// Save order to Redis (silent)
 	if m.redis != nil {
 		orderInfo := &store.OrderInfo{
 			OrderID:       order.OrderID,
@@ -918,13 +975,7 @@ func (m *SimpleMaker) placeOrder(d SimpleDesiredOrder, timestamp int64) {
 			CreatedAt:     timestamp,
 			Status:        "NEW",
 		}
-		if err := m.redis.SaveOrder(m.ctx, orderInfo); err != nil {
-			log.Printf("[SIMPLE_MAKER] Failed to save order to Redis: %v", err)
-		} else {
-			log.Printf("[REDIS] Saved order %s to order:%s", order.OrderID, m.cfg.Symbol)
-		}
-	} else {
-		log.Printf("[SIMPLE_MAKER] WARNING: Redis is nil, cannot save order")
+		m.redis.SaveOrder(m.ctx, orderInfo)
 	}
 
 	// Emit event
@@ -937,34 +988,30 @@ func (m *SimpleMaker) placeOrder(d SimpleDesiredOrder, timestamp int64) {
 			Price:     d.Price,
 			Qty:       d.Qty,
 			Level:     d.Level,
-			Reason:    "new_level",
+			Reason:    reason,
 			Timestamp: timestamp,
 		})
 	}
+
+	return true
 }
 
 // cancelOrder cancels a single order
-func (m *SimpleMaker) cancelOrder(o *exchange.Order, timestamp int64) {
+func (m *SimpleMaker) cancelOrder(o *exchange.Order, timestamp int64, reason string) {
 	err := m.exch.CancelOrder(m.ctx, m.cfg.Symbol, o.OrderID)
 	if err != nil {
 		log.Printf("[SIMPLE_MAKER] Cancel order failed: %v", err)
 		return
 	}
 
-	log.Printf("[SIMPLE_MAKER] Cancelled %s @ %.8f (id=%s)", o.Side, o.Price, o.OrderID)
+	log.Printf("[SIMPLE_MAKER] Cancelled %s @ %.8f (id=%s) reason=%s", o.Side, o.Price, o.OrderID, reason)
 
-	// Delete order from Redis
+	// Delete order from Redis (silent - no log)
 	if m.redis != nil {
-		if err := m.redis.DeleteOrder(m.ctx, m.cfg.Symbol, o.OrderID); err != nil {
-			log.Printf("[SIMPLE_MAKER] Failed to delete order from Redis: %v", err)
-		} else {
-			log.Printf("[REDIS] Deleted order %s from order:%s", o.OrderID, m.cfg.Symbol)
-		}
-	} else {
-		log.Printf("[SIMPLE_MAKER] WARNING: Redis is nil, cannot delete order")
+		m.redis.DeleteOrder(m.ctx, m.cfg.Symbol, o.OrderID)
 	}
 
-	// Emit event
+	// Emit event (silent - no log)
 	if m.onOrderEvent != nil {
 		m.onOrderEvent(OrderEvent{
 			Type:      OrderEventCancel,
@@ -974,7 +1021,7 @@ func (m *SimpleMaker) cancelOrder(o *exchange.Order, timestamp int64) {
 			Price:     o.Price,
 			Qty:       o.Quantity,
 			Level:     0,
-			Reason:    "not_needed",
+			Reason:    reason,
 			Timestamp: timestamp,
 		})
 	}
