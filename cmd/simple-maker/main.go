@@ -122,6 +122,7 @@ func main() {
 		log.Printf("[REDIS] Publishing %s event for order %s", event.Type, event.OrderID)
 		mmEvent := &store.MMOrderEvent{
 			Type:      string(event.Type),
+			Exchange:  exchangeName,
 			Symbol:    event.Symbol,
 			OrderID:   event.OrderID,
 			Side:      event.Side,
@@ -135,10 +136,10 @@ func main() {
 		if err := redis.PublishMMOrderEvent(context.Background(), mmEvent); err != nil {
 			log.Printf("[REDIS] Failed to publish %s event: %v", event.Type, err)
 		} else {
-			log.Printf("[REDIS] Published %s event to mm:stream:%s", event.Type, event.Symbol)
+			log.Printf("[REDIS] Published %s event to mm:stream:%s:%s", event.Type, exchangeName, event.Symbol)
 		}
 	})
-	log.Printf("Order events will be published to Redis stream mm:stream:%s (botID=%s)", makerCfg.Symbol, botID)
+	log.Printf("Order events will be published to Redis stream mm:stream:%s:%s (botID=%s)", exchangeName, makerCfg.Symbol, botID)
 
 	// Setup context
 	ctx, cancel := context.WithCancel(context.Background())

@@ -667,6 +667,23 @@ func (m *SimpleMaker) placeOrder(d SimpleDesiredOrder, timestamp int64) {
 	log.Printf("[SIMPLE_MAKER] Placed %s L%d @ %.8f x %.6f (id=%s)",
 		d.Side, d.Level, d.Price, d.Qty, order.OrderID)
 
+	// Save order to Redis
+	if m.redis != nil {
+		orderInfo := &store.OrderInfo{
+			OrderID:       order.OrderID,
+			ClientOrderID: clientOrderID,
+			Symbol:        m.cfg.Symbol,
+			Side:          d.Side,
+			Price:         d.Price,
+			Quantity:      d.Qty,
+			CreatedAt:     timestamp,
+			Status:        "NEW",
+		}
+		if err := m.redis.SaveOrder(m.ctx, orderInfo); err != nil {
+			log.Printf("[SIMPLE_MAKER] Failed to save order to Redis: %v", err)
+		}
+	}
+
 	// Emit event
 	if m.onOrderEvent != nil {
 		m.onOrderEvent(OrderEvent{
@@ -692,6 +709,13 @@ func (m *SimpleMaker) cancelOrder(o *exchange.Order, timestamp int64) {
 	}
 
 	log.Printf("[SIMPLE_MAKER] Cancelled %s @ %.8f (id=%s)", o.Side, o.Price, o.OrderID)
+
+	// Delete order from Redis
+	if m.redis != nil {
+		if err := m.redis.DeleteOrder(m.ctx, m.cfg.Symbol, o.OrderID); err != nil {
+			log.Printf("[SIMPLE_MAKER] Failed to delete order from Redis: %v", err)
+		}
+	}
 
 	// Emit event
 	if m.onOrderEvent != nil {

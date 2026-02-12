@@ -309,6 +309,7 @@ func (s *RedisStore) ClearAllOrders(ctx context.Context, symbol string) error {
 // MMOrderEvent represents an MM engine order event for FE
 type MMOrderEvent struct {
 	Type      string  `json:"type"` // "place", "cancel", "amend", "fill"
+	Exchange  string  `json:"exchange"`
 	Symbol    string  `json:"symbol"`
 	OrderID   string  `json:"order_id"`
 	Side      string  `json:"side"` // "BUY" or "SELL"
@@ -321,10 +322,10 @@ type MMOrderEvent struct {
 }
 
 // PublishMMOrderEvent publishes MM order event to Redis Stream
-// Stream key format: mm:stream:{symbol}
+// Stream key format: mm:stream:{exchange}:{symbol}
 // Uses XADD with MAXLEN ~1000 to limit memory usage
 func (s *RedisStore) PublishMMOrderEvent(ctx context.Context, event *MMOrderEvent) error {
-	streamKey := fmt.Sprintf("mm:stream:%s", event.Symbol)
+	streamKey := fmt.Sprintf("mm:stream:%s:%s", event.Exchange, event.Symbol)
 
 	// Add to stream with auto-generated ID and approximate maxlen
 	_, err := s.client.XAdd(ctx, &redis.XAddArgs{
@@ -333,6 +334,7 @@ func (s *RedisStore) PublishMMOrderEvent(ctx context.Context, event *MMOrderEven
 		Approx: true, // Use ~ for better performance
 		Values: map[string]interface{}{
 			"type":      event.Type,
+			"exchange":  event.Exchange,
 			"symbol":    event.Symbol,
 			"order_id":  event.OrderID,
 			"side":      event.Side,
