@@ -28,7 +28,7 @@ func (c *Client) GetExchangeInfo(ctx context.Context, symbol string) (*exchange.
 func (c *Client) GetDepth(ctx context.Context, symbol string) (*exchange.Depth, error) {
 	params := url.Values{}
 	params.Set("symbol", symbol)
-	params.Set("limit", "5")
+	params.Set("limit", "20") // More levels for sweep detection
 
 	body, err := c.doRequest(ctx, "GET", "/api/v3/depth", params, false)
 	if err != nil {

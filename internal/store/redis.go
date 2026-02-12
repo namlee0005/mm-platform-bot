@@ -33,45 +33,82 @@ func NewRedisStore(addr, password string, db int) (*RedisStore, error) {
 	return &RedisStore{client: client}, nil
 }
 
-// PublishFill publishes a fill event to Redis
+// PublishFill publishes a fill event to Redis Stream
 func (s *RedisStore) PublishFill(ctx context.Context, fill *types.FillEvent) error {
-	data, err := json.Marshal(fill)
-	if err != nil {
-		return fmt.Errorf("failed to marshal fill: %w", err)
-	}
+	streamKey := fmt.Sprintf("fills:stream:%s", fill.Symbol)
 
-	channel := fmt.Sprintf("fills:%s", fill.Symbol)
-	if err := s.client.Publish(ctx, channel, data).Err(); err != nil {
-		return fmt.Errorf("failed to publish fill: %w", err)
+	_, err := s.client.XAdd(ctx, &redis.XAddArgs{
+		Stream: streamKey,
+		MaxLen: 1000,
+		Approx: true,
+		Values: map[string]interface{}{
+			"symbol":           fill.Symbol,
+			"order_id":         fill.OrderID,
+			"trade_id":         fill.TradeID,
+			"side":             fill.Side,
+			"price":            fill.Price,
+			"quantity":         fill.Quantity,
+			"commission":       fill.Commission,
+			"commission_asset": fill.CommissionAsset,
+			"timestamp":        fill.Timestamp.UnixMilli(),
+		},
+	}).Result()
+
+	if err != nil {
+		return fmt.Errorf("failed to add fill to stream: %w", err)
 	}
 
 	return nil
 }
 
-// PublishAccountUpdate publishes an account update to Redis
+// PublishAccountUpdate publishes an account update to Redis Stream
 func (s *RedisStore) PublishAccountUpdate(ctx context.Context, account *types.AccountEvent) error {
-	data, err := json.Marshal(account)
+	// Marshal balances to JSON for storage in stream
+	balancesJSON, err := json.Marshal(account.Balances)
 	if err != nil {
-		return fmt.Errorf("failed to marshal account: %w", err)
+		return fmt.Errorf("failed to marshal balances: %w", err)
 	}
 
-	if err := s.client.Publish(ctx, "account:updates", data).Err(); err != nil {
-		return fmt.Errorf("failed to publish account update: %w", err)
+	_, err = s.client.XAdd(ctx, &redis.XAddArgs{
+		Stream: "account:stream",
+		MaxLen: 500,
+		Approx: true,
+		Values: map[string]interface{}{
+			"balances":  string(balancesJSON),
+			"timestamp": account.Timestamp.UnixMilli(),
+		},
+	}).Result()
+
+	if err != nil {
+		return fmt.Errorf("failed to add account update to stream: %w", err)
 	}
 
 	return nil
 }
 
-// PublishOrderUpdate publishes an order update to Redis
+// PublishOrderUpdate publishes an order update to Redis Stream
 func (s *RedisStore) PublishOrderUpdate(ctx context.Context, order *types.OrderEvent) error {
-	data, err := json.Marshal(order)
-	if err != nil {
-		return fmt.Errorf("failed to marshal order: %w", err)
-	}
+	streamKey := fmt.Sprintf("orders:stream:%s", order.Symbol)
 
-	channel := fmt.Sprintf("orders:%s", order.Symbol)
-	if err := s.client.Publish(ctx, channel, data).Err(); err != nil {
-		return fmt.Errorf("failed to publish order update: %w", err)
+	_, err := s.client.XAdd(ctx, &redis.XAddArgs{
+		Stream: streamKey,
+		MaxLen: 1000,
+		Approx: true,
+		Values: map[string]interface{}{
+			"order_id":        order.OrderID,
+			"client_order_id": order.ClientOrderID,
+			"symbol":          order.Symbol,
+			"side":            order.Side,
+			"status":          order.Status,
+			"price":           order.Price,
+			"quantity":        order.Quantity,
+			"executed_qty":    order.ExecutedQty,
+			"timestamp":       order.Timestamp.UnixMilli(),
+		},
+	}).Result()
+
+	if err != nil {
+		return fmt.Errorf("failed to add order update to stream: %w", err)
 	}
 
 	return nil
@@ -264,6 +301,52 @@ func (s *RedisStore) ClearAllOrders(ctx context.Context, symbol string) error {
 
 	if err := s.client.Del(ctx, key).Err(); err != nil {
 		return fmt.Errorf("failed to delete orders list: %w", err)
+	}
+
+	return nil
+}
+
+// MMOrderEvent represents an MM engine order event for FE
+type MMOrderEvent struct {
+	Type      string  `json:"type"` // "place", "cancel", "amend", "fill"
+	Symbol    string  `json:"symbol"`
+	OrderID   string  `json:"order_id"`
+	Side      string  `json:"side"` // "BUY" or "SELL"
+	Price     float64 `json:"price"`
+	Qty       float64 `json:"qty"`
+	Level     int     `json:"level"`     // ladder level index
+	Reason    string  `json:"reason"`    // why this action was taken
+	Timestamp int64   `json:"timestamp"` // unix milliseconds
+	BotID     string  `json:"bot_id"`    // unique bot instance ID
+}
+
+// PublishMMOrderEvent publishes MM order event to Redis Stream
+// Stream key format: mm:stream:{symbol}
+// Uses XADD with MAXLEN ~1000 to limit memory usage
+func (s *RedisStore) PublishMMOrderEvent(ctx context.Context, event *MMOrderEvent) error {
+	streamKey := fmt.Sprintf("mm:stream:%s", event.Symbol)
+
+	// Add to stream with auto-generated ID and approximate maxlen
+	_, err := s.client.XAdd(ctx, &redis.XAddArgs{
+		Stream: streamKey,
+		MaxLen: 1000, // Keep last ~1000 messages
+		Approx: true, // Use ~ for better performance
+		Values: map[string]interface{}{
+			"type":      event.Type,
+			"symbol":    event.Symbol,
+			"order_id":  event.OrderID,
+			"side":      event.Side,
+			"price":     event.Price,
+			"qty":       event.Qty,
+			"level":     event.Level,
+			"reason":    event.Reason,
+			"timestamp": event.Timestamp,
+			"bot_id":    event.BotID,
+		},
+	}).Result()
+
+	if err != nil {
+		return fmt.Errorf("failed to add MM order event to stream: %w", err)
 	}
 
 	return nil

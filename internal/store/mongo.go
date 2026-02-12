@@ -144,13 +144,13 @@ func (s *MongoStore) Close(ctx context.Context) error {
 	return s.client.Disconnect(ctx)
 }
 
-// ConfigUpdate represents an updated trading config from MongoDB
+// ConfigUpdate represents an updated simple_config from MongoDB
 type ConfigUpdate struct {
-	IsUpdated bool
-	Config    *types.TradingConfigUpdate
+	IsUpdated    bool
+	SimpleConfig *types.SimpleConfigUpdate
 }
 
-// CheckConfigUpdate checks if config has been updated and returns new config if so
+// CheckConfigUpdate checks if config has been updated and returns new simple_config if so
 func (s *MongoStore) CheckConfigUpdate(ctx context.Context, keyID string) (*ConfigUpdate, error) {
 	collection := s.database.Collection("user_exchange_keys")
 
@@ -162,8 +162,8 @@ func (s *MongoStore) CheckConfigUpdate(ctx context.Context, keyID string) (*Conf
 
 	// Find the document and check isConfigUpdated
 	var result struct {
-		IsConfigUpdated *bool                     `bson:"isConfigUpdated"`
-		Config          types.TradingConfigUpdate `bson:"config"`
+		IsConfigUpdated *bool                    `bson:"isConfigUpdated"`
+		SimpleConfig    types.SimpleConfigUpdate `bson:"config"`
 	}
 
 	err = collection.FindOne(ctx, bson.M{"_id": objectID}).Decode(&result)
@@ -186,7 +186,7 @@ func (s *MongoStore) CheckConfigUpdate(ctx context.Context, keyID string) (*Conf
 	}
 
 	return &ConfigUpdate{
-		IsUpdated: true,
-		Config:    &result.Config,
+		IsUpdated:    true,
+		SimpleConfig: &result.SimpleConfig,
 	}, nil
 }

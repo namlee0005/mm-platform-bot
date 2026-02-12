@@ -64,6 +64,9 @@ type Config struct {
 	// Trading settings
 	TradingConfig TradingConfig
 
+	// Simple config (raw from MongoDB)
+	SimpleConfig SimpleConfig
+
 	// Redis settings
 	RedisAddr     string
 	RedisPassword string
@@ -143,6 +146,26 @@ func Load() (*Config, error) {
 
 	log.Printf("Successfully decrypted API credentials for key: %s", userExchangeKey.KeyName)
 
+	// Validate simple_config
+	if userExchangeKey.SimpleConfig.Symbol == "" {
+		return nil, fmt.Errorf("simple_config.symbol is required in MongoDB document")
+	}
+	if userExchangeKey.SimpleConfig.NumLevels == 0 {
+		log.Printf("WARNING: simple_config.num_levels is 0, using default 20")
+	}
+
+	log.Printf("Loaded simple_config from MongoDB: symbol=%s, spread_min_bps=%.0f, spread_max_bps=%.0f, num_levels=%d, target_depth=%.0f",
+		userExchangeKey.SimpleConfig.Symbol,
+		userExchangeKey.SimpleConfig.SpreadMinBps,
+		userExchangeKey.SimpleConfig.SpreadMaxBps,
+		userExchangeKey.SimpleConfig.NumLevels,
+		userExchangeKey.SimpleConfig.TargetDepthNotional,
+	)
+
+	// Convert simple_config to TradingConfig
+	tradingConfig := userExchangeKey.SimpleConfig.ToTradingConfig()
+	log.Printf("Converted to TradingConfig: symbol=%s, levels=%d, quote_per_order=%.2f", tradingConfig.Symbol, len(tradingConfig.OffsetsBps), tradingConfig.QuotePerOrder)
+
 	cfg := &Config{
 		// User exchange key ID (for config reload)
 		UserExchangeKeyID: userExchangeKeyID,
@@ -154,7 +177,10 @@ func Load() (*Config, error) {
 		ExchangeBaseURL:   exchange.BaseURL,
 
 		// Trading settings from MongoDB
-		TradingConfig: userExchangeKey.Config,
+		TradingConfig: tradingConfig,
+
+		// Simple config (raw from MongoDB)
+		SimpleConfig: userExchangeKey.SimpleConfig,
 
 		// Redis settings from env
 		RedisAddr:     getEnv("REDIS_ADDR", "localhost:6379"),
@@ -340,6 +366,99 @@ type RiskActions struct {
 	RiskRefreshMult float64 `json:"risk_refresh_mult" bson:"risk_refresh_mult"` // Multiply refresh interval by this factor in RISK mode
 }
 
+// SimpleConfig is a minimal configuration that auto-generates ladder params
+type SimpleConfig struct {
+	Symbol     string `json:"symbol" bson:"symbol"`
+	BaseAsset  string `json:"base_asset" bson:"base_asset"`
+	QuoteAsset string `json:"quote_asset" bson:"quote_asset"`
+
+	// Bot type: "maker-bid", "maker-ask", "mm-engine"
+	BotType string `json:"bot_type" bson:"bot_type"`
+
+	// Main params
+	SpreadMinBps        float64 `json:"spread_min_bps" bson:"spread_min_bps"`
+	SpreadMaxBps        float64 `json:"spread_max_bps" bson:"spread_max_bps"`
+	NumLevels           int     `json:"num_levels" bson:"num_levels"`
+	TargetDepthNotional float64 `json:"target_depth_notional" bson:"target_depth_notional"`
+	TargetRatio         float64 `json:"target_ratio" bson:"target_ratio"`
+
+	// Optional params
+	DrawdownLimitPct   float64 `json:"drawdown_limit_pct,omitempty" bson:"drawdown_limit_pct,omitempty"`
+	MaxFillsPerMin     float64 `json:"max_fills_per_min,omitempty" bson:"max_fills_per_min,omitempty"`
+	SkewK              float64 `json:"skew_k,omitempty" bson:"skew_k,omitempty"`
+	MaxSkewBps         int     `json:"max_skew_bps,omitempty" bson:"max_skew_bps,omitempty"`
+	ImbalanceThreshold float64 `json:"imbalance_threshold,omitempty" bson:"imbalance_threshold,omitempty"`
+	TickIntervalMs     int     `json:"tick_interval_ms,omitempty" bson:"tick_interval_ms,omitempty"`
+
+	// Simple Maker specific params
+	LadderRegenBps    float64 `json:"ladder_regen_bps,omitempty" bson:"ladder_regen_bps,omitempty"`         // mid change (bps) to regenerate ladder (default 50 = 0.5%)
+	MinBalanceToTrade float64 `json:"min_balance_to_trade,omitempty" bson:"min_balance_to_trade,omitempty"` // minimum balance to trade
+	LevelStepBps      float64 `json:"level_step_bps,omitempty" bson:"level_step_bps,omitempty"`             // DEPRECATED: use level_gap_ticks_max
+	LevelGapTicksMax  int     `json:"level_gap_ticks_max,omitempty" bson:"level_gap_ticks_max,omitempty"`   // max random ticks between levels (default 3)
+}
+
+// ToTradingConfig converts SimpleConfig to TradingConfig with auto-generated ladder
+func (s *SimpleConfig) ToTradingConfig() TradingConfig {
+	// Set defaults
+	numLevels := s.NumLevels
+	if numLevels == 0 {
+		numLevels = 20
+	}
+	spreadMinBps := s.SpreadMinBps
+	if spreadMinBps == 0 {
+		spreadMinBps = 50
+	}
+	spreadMaxBps := s.SpreadMaxBps
+	if spreadMaxBps == 0 {
+		spreadMaxBps = 100
+	}
+	targetRatio := s.TargetRatio
+	if targetRatio == 0 {
+		targetRatio = 0.5
+	}
+	skewK := s.SkewK
+	if skewK == 0 {
+		skewK = 2.0
+	}
+	maxSkewBps := s.MaxSkewBps
+	if maxSkewBps == 0 {
+		maxSkewBps = 200
+	}
+
+	// Generate ladder offsets (exponential distribution)
+	offsets := make([]int, numLevels)
+	sizes := make([]float64, numLevels)
+	maxOffset := spreadMaxBps * 5 // furthest level at 5x max spread
+
+	for i := 0; i < numLevels; i++ {
+		progress := float64(i) / float64(numLevels-1)
+		// Exponential-ish growth
+		offsets[i] = int(spreadMinBps + (maxOffset-spreadMinBps)*progress*progress)
+		// Size decreases with distance
+		sizes[i] = 1.0 - 0.8*progress
+		if sizes[i] < 0.1 {
+			sizes[i] = 0.1
+		}
+	}
+
+	// Calculate quote per order to hit target depth
+	quotePerOrder := s.TargetDepthNotional / float64(numLevels*2) * 1.2
+
+	return TradingConfig{
+		Type:          "simple",
+		Symbol:        s.Symbol,
+		BaseAsset:     s.BaseAsset,
+		QuoteAsset:    s.QuoteAsset,
+		TargetRatio:   targetRatio,
+		OffsetsBps:    offsets,
+		SizeMult:      sizes,
+		QuotePerOrder: quotePerOrder,
+		K:             skewK,
+		MaxSkewBps:    maxSkewBps,
+		MinOffsetBps:  int(spreadMinBps),
+	}
+}
+
 // UserExchangeKey represents the MongoDB document structure for user_exchange_keys collection
 type UserExchangeKey struct {
 	ID                  primitive.ObjectID  `bson:"_id,omitempty"`
@@ -357,7 +476,7 @@ type UserExchangeKey struct {
 	IsActive            bool                `bson:"isActive"`
 	IsRunning           bool                `bson:"isRunning"`
 	IsConfigUpdated     *bool               `bson:"isConfigUpdated,omitempty"`
-	Config              TradingConfig       `bson:"config"`
+	SimpleConfig        SimpleConfig        `bson:"config"`
 	CreatedAt           time.Time           `bson:"createdAt"`
 	UpdatedAt           time.Time           `bson:"updatedAt"`
 }

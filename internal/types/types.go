@@ -78,40 +78,26 @@ type EngineState struct {
 	LastRefreshMs    int64   // Last refresh timestamp in milliseconds
 }
 
-// TradingConfigUpdate represents trading config from MongoDB for hot reload
-type TradingConfigUpdate struct {
-	Type       string `bson:"type"`
+// SimpleConfigUpdate represents simple_config from MongoDB for hot reload
+type SimpleConfigUpdate struct {
 	Symbol     string `bson:"symbol"`
 	BaseAsset  string `bson:"base_asset"`
 	QuoteAsset string `bson:"quote_asset"`
 
-	// Inventory target
-	TargetRatio float64 `bson:"target_ratio"`
+	// Main params
+	SpreadMinBps        float64 `bson:"spread_min_bps"`
+	SpreadMaxBps        float64 `bson:"spread_max_bps"`
+	NumLevels           int     `bson:"num_levels"`
+	TargetDepthNotional float64 `bson:"target_depth_notional"`
+	TargetRatio         float64 `bson:"target_ratio"`
 
-	// Ladder configuration
-	OffsetsBps    []int     `bson:"offsets_bps"`
-	SizeMult      []float64 `bson:"size_mult"`
-	QuotePerOrder float64   `bson:"quote_per_order"`
-
-	// Skew parameters
-	Deadzone           float64 `bson:"deadzone"`
-	K                  float64 `bson:"k"`
-	MaxSkewBps         int     `bson:"max_skew_bps"`
-	MinOffsetBps       int     `bson:"min_offset_bps"`
-	DSkewMaxBpsPerTick int     `bson:"d_skew_max_bps_per_tick"`
-
-	// Replace thresholds
-	ReplaceThresholds ReplaceThresholds `bson:"replace_thresholds"`
-
-	// Risk thresholds
-	RiskThresholds RiskThresholds `bson:"risk_thresholds"`
-
-	// Risk actions
-	RiskActions RiskActions `bson:"risk_actions"`
-
-	// Refresh configuration
-	RefreshBaseSec   int     `bson:"refresh_base_sec"`
-	RefreshJitterPct float64 `bson:"refresh_jitter_pct"`
+	// Optional params
+	DrawdownLimitPct   float64 `bson:"drawdown_limit_pct,omitempty"`
+	MaxFillsPerMin     float64 `bson:"max_fills_per_min,omitempty"`
+	SkewK              float64 `bson:"skew_k,omitempty"`
+	MaxSkewBps         int     `bson:"max_skew_bps,omitempty"`
+	ImbalanceThreshold float64 `bson:"imbalance_threshold,omitempty"`
+	TickIntervalMs     int     `bson:"tick_interval_ms,omitempty"`
 }
 
 type ReplaceThresholds struct {

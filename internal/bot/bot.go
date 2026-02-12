@@ -279,40 +279,36 @@ func (b *Bot) checkAndReloadConfig() {
 		return
 	}
 
-	if !configUpdate.IsUpdated || configUpdate.Config == nil {
+	if !configUpdate.IsUpdated || configUpdate.SimpleConfig == nil {
 		return
 	}
 
-	log.Printf("Config update detected, reloading trading config...")
+	log.Printf("Config update detected, reloading simple_config...")
+
+	// Convert SimpleConfigUpdate to SimpleConfig for ToTradingConfig
+	simpleConfig := config.SimpleConfig{
+		Symbol:              configUpdate.SimpleConfig.Symbol,
+		BaseAsset:           configUpdate.SimpleConfig.BaseAsset,
+		QuoteAsset:          configUpdate.SimpleConfig.QuoteAsset,
+		SpreadMinBps:        configUpdate.SimpleConfig.SpreadMinBps,
+		SpreadMaxBps:        configUpdate.SimpleConfig.SpreadMaxBps,
+		NumLevels:           configUpdate.SimpleConfig.NumLevels,
+		TargetDepthNotional: configUpdate.SimpleConfig.TargetDepthNotional,
+		TargetRatio:         configUpdate.SimpleConfig.TargetRatio,
+		DrawdownLimitPct:    configUpdate.SimpleConfig.DrawdownLimitPct,
+		MaxFillsPerMin:      configUpdate.SimpleConfig.MaxFillsPerMin,
+		SkewK:               configUpdate.SimpleConfig.SkewK,
+		MaxSkewBps:          configUpdate.SimpleConfig.MaxSkewBps,
+		ImbalanceThreshold:  configUpdate.SimpleConfig.ImbalanceThreshold,
+		TickIntervalMs:      configUpdate.SimpleConfig.TickIntervalMs,
+	}
+
+	// Convert to TradingConfig
+	newTradingConfig := simpleConfig.ToTradingConfig()
 
 	// Update trading config
 	b.mu.Lock()
-	b.cfg.TradingConfig.TargetRatio = configUpdate.Config.TargetRatio
-	b.cfg.TradingConfig.OffsetsBps = configUpdate.Config.OffsetsBps
-	b.cfg.TradingConfig.SizeMult = configUpdate.Config.SizeMult
-	b.cfg.TradingConfig.QuotePerOrder = configUpdate.Config.QuotePerOrder
-	b.cfg.TradingConfig.Deadzone = configUpdate.Config.Deadzone
-	b.cfg.TradingConfig.K = configUpdate.Config.K
-	b.cfg.TradingConfig.MaxSkewBps = configUpdate.Config.MaxSkewBps
-	b.cfg.TradingConfig.MinOffsetBps = configUpdate.Config.MinOffsetBps
-	b.cfg.TradingConfig.DSkewMaxBpsPerTick = configUpdate.Config.DSkewMaxBpsPerTick
-	b.cfg.TradingConfig.RefreshBaseSec = configUpdate.Config.RefreshBaseSec
-	b.cfg.TradingConfig.RefreshJitterPct = configUpdate.Config.RefreshJitterPct
-
-	// Update thresholds
-	b.cfg.TradingConfig.ReplaceThresholds.RepriceThresholdBps = configUpdate.Config.ReplaceThresholds.RepriceThresholdBps
-	b.cfg.TradingConfig.ReplaceThresholds.InvDevThreshold = configUpdate.Config.ReplaceThresholds.InvDevThreshold
-	b.cfg.TradingConfig.ReplaceThresholds.MaxOrderAgeSec = configUpdate.Config.ReplaceThresholds.MaxOrderAgeSec
-
-	b.cfg.TradingConfig.RiskThresholds.TtfFastSec = configUpdate.Config.RiskThresholds.TtfFastSec
-	b.cfg.TradingConfig.RiskThresholds.FillSpikePerMin = configUpdate.Config.RiskThresholds.FillSpikePerMin
-	b.cfg.TradingConfig.RiskThresholds.ImbHigh = configUpdate.Config.RiskThresholds.ImbHigh
-	b.cfg.TradingConfig.RiskThresholds.ImbLow = configUpdate.Config.RiskThresholds.ImbLow
-	b.cfg.TradingConfig.RiskThresholds.DriftFastPerHour = configUpdate.Config.RiskThresholds.DriftFastPerHour
-
-	b.cfg.TradingConfig.RiskActions.RiskSpreadMult = configUpdate.Config.RiskActions.RiskSpreadMult
-	b.cfg.TradingConfig.RiskActions.RiskSizeMult = configUpdate.Config.RiskActions.RiskSizeMult
-	b.cfg.TradingConfig.RiskActions.RiskRefreshMult = configUpdate.Config.RiskActions.RiskRefreshMult
+	b.cfg.TradingConfig = newTradingConfig
 	b.mu.Unlock()
 
 	// Cancel all orders on exchange and clear Redis to force new orders with new config
@@ -331,10 +327,10 @@ func (b *Bot) checkAndReloadConfig() {
 	b.state = &types.EngineState{}
 
 	log.Printf("Config reloaded successfully: TargetRatio=%.2f, QuotePerOrder=%.2f, K=%.2f, Levels=%d",
-		configUpdate.Config.TargetRatio,
-		configUpdate.Config.QuotePerOrder,
-		configUpdate.Config.K,
-		len(configUpdate.Config.OffsetsBps))
+		newTradingConfig.TargetRatio,
+		newTradingConfig.QuotePerOrder,
+		newTradingConfig.K,
+		len(newTradingConfig.OffsetsBps))
 }
 
 // convertToGateSymbol converts symbol from "BTCUSDT" to "BTC_USDT" format

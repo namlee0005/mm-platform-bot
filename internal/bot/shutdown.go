@@ -6,7 +6,7 @@ import (
 	"time"
 )
 
-// shutdown performs graceful shutdown of all bot components
+// shutdown performs a graceful shutdown of all bot components
 func (b *Bot) shutdown(ctx context.Context) error {
 	log.Println("Initiating graceful shutdown...")
 
@@ -55,7 +55,7 @@ func (b *Bot) shutdown(ctx context.Context) error {
 	return nil
 }
 
-// emergencyShutdown performs immediate shutdown without cleanup
+// emergencyShutdown performs immediate shutdown without a cleanup
 func (b *Bot) emergencyShutdown() {
 	log.Println("Emergency shutdown initiated!")
 
