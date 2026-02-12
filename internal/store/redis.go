@@ -348,6 +348,7 @@ type OrderInfo struct {
 	Quantity      float64 `json:"quantity"`
 	CreatedAt     int64   `json:"createdAt"` // Unix milliseconds
 	Status        string  `json:"status"`
+	BotID         string  `json:"botId,omitempty"` // Bot instance ID
 }
 
 // SaveOrder saves order information to Redis List

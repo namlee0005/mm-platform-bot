@@ -879,62 +879,73 @@ func (m *SimpleMaker) computeDesiredOrdersWithBalance(mid float64, availableBala
 
 // executeOrderDiff cancels orders that don't match and places new ones
 // Returns the count of orders placed (used to skip next tick if many orders placed)
+// Uses PRICE TOLERANCE: orders within maxGapTicks are considered matching (avoid churn from random gaps)
 func (m *SimpleMaker) executeOrderDiff(desired []SimpleDesiredOrder, current []*exchange.Order, mid float64) int {
 	now := time.Now().UnixMilli()
 	placedCount := 0
 
-	// Create map of current orders by price (rounded)
-	currentByPrice := make(map[float64]*exchange.Order)
+	// Price tolerance: allow up to maxGapTicks difference (since we use random gaps)
+	maxGapTicks := m.cfg.LevelGapTicksMax
+	if maxGapTicks <= 0 {
+		maxGapTicks = 3
+	}
+	priceTolerance := m.tickSize * float64(maxGapTicks)
+
+	// Track which current orders are matched to desired orders
+	usedCurrentOrders := make(map[string]bool)
+	matchedDesiredIdx := make(map[int]bool)
+
+	// For each current order, find the closest desired order within tolerance
 	for _, o := range current {
-		priceKey := m.roundToTick(o.Price)
-		currentByPrice[priceKey] = o
-	}
+		bestMatch := -1
+		bestDiff := priceTolerance + 1 // Start with value > tolerance
 
-	// Create set of desired prices
-	desiredPrices := make(map[float64]bool)
-	for _, d := range desired {
-		desiredPrices[m.roundToTick(d.Price)] = true
-	}
+		for i, d := range desired {
+			if matchedDesiredIdx[i] {
+				continue // Already matched to another current order
+			}
 
-	// Track which current orders are still needed
-	usedOrders := make(map[string]bool)
+			priceDiff := math.Abs(o.Price - d.Price)
+			if priceDiff <= priceTolerance && priceDiff < bestDiff {
+				bestMatch = i
+				bestDiff = priceDiff
+			}
+		}
 
-	// For each desired order, check if we have a matching current order
-	for _, d := range desired {
-		priceKey := m.roundToTick(d.Price)
-
-		if existing, ok := currentByPrice[priceKey]; ok {
-			// Check if qty is close enough (within 5%)
-			qtyDiff := math.Abs(existing.Quantity-d.Qty) / d.Qty
-			if qtyDiff < 0.05 {
+		if bestMatch >= 0 {
+			// Found a match - check qty
+			d := desired[bestMatch]
+			qtyDiff := math.Abs(o.Quantity-d.Qty) / d.Qty
+			if qtyDiff < 0.15 { // Allow 15% qty difference
 				// Keep this order
-				usedOrders[existing.OrderID] = true
-				continue
+				usedCurrentOrders[o.OrderID] = true
+				matchedDesiredIdx[bestMatch] = true
+			} else {
+				// Qty changed too much - cancel (will be replaced)
+				reason := fmt.Sprintf("qty_changed(%.0f%%)", qtyDiff*100)
+				m.cancelOrder(o, now, reason)
 			}
-			// Qty changed too much - will cancel and replace
-			reason := fmt.Sprintf("qty_changed(%.0f%%)", qtyDiff*100)
-			m.cancelOrder(existing, now, reason)
 		}
+		// If no match found, order will be cancelled below
+	}
 
-		// Need to place new order
-		reason := "new_level"
-		if len(current) == 0 {
-			reason = "ladder_init"
-		}
-		if m.placeOrder(d, now, reason) {
-			placedCount++
+	// Cancel unmatched current orders (outside desired price range)
+	for _, o := range current {
+		if !usedCurrentOrders[o.OrderID] {
+			m.cancelOrder(o, now, "price_drift")
 		}
 	}
 
-	// Cancel orders that are not needed (price no longer in desired)
-	for _, o := range current {
-		if !usedOrders[o.OrderID] {
-			priceKey := m.roundToTick(o.Price)
-			reason := "price_out_of_range"
-			if !desiredPrices[priceKey] {
-				reason = "level_removed"
+	// Place orders for unmatched desired levels
+	for i, d := range desired {
+		if !matchedDesiredIdx[i] {
+			reason := "new_level"
+			if len(current) == 0 {
+				reason = "ladder_init"
 			}
-			m.cancelOrder(o, now, reason)
+			if m.placeOrder(d, now, reason) {
+				placedCount++
+			}
 		}
 	}
 
@@ -974,6 +985,7 @@ func (m *SimpleMaker) placeOrder(d SimpleDesiredOrder, timestamp int64, reason s
 			Quantity:      d.Qty,
 			CreatedAt:     timestamp,
 			Status:        "NEW",
+			BotID:         m.cfg.BotID,
 		}
 		m.redis.SaveOrder(m.ctx, orderInfo)
 	}
