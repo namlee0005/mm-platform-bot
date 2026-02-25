@@ -9,12 +9,14 @@ import (
 	"syscall"
 	"time"
 
+	"mm-platform-engine/internal/bot"
 	"mm-platform-engine/internal/config"
-	"mm-platform-engine/internal/engine"
+	"mm-platform-engine/internal/core"
 	"mm-platform-engine/internal/exchange"
 	"mm-platform-engine/internal/exchange/gate"
 	"mm-platform-engine/internal/exchange/mexc"
 	"mm-platform-engine/internal/store"
+	"mm-platform-engine/internal/strategy"
 )
 
 func main() {
@@ -71,13 +73,13 @@ func main() {
 		log.Fatal("bot_type is required in config (maker-bid or maker-ask)")
 	}
 
-	var botSide engine.BotSide
+	var botSide strategy.BotSide
 	switch strings.ToLower(botType) {
 	case "maker-bid", "bid":
-		botSide = engine.BotSideBid
+		botSide = strategy.BotSideBid
 		log.Println("Mode: MAKER-BID (BUY orders only) - FIXED")
 	case "maker-ask", "ask":
-		botSide = engine.BotSideAsk
+		botSide = strategy.BotSideAsk
 		log.Println("Mode: MAKER-ASK (SELL orders only) - FIXED")
 	default:
 		log.Fatalf("Invalid bot_type: %s (must be 'maker-bid' or 'maker-ask')", botType)
@@ -85,21 +87,23 @@ func main() {
 
 	// Create simple maker config from loaded config
 	simpleConfig := cfg.SimpleConfig
-	makerCfg := &engine.SimpleMakerConfig{
+	makerCfg := &bot.SimpleMakerConfig{
 		Symbol:              simpleConfig.Symbol,
 		BaseAsset:           simpleConfig.BaseAsset,
 		QuoteAsset:          simpleConfig.QuoteAsset,
+		Exchange:            exchangeName,
+		ExchangeID:          cfg.UserExchangeKeyID,
+		BotID:               botID,
+		BotType:             botType,
+		TickIntervalMs:      simpleConfig.TickIntervalMs,
 		BotSide:             botSide,
 		SpreadBps:           simpleConfig.SpreadMinBps,
 		NumLevels:           simpleConfig.NumLevels,
 		TargetDepthNotional: simpleConfig.TargetDepthNotional,
-		TickIntervalMs:      simpleConfig.TickIntervalMs,
-		LadderRegenBps:      simpleConfig.LadderRegenBps,
-		MinBalanceToTrade:   simpleConfig.MinBalanceToTrade,
-		LevelGapTicksMax:    simpleConfig.LevelGapTicksMax,
 		DepthBps:            simpleConfig.DepthBps,
-		Exchange:            exchangeName,
-		BotID:               botID,
+		MinBalanceToTrade:   simpleConfig.MinBalanceToTrade,
+		LadderRegenBps:      simpleConfig.LadderRegenBps,
+		LevelGapTicksMax:    simpleConfig.LevelGapTicksMax,
 	}
 
 	// Set defaults if not configured
@@ -128,11 +132,11 @@ func main() {
 	log.Printf("Simple Maker config: side=%s, spread=%.0fbps, levels=%d, gapTicks=1-%d, depth=$%.0f, depthBps=%.0f, regenBps=%.0f",
 		makerCfg.BotSide, makerCfg.SpreadBps, makerCfg.NumLevels, makerCfg.LevelGapTicksMax, makerCfg.TargetDepthNotional, makerCfg.DepthBps, makerCfg.LadderRegenBps)
 
-	// Create simple maker
-	maker := engine.NewSimpleMaker(makerCfg, exch, redis, mongo)
+	// Create simple maker using new bot factory
+	maker := bot.NewSimpleMaker(makerCfg, exch, redis, mongo)
 
 	// Wire up Redis Stream for order events (silent - no log)
-	maker.SetOrderEventCallback(func(event engine.OrderEvent) {
+	maker.SetOrderEventCallback(func(event core.BotOrderEvent) {
 		mmEvent := &store.MMOrderEvent{
 			Type:      string(event.Type),
 			Exchange:  exchangeName,

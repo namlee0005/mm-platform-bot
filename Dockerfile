@@ -17,7 +17,7 @@ RUN go mod download
 COPY . .
 
 # Build the application
-RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o mm-bot ./cmd/simple-maker/main.go
+RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o mm-bot ./cmd/main/main.go
 
 # Final stage
 FROM alpine:latest
