@@ -74,7 +74,7 @@ func NewSimpleMaker(
 		TickIntervalMs: cfg.TickIntervalMs,
 	}
 
-	cfg.DebugCancelSleep = true
+	//cfg.DebugCancelSleep = false
 
 	// Create strategy config
 	strategyCfg := &strategy.SimpleLadderConfig{
