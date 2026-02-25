@@ -513,64 +513,104 @@ func (s *SimpleLadderStrategy) computeDesiredOrders(mid float64, availableBalanc
 		depthBps = 200
 	}
 
-	var minPrice, maxPrice float64
-	if s.cfg.BotSide == BotSideBid {
-		minPrice = mid * (1.0 - depthBps/10000.0)
-		maxPrice = mid
-	} else {
-		minPrice = mid
-		maxPrice = mid * (1.0 + depthBps/10000.0)
+	spreadBps := s.cfg.SpreadBps
+	if spreadBps <= 0 {
+		spreadBps = 50
 	}
 
-	// Calculate first level price
-	offsetMult := s.cfg.SpreadBps / 10000.0
-	var firstPrice float64
-	if s.cfg.BotSide == BotSideBid {
-		firstPrice = mid * (1.0 - offsetMult)
-	} else {
-		firstPrice = mid * (1.0 + offsetMult)
+	numLevels := s.cfg.NumLevels
+	if numLevels <= 0 {
+		numLevels = 5
 	}
-	firstPrice = s.roundToTick(firstPrice)
 
+	// Calculate price range for ladder
+	// First level: at spreadBps from mid
+	// Last level: at depthBps from mid
+	// Distribute levels evenly within this range
+
+	var firstPrice, lastPrice float64
+	if s.cfg.BotSide == BotSideBid {
+		firstPrice = mid * (1.0 - spreadBps/10000.0)
+		lastPrice = mid * (1.0 - depthBps/10000.0)
+	} else {
+		firstPrice = mid * (1.0 + spreadBps/10000.0)
+		lastPrice = mid * (1.0 + depthBps/10000.0)
+	}
+
+	// Calculate base step between levels (in price)
+	priceRange := math.Abs(lastPrice - firstPrice)
+	baseStep := priceRange / float64(numLevels-1)
+	if numLevels == 1 {
+		baseStep = 0
+	}
+
+	// Max jitter: ±LevelGapTicksMax ticks (but stay within bounds)
 	maxGapTicks := s.cfg.LevelGapTicksMax
 	if maxGapTicks <= 0 {
 		maxGapTicks = 3
 	}
+	maxJitter := s.tickSize * float64(maxGapTicks)
 
-	// Pass 1: Generate prices
-	numLevels := s.cfg.NumLevels
+	// Generate prices: evenly distributed with small random jitter
 	levelPrices := make([]float64, 0, numLevels)
-	currentPrice := firstPrice
 
 	for level := 0; level < numLevels; level++ {
-		var price float64
-		if level == 0 {
-			price = currentPrice
+		var basePrice float64
+		if s.cfg.BotSide == BotSideBid {
+			// Bid: firstPrice (highest) -> lastPrice (lowest)
+			basePrice = firstPrice - baseStep*float64(level)
 		} else {
-			gapTicks := 1 + rand.Intn(maxGapTicks)
-			if s.cfg.BotSide == BotSideBid {
-				currentPrice = currentPrice - s.tickSize*float64(gapTicks)
-			} else {
-				currentPrice = currentPrice + s.tickSize*float64(gapTicks)
-			}
-			price = currentPrice
+			// Ask: firstPrice (lowest) -> lastPrice (highest)
+			basePrice = firstPrice + baseStep*float64(level)
 		}
+
+		// Add random jitter (except for first and last levels to maintain bounds)
+		var price float64
+		if level == 0 || level == numLevels-1 {
+			price = basePrice
+		} else {
+			// Random jitter: ±maxJitter, but more likely to be small
+			jitter := (rand.Float64()*2 - 1) * maxJitter * 0.5 // ±50% of maxJitter
+			price = basePrice + jitter
+		}
+
 		price = s.roundToTick(price)
 
-		// Check depth limit
-		if s.cfg.BotSide == BotSideBid && price < minPrice {
-			break
-		}
-		if s.cfg.BotSide == BotSideAsk && price > maxPrice {
-			break
+		// Ensure within bounds
+		if s.cfg.BotSide == BotSideBid {
+			minPrice := mid * (1.0 - depthBps/10000.0)
+			if price < minPrice {
+				price = s.roundToTick(minPrice)
+			}
+			if price > mid {
+				price = s.roundToTick(mid * (1.0 - spreadBps/10000.0))
+			}
+		} else {
+			maxPrice := mid * (1.0 + depthBps/10000.0)
+			if price > maxPrice {
+				price = s.roundToTick(maxPrice)
+			}
+			if price < mid {
+				price = s.roundToTick(mid * (1.0 + spreadBps/10000.0))
+			}
 		}
 
 		levelPrices = append(levelPrices, price)
 	}
 
+	// Remove duplicate prices (can happen with small ranges and rounding)
+	levelPrices = s.removeDuplicatePrices(levelPrices)
+
 	actualLevels := len(levelPrices)
 	if actualLevels == 0 {
 		return nil
+	}
+
+	// Warn if we couldn't fit all requested levels
+	if actualLevels < numLevels {
+		ticksInRange := priceRange / s.tickSize
+		log.Printf("[%s] WARNING: Only %d/%d levels fit in range. Price range=%.8f, tickSize=%.8f, ticks=%.0f",
+			s.Name(), actualLevels, numLevels, priceRange, s.tickSize, ticksInRange)
 	}
 
 	// Pass 2: Calculate weighted sizes
@@ -675,4 +715,25 @@ func (s *SimpleLadderStrategy) roundToStep(qty float64) float64 {
 		return qty
 	}
 	return math.Floor(qty/s.stepSize) * s.stepSize
+}
+
+// removeDuplicatePrices removes duplicate prices from the slice
+func (s *SimpleLadderStrategy) removeDuplicatePrices(prices []float64) []float64 {
+	if len(prices) <= 1 {
+		return prices
+	}
+
+	seen := make(map[float64]bool)
+	result := make([]float64, 0, len(prices))
+
+	for _, p := range prices {
+		// Round to avoid floating point comparison issues
+		key := math.Round(p/s.tickSize) * s.tickSize
+		if !seen[key] {
+			seen[key] = true
+			result = append(result, p)
+		}
+	}
+
+	return result
 }
