@@ -141,6 +141,9 @@ func (b *BaseBot) Start(ctx context.Context) error {
 		return fmt.Errorf("failed to get initial balance: %w", err)
 	}
 
+	// Publish initial balances to Redis
+	b.publishAllBalancesToRedis()
+
 	snap, err := b.getSnapshot()
 	if err != nil {
 		return fmt.Errorf("failed to get initial snapshot: %w", err)
@@ -312,6 +315,8 @@ func (b *BaseBot) tick() error {
 		log.Printf("[%s] Keep orders: %s", b.strategy.Name(), output.Reason)
 	case TickActionReplace:
 		return b.replaceOrders(output.DesiredOrders, output.Reason)
+	case TickActionAmend:
+		return b.amendOrders(output.OrdersToCancel, output.OrdersToAdd, output.Reason)
 	}
 
 	// Log tick summary
@@ -340,10 +345,11 @@ func (b *BaseBot) handleAccountUpdate(event *types.AccountEvent) {
 	// Update balance tracker
 	b.balanceTracker.UpdateFromEvent(event)
 
-	// Publish to Redis
+	// Publish ALL cached balances to Redis (not just changed ones from event)
 	if b.redis != nil && b.cfg.Exchange != "" && b.cfg.BotID != "" {
+		cachedBalances := b.balanceTracker.GetAllBalances()
 		var allBalances []store.AssetBalance
-		for _, bal := range event.Balances {
+		for _, bal := range cachedBalances {
 			if bal.Free > 0 || bal.Locked > 0 {
 				allBalances = append(allBalances, store.AssetBalance{
 					Asset:  bal.Asset,
@@ -358,20 +364,45 @@ func (b *BaseBot) handleAccountUpdate(event *types.AccountEvent) {
 	}
 }
 
+// publishAllBalancesToRedis publishes all cached balances to Redis
+func (b *BaseBot) publishAllBalancesToRedis() {
+	if b.redis == nil || b.cfg.Exchange == "" || b.cfg.BotID == "" {
+		return
+	}
+
+	cachedBalances := b.balanceTracker.GetAllBalances()
+	var allBalances []store.AssetBalance
+	for _, bal := range cachedBalances {
+		if bal.Free > 0 || bal.Locked > 0 {
+			allBalances = append(allBalances, store.AssetBalance{
+				Asset:  bal.Asset,
+				Free:   bal.Free,
+				Locked: bal.Locked,
+			})
+		}
+	}
+	if len(allBalances) > 0 {
+		b.redis.SetMMBalances(b.ctx, b.cfg.Exchange, b.cfg.Symbol, b.cfg.BotID, allBalances)
+	}
+}
+
 func (b *BaseBot) handleOrderUpdate(event *types.OrderEvent) {
 	// Update order tracker
 	switch event.Status {
 	case "NEW":
-		b.orderTracker.Add(&LiveOrder{
-			OrderID:       event.OrderID,
-			ClientOrderID: event.ClientOrderID,
-			Side:          event.Side,
-			Price:         event.Price,
-			Qty:           event.Quantity,
-			RemainingQty:  event.Quantity,
-			LevelIndex:    parseLevelFromTag(event.ClientOrderID),
-			PlacedAt:      event.Timestamp,
-		})
+		// Only add if not already exists (logOrderPlaced already added with requestedPrice)
+		if existing := b.orderTracker.Get(event.OrderID); existing == nil {
+			b.orderTracker.Add(&LiveOrder{
+				OrderID:       event.OrderID,
+				ClientOrderID: event.ClientOrderID,
+				Side:          event.Side,
+				Price:         event.Price,
+				Qty:           event.Quantity,
+				RemainingQty:  event.Quantity,
+				LevelIndex:    parseLevelFromTag(event.ClientOrderID),
+				PlacedAt:      event.Timestamp,
+			})
+		}
 	case "PARTIALLY_FILLED":
 		b.orderTracker.UpdateRemaining(event.OrderID, event.Quantity-event.ExecutedQty)
 	case "FILLED", "CANCELED", "EXPIRED", "REJECTED":
@@ -391,6 +422,50 @@ func (b *BaseBot) handleOrderUpdate(event *types.OrderEvent) {
 		Timestamp:     event.Timestamp,
 	})
 
+	// Emit order event callback
+	if b.onOrderEvent != nil {
+		var eventType OrderEventType
+		switch event.Status {
+		case "NEW":
+			eventType = OrderEventTypePlace
+		case "CANCELED":
+			eventType = OrderEventTypeCancel
+		case "FILLED":
+			eventType = OrderEventTypeFill
+		case "PARTIALLY_FILLED":
+			eventType = OrderEventTypePartialFill
+		default:
+			eventType = OrderEventType(event.Status)
+		}
+
+		b.onOrderEvent(BotOrderEvent{
+			Type:      eventType,
+			Symbol:    event.Symbol,
+			OrderID:   event.OrderID,
+			Side:      event.Side,
+			Price:     event.Price,
+			Qty:       event.Quantity,
+			Level:     parseLevelFromTag(event.ClientOrderID),
+			Reason:    event.Status,
+			Timestamp: event.Timestamp.UnixMilli(),
+		})
+	}
+
+	// Save to Redis on NEW
+	if event.Status == "NEW" && b.redis != nil {
+		b.redis.SaveOrder(b.ctx, &store.OrderInfo{
+			OrderID:       event.OrderID,
+			ClientOrderID: event.ClientOrderID,
+			Symbol:        event.Symbol,
+			Side:          event.Side,
+			Price:         event.Price,
+			Quantity:      event.Quantity,
+			CreatedAt:     event.Timestamp.UnixMilli(),
+			Status:        "NEW",
+			BotID:         b.cfg.BotID,
+		})
+	}
+
 	// Delete from Redis on cancel/fill
 	if event.Status == "CANCELED" || event.Status == "FILLED" {
 		if b.redis != nil {
@@ -398,9 +473,11 @@ func (b *BaseBot) handleOrderUpdate(event *types.OrderEvent) {
 		}
 	}
 
-	// Publish to Redis
+	// Publish to Redis Stream
 	if b.redis != nil {
-		b.redis.PublishOrderUpdate(b.ctx, event)
+		if err := b.redis.PublishOrderUpdate(b.ctx, event); err != nil {
+			log.Printf("[%s] Failed to publish order update to Redis: %v", b.strategy.Name(), err)
+		}
 	}
 }
 
@@ -549,8 +626,9 @@ func (b *BaseBot) replaceOrders(desired []DesiredOrder, reason string) error {
 		return nil
 	}
 
-	// Build order requests
+	// Build order requests and track requested prices
 	reqs := make([]*exchange.OrderRequest, len(desired))
+	reqPrices := make(map[string]float64) // clientOrderID -> requested price
 	for i, d := range desired {
 		reqs[i] = &exchange.OrderRequest{
 			Symbol:        b.cfg.Symbol,
@@ -560,6 +638,7 @@ func (b *BaseBot) replaceOrders(desired []DesiredOrder, reason string) error {
 			Quantity:      d.Qty,
 			ClientOrderID: d.Tag,
 		}
+		reqPrices[d.Tag] = d.Price
 	}
 
 	// Place orders via batch API
@@ -573,14 +652,14 @@ func (b *BaseBot) replaceOrders(desired []DesiredOrder, reason string) error {
 				log.Printf("[%s] Place order failed: %v", b.strategy.Name(), err)
 				continue
 			}
-			b.logOrderPlaced(order, req.ClientOrderID)
+			b.logOrderPlaced(order, req.ClientOrderID, req.Price)
 		}
 		return nil
 	}
 
 	// Log results
 	for _, order := range resp.Orders {
-		b.logOrderPlaced(order, order.ClientOrderID)
+		b.logOrderPlaced(order, order.ClientOrderID, reqPrices[order.ClientOrderID])
 	}
 	for _, errMsg := range resp.Errors {
 		log.Printf("[%s] Order error: %s", b.strategy.Name(), errMsg)
@@ -589,40 +668,94 @@ func (b *BaseBot) replaceOrders(desired []DesiredOrder, reason string) error {
 	return nil
 }
 
-func (b *BaseBot) logOrderPlaced(order *exchange.Order, tag string) {
+// amendOrders performs incremental update: cancel specific orders + add new orders
+func (b *BaseBot) amendOrders(toCancel []string, toAdd []DesiredOrder, reason string) error {
+	log.Printf("[%s] Amending orders (cancel=%d, add=%d): %s",
+		b.strategy.Name(), len(toCancel), len(toAdd), reason)
+
+	// Cancel specific orders
+	for _, orderID := range toCancel {
+		if err := b.exch.CancelOrder(b.ctx, b.cfg.Symbol, orderID); err != nil {
+			log.Printf("[%s] Cancel order %s failed: %v", b.strategy.Name(), orderID, err)
+			// Continue with other cancels
+		} else {
+			b.orderTracker.Remove(orderID)
+			log.Printf("[%s] Cancelled order %s", b.strategy.Name(), orderID)
+		}
+	}
+
+	// Add new orders
+	if len(toAdd) == 0 {
+		return nil
+	}
+
+	// Build order requests and track requested prices
+	reqs := make([]*exchange.OrderRequest, len(toAdd))
+	reqPrices := make(map[string]float64) // clientOrderID -> requested price
+	for i, d := range toAdd {
+		reqs[i] = &exchange.OrderRequest{
+			Symbol:        b.cfg.Symbol,
+			Side:          d.Side,
+			Type:          "LIMIT",
+			Price:         d.Price,
+			Quantity:      d.Qty,
+			ClientOrderID: d.Tag,
+		}
+		reqPrices[d.Tag] = d.Price
+	}
+
+	// Place orders via batch API
+	resp, err := b.exch.BatchPlaceOrders(b.ctx, reqs)
+	if err != nil {
+		// Fallback to individual orders
+		log.Printf("[%s] Batch add failed, falling back to individual orders: %v", b.strategy.Name(), err)
+		for _, req := range reqs {
+			order, err := b.exch.PlaceOrder(b.ctx, req)
+			if err != nil {
+				log.Printf("[%s] Place order failed: %v", b.strategy.Name(), err)
+				continue
+			}
+			b.logOrderPlaced(order, req.ClientOrderID, req.Price)
+		}
+		return nil
+	}
+
+	// Log results
+	for _, order := range resp.Orders {
+		b.logOrderPlaced(order, order.ClientOrderID, reqPrices[order.ClientOrderID])
+	}
+	for _, errMsg := range resp.Errors {
+		log.Printf("[%s] Order error: %s", b.strategy.Name(), errMsg)
+	}
+
+	return nil
+}
+
+func (b *BaseBot) logOrderPlaced(order *exchange.Order, tag string, requestedPrice float64) {
 	level := parseLevelFromTag(tag)
 	log.Printf("[%s] Placed %s L%d @ %.8f x %.6f (id=%s)",
 		b.strategy.Name(), order.Side, level, order.Price, order.Quantity, order.OrderID)
 
-	// Emit event
-	if b.onOrderEvent != nil {
-		b.onOrderEvent(BotOrderEvent{
-			Type:      OrderEventTypePlace,
-			Symbol:    b.cfg.Symbol,
-			OrderID:   order.OrderID,
-			Side:      order.Side,
-			Price:     order.Price,
-			Qty:       order.Quantity,
-			Level:     level,
-			Reason:    "new_level",
-			Timestamp: time.Now().UnixMilli(),
-		})
+	// Use requestedPrice for orderTracker (matches cached ladder for diffing)
+	// If requestedPrice is 0, fall back to exchange price
+	priceForTracker := requestedPrice
+	if priceForTracker == 0 {
+		priceForTracker = order.Price
 	}
 
-	// Save to Redis
-	if b.redis != nil {
-		b.redis.SaveOrder(b.ctx, &store.OrderInfo{
-			OrderID:       order.OrderID,
-			ClientOrderID: tag,
-			Symbol:        b.cfg.Symbol,
-			Side:          order.Side,
-			Price:         order.Price,
-			Quantity:      order.Quantity,
-			CreatedAt:     time.Now().UnixMilli(),
-			Status:        "NEW",
-			BotID:         b.cfg.BotID,
-		})
-	}
+	// Add to orderTracker immediately (don't wait for WebSocket NEW event)
+	b.orderTracker.Add(&LiveOrder{
+		OrderID:       order.OrderID,
+		ClientOrderID: tag,
+		Side:          order.Side,
+		Price:         priceForTracker,
+		Qty:           order.Quantity,
+		RemainingQty:  order.Quantity,
+		LevelIndex:    level,
+		PlacedAt:      time.Now(),
+	})
+
+	// Note: Events and Redis handled by handleOrderUpdate when WebSocket NEW arrives
 }
 
 // checkConfigUpdate checks for config updates from MongoDB

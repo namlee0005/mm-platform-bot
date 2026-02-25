@@ -10,7 +10,8 @@ type TickAction string
 
 const (
 	TickActionKeep      TickAction = "KEEP"       // Keep existing orders
-	TickActionReplace   TickAction = "REPLACE"    // Replace existing orders with new ones
+	TickActionReplace   TickAction = "REPLACE"    // Replace existing orders with new ones (cancel all + place all)
+	TickActionAmend     TickAction = "AMEND"      // Incremental update (cancel some + add some)
 	TickActionCancelAll TickAction = "CANCEL_ALL" // Cancel all orders (pause mode)
 )
 
@@ -56,11 +57,13 @@ type TickInput struct {
 
 // TickOutput contains the result of a strategy tick
 type TickOutput struct {
-	Action        TickAction
-	DesiredOrders []DesiredOrder
-	Metrics       map[string]float64 // Optional metrics for reporting
-	NewMode       Mode               // If strategy wants to change mode
-	Reason        string             // Reason for the action
+	Action         TickAction
+	DesiredOrders  []DesiredOrder     // For REPLACE action: all desired orders
+	OrdersToAdd    []DesiredOrder     // For AMEND action: orders to add
+	OrdersToCancel []string           // For AMEND action: order IDs to cancel
+	Metrics        map[string]float64 // Optional metrics for reporting
+	NewMode        Mode               // If strategy wants to change mode
+	Reason         string             // Reason for the action
 }
 
 // Snapshot is a point-in-time market data snapshot
@@ -153,10 +156,11 @@ type OrderEvent struct {
 type OrderEventType string
 
 const (
-	OrderEventTypePlace  OrderEventType = "place"
-	OrderEventTypeCancel OrderEventType = "cancel"
-	OrderEventTypeAmend  OrderEventType = "amend"
-	OrderEventTypeFill   OrderEventType = "fill"
+	OrderEventTypePlace       OrderEventType = "place"
+	OrderEventTypeCancel      OrderEventType = "cancel"
+	OrderEventTypeAmend       OrderEventType = "amend"
+	OrderEventTypeFill        OrderEventType = "fill"
+	OrderEventTypePartialFill OrderEventType = "partial_fill"
 )
 
 // BotOrderEvent represents an order event for broadcasting to external systems

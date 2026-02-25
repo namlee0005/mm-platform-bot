@@ -6,6 +6,7 @@ import (
 	"log"
 	"math"
 	"math/rand"
+	"sort"
 	"sync"
 	"time"
 
@@ -50,6 +51,9 @@ type SimpleLadderConfig struct {
 	MaxRebalanceMult  float64 `json:"max_rebalance_mult"` // Max size multiplier for rebalance (default 2.0)
 	MinRebalanceMult  float64 `json:"min_rebalance_mult"` // Min size multiplier for rebalance (default 0.2)
 	RebalanceDeadzone float64 `json:"rebalance_deadzone"` // Deadzone - no adjustment if deviation < this (default 0.05)
+
+	// Debug settings
+	DebugCancelSleep bool `json:"debug_cancel_sleep"` // Enable 30s sleep after cancel (for debugging WebSocket)
 }
 
 // SimpleLadderStrategy implements a one-sided market maker strategy
@@ -72,6 +76,11 @@ type SimpleLadderStrategy struct {
 	// Fill cooldown tracking
 	fillCooldowns  map[float64]int64 // price -> fill timestamp
 	fillCooldownMs int64
+	lastFillTime   int64 // Last fill timestamp (ms) for global cooldown
+
+	// Cancel tracking (for debug)
+	lastCancelTime int64           // Last EXTERNAL cancel timestamp (ms)
+	pendingCancels map[string]bool // Order IDs that bot is canceling (internal)
 
 	// Risk tracking
 	peakNAV        float64          // Peak NAV for drawdown calculation
@@ -160,6 +169,7 @@ func NewSimpleLadderStrategy(cfg *SimpleLadderConfig) *SimpleLadderStrategy {
 		cfg:            cfg,
 		fillCooldowns:  make(map[float64]int64),
 		fillCooldownMs: 5000 + rand.Int63n(5000),
+		pendingCancels: make(map[string]bool),
 		navHistory:     make([]navSnapshot, 0, 1000),
 		currentMode:    ModeNormal,
 	}
@@ -211,6 +221,37 @@ func (s *SimpleLadderStrategy) Tick(ctx context.Context, input *core.TickInput) 
 			Reason: fmt.Sprintf("PAUSED: drawdown %.2f%% exceeds limit %.2f%%",
 				drawdown*100, s.cfg.DrawdownLimitPct*100),
 		}, nil
+	}
+
+	// Check fill cooldown - don't place new orders immediately after a fill
+	s.mu.RLock()
+	lastFill := s.lastFillTime
+	cooldownMs := s.fillCooldownMs
+	lastCancel := s.lastCancelTime
+	s.mu.RUnlock()
+
+	if lastFill > 0 {
+		elapsed := time.Now().UnixMilli() - lastFill
+		if elapsed < cooldownMs {
+			remaining := cooldownMs - elapsed
+			return &core.TickOutput{
+				Action: core.TickActionKeep,
+				Reason: fmt.Sprintf("fill_cooldown: %dms remaining", remaining),
+			}, nil
+		}
+	}
+
+	// Debug: Sleep 30s after cancel to observe WebSocket events
+	if s.cfg.DebugCancelSleep && lastCancel > 0 {
+		const cancelSleepMs int64 = 30000 // 30 seconds
+		elapsed := time.Now().UnixMilli() - lastCancel
+		if elapsed < cancelSleepMs {
+			remaining := cancelSleepMs - elapsed
+			return &core.TickOutput{
+				Action: core.TickActionKeep,
+				Reason: fmt.Sprintf("DEBUG cancel_sleep: %dms remaining (observe WebSocket)", remaining),
+			}, nil
+		}
 	}
 
 	// Get available balance for this side
@@ -269,25 +310,51 @@ func (s *SimpleLadderStrategy) Tick(ctx context.Context, input *core.TickInput) 
 
 	_ = invRatio // suppress unused warning when rebalance disabled
 
-	// Check if we should replace orders
-	shouldReplace, reason := s.shouldReplaceOrders(mid, currentOrderCount, input.LiveOrders, desired)
+	// Compute order diff (incremental update)
+	diff := s.computeOrderDiff(input.LiveOrders, desired)
 
-	if shouldReplace {
+	metrics := map[string]float64{
+		"nav":       nav,
+		"drawdown":  drawdown,
+		"size_mult": sizeMult,
+	}
+
+	switch diff.Action {
+	case core.TickActionKeep:
+		return &core.TickOutput{
+			Action:  core.TickActionKeep,
+			Reason:  diff.Reason,
+			Metrics: metrics,
+		}, nil
+
+	case core.TickActionReplace:
 		return &core.TickOutput{
 			Action:        core.TickActionReplace,
 			DesiredOrders: desired,
-			Reason:        reason,
-			Metrics: map[string]float64{
-				"nav":       nav,
-				"drawdown":  drawdown,
-				"size_mult": sizeMult,
-			},
+			Reason:        diff.Reason,
+			Metrics:       metrics,
+		}, nil
+
+	case core.TickActionAmend:
+		// Mark orders as pending internal cancel (so we don't trigger debug sleep)
+		s.mu.Lock()
+		for _, orderID := range diff.OrdersToCancel {
+			s.pendingCancels[orderID] = true
+		}
+		s.mu.Unlock()
+
+		return &core.TickOutput{
+			Action:         core.TickActionAmend,
+			OrdersToCancel: diff.OrdersToCancel,
+			OrdersToAdd:    diff.OrdersToAdd,
+			Reason:         diff.Reason,
+			Metrics:        metrics,
 		}, nil
 	}
 
 	return &core.TickOutput{
 		Action: core.TickActionKeep,
-		Reason: "orders within tolerance",
+		Reason: "unknown_action",
 	}, nil
 }
 
@@ -508,18 +575,53 @@ func (s *SimpleLadderStrategy) GetPeakNAV() float64 {
 
 // OnFill handles fill events
 func (s *SimpleLadderStrategy) OnFill(event *core.FillEvent) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	now := time.Now().UnixMilli()
 	fillPrice := s.roundToTick(event.Price)
-	s.fillCooldowns[fillPrice] = time.Now().UnixMilli()
-	s.fillCooldownMs = 5000 + rand.Int63n(5000)
-	log.Printf("[%s] Fill cooldown set for price %.8f, will wait %dms",
+	s.fillCooldowns[fillPrice] = now
+	s.lastFillTime = now
+	s.fillCooldownMs = 5000 + rand.Int63n(5000) // 5-10 seconds random cooldown
+
+	// Clear cached ladder to force regeneration after cooldown
+	s.cachedLadder = nil
+
+	log.Printf("[%s] Fill at %.8f, cooldown %dms activated",
 		s.Name(), fillPrice, s.fillCooldownMs)
 }
 
 // OnOrderUpdate handles order status updates
 func (s *SimpleLadderStrategy) OnOrderUpdate(event *core.OrderEvent) {
-	// Log order updates
 	log.Printf("[%s] Order %s: %s @ %.8f status=%s",
 		s.Name(), event.OrderID, event.Side, event.Price, event.Status)
+
+	// If order was canceled
+	if event.Status == "CANCELED" || event.Status == "EXPIRED" || event.Status == "REJECTED" {
+		s.mu.Lock()
+
+		// Check if this is an internal cancel (bot initiated) or external (user/UI)
+		isInternalCancel := s.pendingCancels[event.OrderID]
+		if isInternalCancel {
+			// Remove from pending - this was our own cancel
+			delete(s.pendingCancels, event.OrderID)
+			s.mu.Unlock()
+			log.Printf("[%s] Internal cancel confirmed: %s", s.Name(), event.OrderID)
+			return
+		}
+
+		// External cancel - force ladder regeneration and maybe sleep
+		s.cachedLadder = nil
+		s.lastCancelTime = time.Now().UnixMilli()
+		s.mu.Unlock()
+
+		if s.cfg.DebugCancelSleep {
+			log.Printf("[%s] DEBUG: EXTERNAL cancel %s, will sleep 30s for WebSocket debug",
+				s.Name(), event.OrderID)
+		} else {
+			log.Printf("[%s] External cancel %s, will regenerate ladder", s.Name(), event.OrderID)
+		}
+	}
 }
 
 // UpdateConfig updates strategy config at runtime
@@ -650,12 +752,19 @@ func (s *SimpleLadderStrategy) computeDesiredOrders(mid float64, availableBalanc
 		baseStep = 0
 	}
 
-	// Max jitter: ±LevelGapTicksMax ticks (but stay within bounds)
+	// Calculate max jitter - should be smaller than baseStep to avoid overlaps
+	// Max jitter = min(LevelGapTicksMax * tickSize, baseStep * 0.3)
 	maxGapTicks := s.cfg.LevelGapTicksMax
 	if maxGapTicks <= 0 {
 		maxGapTicks = 3
 	}
-	maxJitter := s.tickSize * float64(maxGapTicks)
+	maxJitterTicks := s.tickSize * float64(maxGapTicks)
+	maxJitterStep := baseStep * 0.3 // Max 30% of step to avoid overlaps
+
+	maxJitter := maxJitterTicks
+	if maxJitterStep < maxJitter && maxJitterStep > 0 {
+		maxJitter = maxJitterStep
+	}
 
 	// Generate prices: evenly distributed with small random jitter
 	levelPrices := make([]float64, 0, numLevels)
@@ -675,8 +784,8 @@ func (s *SimpleLadderStrategy) computeDesiredOrders(mid float64, availableBalanc
 		if level == 0 || level == numLevels-1 {
 			price = basePrice
 		} else {
-			// Random jitter: ±maxJitter, but more likely to be small
-			jitter := (rand.Float64()*2 - 1) * maxJitter * 0.5 // ±50% of maxJitter
+			// Random jitter: ±maxJitter (capped to avoid overlaps)
+			jitter := (rand.Float64()*2 - 1) * maxJitter
 			price = basePrice + jitter
 		}
 
@@ -704,6 +813,19 @@ func (s *SimpleLadderStrategy) computeDesiredOrders(mid float64, availableBalanc
 		levelPrices = append(levelPrices, price)
 	}
 
+	// Sort prices to ensure proper order after jitter
+	// BID: highest to lowest (descending)
+	// ASK: lowest to highest (ascending)
+	if s.cfg.BotSide == BotSideBid {
+		sort.Float64s(levelPrices)
+		// Reverse for descending order
+		for i, j := 0, len(levelPrices)-1; i < j; i, j = i+1, j-1 {
+			levelPrices[i], levelPrices[j] = levelPrices[j], levelPrices[i]
+		}
+	} else {
+		sort.Float64s(levelPrices)
+	}
+
 	// Remove duplicate prices (can happen with small ranges and rounding)
 	levelPrices = s.removeDuplicatePrices(levelPrices)
 
@@ -719,13 +841,16 @@ func (s *SimpleLadderStrategy) computeDesiredOrders(mid float64, availableBalanc
 			s.Name(), actualLevels, numLevels, priceRange, s.tickSize, ticksInRange)
 	}
 
-	// Pass 2: Calculate weighted sizes
-	totalWeight := float64(actualLevels * (actualLevels + 1) / 2)
+	// Pass 2: Calculate random sizes (uniform base with jitter)
+	// Each level gets roughly equal notional with random variation
 
 	orders := make([]core.DesiredOrder, 0, actualLevels)
 	var totalNotionalUsed float64
 	timestamp := time.Now().UnixMilli()
 	batchID := fmt.Sprintf("%d_%04d", timestamp, rand.Intn(10000))
+
+	// Base notional per level (uniform distribution)
+	baseNotionalPerLevel := effectiveDepth / float64(actualLevels)
 
 	for level := 0; level < actualLevels; level++ {
 		remainingBalance := availableBalance - totalNotionalUsed
@@ -735,11 +860,12 @@ func (s *SimpleLadderStrategy) computeDesiredOrders(mid float64, availableBalanc
 
 		price := levelPrices[level]
 
-		// Weighted notional
-		weight := float64(actualLevels - level)
-		baseSizeNotional := effectiveDepth * weight / totalWeight
+		// Random size multiplier: 0.5x to 1.5x of base size
+		// This gives good randomness while keeping sizes reasonable
+		randomMult := 0.5 + rand.Float64() // 0.5 to 1.5
+		baseSizeNotional := baseNotionalPerLevel * randomMult
 
-		// Add jitter
+		// Add additional jitter from config
 		sizeJitter := 1.0 + s.cfg.SizeJitterPct*(2*rand.Float64()-1)
 		sizeNotional := baseSizeNotional * sizeJitter
 
@@ -805,6 +931,112 @@ func (s *SimpleLadderStrategy) shouldReplaceOrders(mid float64, currentCount int
 	}
 
 	return false, ""
+}
+
+// OrderDiff represents the incremental changes needed
+type OrderDiff struct {
+	Action         core.TickAction
+	OrdersToCancel []string            // Order IDs to cancel
+	OrdersToAdd    []core.DesiredOrder // Orders to add
+	Reason         string
+}
+
+// computeOrderDiff computes the minimal changes needed to reach desired state
+func (s *SimpleLadderStrategy) computeOrderDiff(live []core.LiveOrder, desired []core.DesiredOrder) *OrderDiff {
+	// No live orders - place all
+	if len(live) == 0 {
+		return &OrderDiff{
+			Action:      core.TickActionReplace,
+			OrdersToAdd: desired,
+			Reason:      "no_live_orders",
+		}
+	}
+
+	// Sort both lists by price (descending for BID, ascending for ASK)
+	// This ensures proper pairing and avoids cross-matching due to tolerance
+	sortedLive := make([]core.LiveOrder, len(live))
+	copy(sortedLive, live)
+	sort.Slice(sortedLive, func(i, j int) bool {
+		return sortedLive[i].Price > sortedLive[j].Price // descending
+	})
+
+	sortedDesired := make([]core.DesiredOrder, len(desired))
+	copy(sortedDesired, desired)
+	sort.Slice(sortedDesired, func(i, j int) bool {
+		return sortedDesired[i].Price > sortedDesired[j].Price // descending
+	})
+
+	maxGapTicks := s.cfg.LevelGapTicksMax
+	if maxGapTicks <= 0 {
+		maxGapTicks = 3
+	}
+	priceTolerance := s.tickSize * float64(maxGapTicks)
+
+	// Match sorted orders in parallel (1:1 matching by position)
+	matchedLive := make(map[string]bool)
+	var toCancel []string
+	var toAdd []core.DesiredOrder
+
+	maxLen := len(sortedLive)
+	if len(sortedDesired) > maxLen {
+		maxLen = len(sortedDesired)
+	}
+
+	for i := 0; i < maxLen; i++ {
+		var l *core.LiveOrder
+		var d *core.DesiredOrder
+
+		if i < len(sortedLive) {
+			l = &sortedLive[i]
+		}
+		if i < len(sortedDesired) {
+			d = &sortedDesired[i]
+		}
+
+		if l != nil && d != nil {
+			// Both exist at this position - check if they match
+			priceDiff := math.Abs(l.Price - d.Price)
+			if l.Side == d.Side && priceDiff <= priceTolerance {
+				matchedLive[l.OrderID] = true
+				// Matched - no action needed
+			} else {
+				// Not matched - cancel live, add desired
+				toCancel = append(toCancel, l.OrderID)
+				toAdd = append(toAdd, *d)
+			}
+		} else if l != nil && d == nil {
+			// Extra live order - cancel it
+			toCancel = append(toCancel, l.OrderID)
+		} else if l == nil && d != nil {
+			// Missing live order - add it
+			toAdd = append(toAdd, *d)
+		}
+	}
+
+	// Determine action
+	if len(toCancel) == 0 && len(toAdd) == 0 {
+		return &OrderDiff{
+			Action: core.TickActionKeep,
+			Reason: "orders_in_sync",
+		}
+	}
+
+	// If we need to cancel most orders, just do a full replace
+	if len(toCancel) > len(live)/2 {
+		return &OrderDiff{
+			Action:      core.TickActionReplace,
+			OrdersToAdd: desired,
+			Reason:      fmt.Sprintf("too_many_cancels: %d/%d", len(toCancel), len(live)),
+		}
+	}
+
+	// Incremental update
+	return &OrderDiff{
+		Action:         core.TickActionAmend,
+		OrdersToCancel: toCancel,
+		OrdersToAdd:    toAdd,
+		Reason:         fmt.Sprintf("amend: cancel=%d, add=%d", len(toCancel), len(toAdd)),
+	}
 }
 
 // roundToTick rounds price to tick size

@@ -49,6 +49,9 @@ type SimpleMakerConfig struct {
 	MaxRebalanceMult  float64 `json:"max_rebalance_mult"` // Max size multiplier (default 2.0)
 	MinRebalanceMult  float64 `json:"min_rebalance_mult"` // Min size multiplier (default 0.2)
 	RebalanceDeadzone float64 `json:"rebalance_deadzone"` // Deadzone (default 0.05)
+
+	// Debug settings
+	DebugCancelSleep bool `json:"debug_cancel_sleep"` // Sleep 30s after cancel for WebSocket debug
 }
 
 // NewSimpleMaker creates a new SimpleMaker bot using BaseBot + SimpleLadderStrategy.
@@ -70,6 +73,8 @@ func NewSimpleMaker(
 		BotType:        cfg.BotType,
 		TickIntervalMs: cfg.TickIntervalMs,
 	}
+
+	cfg.DebugCancelSleep = true
 
 	// Create strategy config
 	strategyCfg := &strategy.SimpleLadderConfig{
@@ -98,6 +103,8 @@ func NewSimpleMaker(
 		MaxRebalanceMult:  cfg.MaxRebalanceMult,
 		MinRebalanceMult:  cfg.MinRebalanceMult,
 		RebalanceDeadzone: cfg.RebalanceDeadzone,
+		// Debug settings
+		DebugCancelSleep: cfg.DebugCancelSleep,
 	}
 
 	// Create strategy
