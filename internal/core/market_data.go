@@ -16,6 +16,11 @@ type MarketDataCache struct {
 	stepSize    float64
 	minNotional float64
 
+	// Last known good prices (fallback when orderbook is empty)
+	lastMid     float64
+	lastBestBid float64
+	lastBestAsk float64
+
 	// Last update time
 	lastUpdate time.Time
 }
@@ -56,22 +61,72 @@ func (m *MarketDataCache) UpdateFromExchangeInfo(info *exchange.ExchangeInfo, sy
 
 // BuildSnapshot creates a Snapshot from depth data
 func (m *MarketDataCache) BuildSnapshot(depth *exchange.Depth) (*Snapshot, error) {
-	if len(depth.Bids) == 0 || len(depth.Asks) == 0 {
-		return nil, fmt.Errorf("empty order book")
+	var bestBid, bestAsk, mid float64
+	var bids, asks []PriceLevel
+
+	// Check if we have valid bid/ask data
+	hasBids := len(depth.Bids) > 0
+	hasAsks := len(depth.Asks) > 0
+
+	if hasBids && hasAsks {
+		// Normal case: both sides available
+		bestBid, _ = strconv.ParseFloat(depth.Bids[0][0], 64)
+		bestAsk, _ = strconv.ParseFloat(depth.Asks[0][0], 64)
+		mid = (bestBid + bestAsk) / 2.0
+
+		// Update cached values
+		m.lastBestBid = bestBid
+		m.lastBestAsk = bestAsk
+		m.lastMid = mid
+
+	} else if hasBids && !hasAsks {
+		// Only bids available - use bid as reference
+		bestBid, _ = strconv.ParseFloat(depth.Bids[0][0], 64)
+		if m.lastBestAsk > 0 {
+			bestAsk = m.lastBestAsk
+		} else {
+			// Estimate ask as bid + min spread (10 bps)
+			bestAsk = bestBid * 1.001
+		}
+		mid = (bestBid + bestAsk) / 2.0
+		m.lastBestBid = bestBid
+		m.lastMid = mid
+
+	} else if !hasBids && hasAsks {
+		// Only asks available - use ask as reference
+		bestAsk, _ = strconv.ParseFloat(depth.Asks[0][0], 64)
+		if m.lastBestBid > 0 {
+			bestBid = m.lastBestBid
+		} else {
+			// Estimate bid as ask - min spread (10 bps)
+			bestBid = bestAsk * 0.999
+		}
+		mid = (bestBid + bestAsk) / 2.0
+		m.lastBestAsk = bestAsk
+		m.lastMid = mid
+
+	} else {
+		// Both empty - use cached values
+		if m.lastMid <= 0 {
+			return nil, fmt.Errorf("empty order book and no cached price")
+		}
+		bestBid = m.lastBestBid
+		bestAsk = m.lastBestAsk
+		mid = m.lastMid
+		// Log warning
+		fmt.Printf("[MarketData] WARNING: Using cached mid=%.8f (empty orderbook)\n", mid)
 	}
 
-	bestBid, _ := strconv.ParseFloat(depth.Bids[0][0], 64)
-	bestAsk, _ := strconv.ParseFloat(depth.Asks[0][0], 64)
-
-	// Parse full book
-	bids := make([]PriceLevel, 0, len(depth.Bids))
+	// Parse bids
+	bids = make([]PriceLevel, 0, len(depth.Bids))
 	for _, b := range depth.Bids {
 		p, _ := strconv.ParseFloat(b[0], 64)
 		q, _ := strconv.ParseFloat(b[1], 64)
 		bids = append(bids, PriceLevel{Price: p, Qty: q})
 	}
 
-	asks := make([]PriceLevel, 0, len(depth.Asks))
+	// Parse asks
+	asks = make([]PriceLevel, 0, len(depth.Asks))
 	for _, a := range depth.Asks {
 		p, _ := strconv.ParseFloat(a[0], 64)
 		q, _ := strconv.ParseFloat(a[1], 64)
@@ -81,7 +136,7 @@ func (m *MarketDataCache) BuildSnapshot(depth *exchange.Depth) (*Snapshot, error
 	return &Snapshot{
 		BestBid:     bestBid,
 		BestAsk:     bestAsk,
-		Mid:         (bestBid + bestAsk) / 2.0,
+		Mid:         mid,
 		TickSize:    m.tickSize,
 		StepSize:    m.stepSize,
 		MinNotional: m.minNotional,
@@ -89,6 +144,21 @@ func (m *MarketDataCache) BuildSnapshot(depth *exchange.Depth) (*Snapshot, error
 		Asks:        asks,
 		Timestamp:   time.Now(),
 	}, nil
+}
+
+// SetLastPrice allows setting the last known price from external source (e.g., trades)
+func (m *MarketDataCache) SetLastPrice(price float64) {
+	if price > 0 {
+		m.lastMid = price
+		// Estimate bid/ask with 10bps spread
+		m.lastBestBid = price * 0.9995
+		m.lastBestAsk = price * 1.0005
+	}
+}
+
+// GetLastMid returns the last known mid price
+func (m *MarketDataCache) GetLastMid() float64 {
+	return m.lastMid
 }
 
 // GetTickSize returns the cached tick size

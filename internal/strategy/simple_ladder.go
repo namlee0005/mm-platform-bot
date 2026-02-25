@@ -42,6 +42,14 @@ type SimpleLadderConfig struct {
 	DrawdownReducePct   float64 `json:"drawdown_reduce_pct"`    // Start reducing size at this level (e.g., 0.02 = 2%)
 	RecoveryHours       float64 `json:"recovery_hours"`         // Target recovery time in hours (24-72)
 	MaxRecoverySizeMult float64 `json:"max_recovery_size_mult"` // Max size multiplier during recovery (e.g., 0.3 = 30%)
+
+	// Inventory rebalancing settings
+	EnableRebalance   bool    `json:"enable_rebalance"`   // Enable inventory-aware sizing
+	TargetInvRatio    float64 `json:"target_inv_ratio"`   // Target inventory ratio (default 0.5 = 50% base)
+	RebalanceK        float64 `json:"rebalance_k"`        // Rebalance sensitivity (default 2.0)
+	MaxRebalanceMult  float64 `json:"max_rebalance_mult"` // Max size multiplier for rebalance (default 2.0)
+	MinRebalanceMult  float64 `json:"min_rebalance_mult"` // Min size multiplier for rebalance (default 0.2)
+	RebalanceDeadzone float64 `json:"rebalance_deadzone"` // Deadzone - no adjustment if deviation < this (default 0.05)
 }
 
 // SimpleLadderStrategy implements a one-sided market maker strategy
@@ -131,6 +139,23 @@ func NewSimpleLadderStrategy(cfg *SimpleLadderConfig) *SimpleLadderStrategy {
 		cfg.MaxRecoverySizeMult = 0.3 // 30% size during max recovery
 	}
 
+	// Rebalance defaults
+	if cfg.TargetInvRatio == 0 {
+		cfg.TargetInvRatio = 0.5 // 50% base, 50% quote
+	}
+	if cfg.RebalanceK == 0 {
+		cfg.RebalanceK = 2.0 // sensitivity factor
+	}
+	if cfg.MaxRebalanceMult == 0 {
+		cfg.MaxRebalanceMult = 2.0 // max 2x size
+	}
+	if cfg.MinRebalanceMult == 0 {
+		cfg.MinRebalanceMult = 0.2 // min 0.2x size
+	}
+	if cfg.RebalanceDeadzone == 0 {
+		cfg.RebalanceDeadzone = 0.05 // 5% deadzone
+	}
+
 	return &SimpleLadderStrategy{
 		cfg:            cfg,
 		fillCooldowns:  make(map[float64]int64),
@@ -207,6 +232,20 @@ func (s *SimpleLadderStrategy) Tick(ctx context.Context, input *core.TickInput) 
 	// Calculate size multiplier based on mode
 	sizeMult := s.calculateSizeMultiplier(drawdown, mode)
 
+	// Calculate inventory rebalance multiplier
+	var rebalanceMult float64 = 1.0
+	var invRatio, invDev float64
+	if s.cfg.EnableRebalance {
+		invRatio, invDev, rebalanceMult = s.calculateRebalanceMultiplier(balance, mid)
+		if len(s.navHistory)%60 == 0 { // Log periodically
+			log.Printf("[%s] Rebalance: inv=%.1f%% (target=%.1f%%), dev=%.1f%%, mult=%.2f",
+				s.Name(), invRatio*100, s.cfg.TargetInvRatio*100, invDev*100, rebalanceMult)
+		}
+	}
+
+	// Combine multipliers
+	finalMult := sizeMult * rebalanceMult
+
 	// Check if we should regenerate ladder
 	currentOrderCount := len(input.LiveOrders)
 	desired := s.getOrRegenerateLadder(mid, availableBalance, currentOrderCount)
@@ -218,11 +257,17 @@ func (s *SimpleLadderStrategy) Tick(ctx context.Context, input *core.TickInput) 
 		}, nil
 	}
 
-	// Apply size multiplier for recovery mode
-	if sizeMult < 1.0 {
-		desired = s.applySizeMultiplier(desired, sizeMult)
-		log.Printf("[%s] Recovery: applying size multiplier %.2f", s.Name(), sizeMult)
+	// Apply combined size multiplier
+	if finalMult != 1.0 {
+		desired = s.applySizeMultiplier(desired, finalMult)
+		if finalMult < 1.0 {
+			log.Printf("[%s] Size reduced: risk=%.2f × rebalance=%.2f = %.2f", s.Name(), sizeMult, rebalanceMult, finalMult)
+		} else {
+			log.Printf("[%s] Size increased: risk=%.2f × rebalance=%.2f = %.2f", s.Name(), sizeMult, rebalanceMult, finalMult)
+		}
 	}
+
+	_ = invRatio // suppress unused warning when rebalance disabled
 
 	// Check if we should replace orders
 	shouldReplace, reason := s.shouldReplaceOrders(mid, currentOrderCount, input.LiveOrders, desired)
@@ -349,6 +394,67 @@ func (s *SimpleLadderStrategy) calculateSizeMultiplier(drawdown float64, mode Si
 	default:
 		return 1.0
 	}
+}
+
+// calculateRebalanceMultiplier calculates size multiplier based on inventory deviation
+// Returns: invRatio, invDeviation, multiplier
+func (s *SimpleLadderStrategy) calculateRebalanceMultiplier(balance *core.BalanceState, mid float64) (float64, float64, float64) {
+	// Calculate inventory ratio (base value / total value)
+	baseValue := (balance.BaseFree + balance.BaseLocked) * mid
+	quoteValue := balance.QuoteFree + balance.QuoteLocked
+	totalValue := baseValue + quoteValue
+
+	if totalValue <= 0 {
+		return 0.5, 0, 1.0
+	}
+
+	invRatio := baseValue / totalValue
+	invDev := invRatio - s.cfg.TargetInvRatio
+
+	// If within deadzone, no adjustment
+	if math.Abs(invDev) <= s.cfg.RebalanceDeadzone {
+		return invRatio, invDev, 1.0
+	}
+
+	// Calculate multiplier based on side and deviation
+	// BID (buy): if too much base (invDev > 0), reduce buying → mult < 1
+	// ASK (sell): if too much base (invDev > 0), increase selling → mult > 1
+	var mult float64
+
+	if s.cfg.BotSide == BotSideBid {
+		// BUY side: reduce when we have too much base
+		// invDev > 0 → mult < 1 (reduce buying)
+		// invDev < 0 → mult > 1 (increase buying)
+		effectiveDev := invDev - s.cfg.RebalanceDeadzone*sign(invDev)
+		mult = 1.0 - effectiveDev*s.cfg.RebalanceK
+	} else {
+		// SELL side: increase when we have too much base
+		// invDev > 0 → mult > 1 (increase selling)
+		// invDev < 0 → mult < 1 (reduce selling)
+		effectiveDev := invDev - s.cfg.RebalanceDeadzone*sign(invDev)
+		mult = 1.0 + effectiveDev*s.cfg.RebalanceK
+	}
+
+	// Clamp to min/max
+	if mult > s.cfg.MaxRebalanceMult {
+		mult = s.cfg.MaxRebalanceMult
+	}
+	if mult < s.cfg.MinRebalanceMult {
+		mult = s.cfg.MinRebalanceMult
+	}
+
+	return invRatio, invDev, mult
+}
+
+// sign returns -1, 0, or 1 depending on the sign of x
+func sign(x float64) float64 {
+	if x > 0 {
+		return 1
+	}
+	if x < 0 {
+		return -1
+	}
+	return 0
 }
 
 // applySizeMultiplier applies size multiplier to all orders
@@ -513,64 +619,104 @@ func (s *SimpleLadderStrategy) computeDesiredOrders(mid float64, availableBalanc
 		depthBps = 200
 	}
 
-	var minPrice, maxPrice float64
-	if s.cfg.BotSide == BotSideBid {
-		minPrice = mid * (1.0 - depthBps/10000.0)
-		maxPrice = mid
-	} else {
-		minPrice = mid
-		maxPrice = mid * (1.0 + depthBps/10000.0)
+	spreadBps := s.cfg.SpreadBps
+	if spreadBps <= 0 {
+		spreadBps = 50
 	}
 
-	// Calculate first level price
-	offsetMult := s.cfg.SpreadBps / 10000.0
-	var firstPrice float64
-	if s.cfg.BotSide == BotSideBid {
-		firstPrice = mid * (1.0 - offsetMult)
-	} else {
-		firstPrice = mid * (1.0 + offsetMult)
+	numLevels := s.cfg.NumLevels
+	if numLevels <= 0 {
+		numLevels = 5
 	}
-	firstPrice = s.roundToTick(firstPrice)
 
+	// Calculate price range for ladder
+	// First level: at spreadBps from mid
+	// Last level: at depthBps from mid
+	// Distribute levels evenly within this range
+
+	var firstPrice, lastPrice float64
+	if s.cfg.BotSide == BotSideBid {
+		firstPrice = mid * (1.0 - spreadBps/10000.0)
+		lastPrice = mid * (1.0 - depthBps/10000.0)
+	} else {
+		firstPrice = mid * (1.0 + spreadBps/10000.0)
+		lastPrice = mid * (1.0 + depthBps/10000.0)
+	}
+
+	// Calculate base step between levels (in price)
+	priceRange := math.Abs(lastPrice - firstPrice)
+	baseStep := priceRange / float64(numLevels-1)
+	if numLevels == 1 {
+		baseStep = 0
+	}
+
+	// Max jitter: ±LevelGapTicksMax ticks (but stay within bounds)
 	maxGapTicks := s.cfg.LevelGapTicksMax
 	if maxGapTicks <= 0 {
 		maxGapTicks = 3
 	}
+	maxJitter := s.tickSize * float64(maxGapTicks)
 
-	// Pass 1: Generate prices
-	numLevels := s.cfg.NumLevels
+	// Generate prices: evenly distributed with small random jitter
 	levelPrices := make([]float64, 0, numLevels)
-	currentPrice := firstPrice
 
 	for level := 0; level < numLevels; level++ {
-		var price float64
-		if level == 0 {
-			price = currentPrice
+		var basePrice float64
+		if s.cfg.BotSide == BotSideBid {
+			// Bid: firstPrice (highest) -> lastPrice (lowest)
+			basePrice = firstPrice - baseStep*float64(level)
 		} else {
-			gapTicks := 1 + rand.Intn(maxGapTicks)
-			if s.cfg.BotSide == BotSideBid {
-				currentPrice = currentPrice - s.tickSize*float64(gapTicks)
-			} else {
-				currentPrice = currentPrice + s.tickSize*float64(gapTicks)
-			}
-			price = currentPrice
+			// Ask: firstPrice (lowest) -> lastPrice (highest)
+			basePrice = firstPrice + baseStep*float64(level)
 		}
+
+		// Add random jitter (except for first and last levels to maintain bounds)
+		var price float64
+		if level == 0 || level == numLevels-1 {
+			price = basePrice
+		} else {
+			// Random jitter: ±maxJitter, but more likely to be small
+			jitter := (rand.Float64()*2 - 1) * maxJitter * 0.5 // ±50% of maxJitter
+			price = basePrice + jitter
+		}
+
 		price = s.roundToTick(price)
 
-		// Check depth limit
-		if s.cfg.BotSide == BotSideBid && price < minPrice {
-			break
-		}
-		if s.cfg.BotSide == BotSideAsk && price > maxPrice {
-			break
+		// Ensure within bounds
+		if s.cfg.BotSide == BotSideBid {
+			minPrice := mid * (1.0 - depthBps/10000.0)
+			if price < minPrice {
+				price = s.roundToTick(minPrice)
+			}
+			if price > mid {
+				price = s.roundToTick(mid * (1.0 - spreadBps/10000.0))
+			}
+		} else {
+			maxPrice := mid * (1.0 + depthBps/10000.0)
+			if price > maxPrice {
+				price = s.roundToTick(maxPrice)
+			}
+			if price < mid {
+				price = s.roundToTick(mid * (1.0 + spreadBps/10000.0))
+			}
 		}
 
 		levelPrices = append(levelPrices, price)
 	}
 
+	// Remove duplicate prices (can happen with small ranges and rounding)
+	levelPrices = s.removeDuplicatePrices(levelPrices)
+
 	actualLevels := len(levelPrices)
 	if actualLevels == 0 {
 		return nil
+	}
+
+	// Warn if we couldn't fit all requested levels
+	if actualLevels < numLevels {
+		ticksInRange := priceRange / s.tickSize
+		log.Printf("[%s] WARNING: Only %d/%d levels fit in range. Price range=%.8f, tickSize=%.8f, ticks=%.0f",
+			s.Name(), actualLevels, numLevels, priceRange, s.tickSize, ticksInRange)
 	}
 
 	// Pass 2: Calculate weighted sizes
@@ -675,4 +821,25 @@ func (s *SimpleLadderStrategy) roundToStep(qty float64) float64 {
 		return qty
 	}
 	return math.Floor(qty/s.stepSize) * s.stepSize
+}
+
+// removeDuplicatePrices removes duplicate prices from the slice
+func (s *SimpleLadderStrategy) removeDuplicatePrices(prices []float64) []float64 {
+	if len(prices) <= 1 {
+		return prices
+	}
+
+	seen := make(map[float64]bool)
+	result := make([]float64, 0, len(prices))
+
+	for _, p := range prices {
+		// Round to avoid floating point comparison issues
+		key := math.Round(p/s.tickSize) * s.tickSize
+		if !seen[key] {
+			seen[key] = true
+			result = append(result, p)
+		}
+	}
+
+	return result
 }

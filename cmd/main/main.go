@@ -196,6 +196,13 @@ func createSimpleMaker(
 		DrawdownReducePct:   simpleConfig.DrawdownLimitPct * 0.4, // 40% of limit to start reducing
 		RecoveryHours:       48,                                  // 48 hours target recovery
 		MaxRecoverySizeMult: 0.3,                                 // 30% size at max drawdown
+		// Rebalance settings - auto-adjust size based on inventory
+		EnableRebalance:   true,                     // Enable by default for one-sided bots
+		TargetInvRatio:    simpleConfig.TargetRatio, // Target 50/50 by default
+		RebalanceK:        2.0,                      // Sensitivity
+		MaxRebalanceMult:  2.0,                      // Max 2x size when rebalancing
+		MinRebalanceMult:  0.2,                      // Min 0.2x size
+		RebalanceDeadzone: 0.05,                     // 5% deadzone
 	}
 
 	// Set defaults

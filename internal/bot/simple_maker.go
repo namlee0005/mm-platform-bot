@@ -41,6 +41,14 @@ type SimpleMakerConfig struct {
 	DrawdownReducePct   float64 `json:"drawdown_reduce_pct"`    // Start reducing size (default 2%)
 	RecoveryHours       float64 `json:"recovery_hours"`         // Target recovery time (default 48h)
 	MaxRecoverySizeMult float64 `json:"max_recovery_size_mult"` // Min size during recovery (default 30%)
+
+	// Inventory rebalancing settings
+	EnableRebalance   bool    `json:"enable_rebalance"`   // Enable inventory-aware sizing
+	TargetInvRatio    float64 `json:"target_inv_ratio"`   // Target inventory ratio (default 0.5)
+	RebalanceK        float64 `json:"rebalance_k"`        // Rebalance sensitivity (default 2.0)
+	MaxRebalanceMult  float64 `json:"max_rebalance_mult"` // Max size multiplier (default 2.0)
+	MinRebalanceMult  float64 `json:"min_rebalance_mult"` // Min size multiplier (default 0.2)
+	RebalanceDeadzone float64 `json:"rebalance_deadzone"` // Deadzone (default 0.05)
 }
 
 // NewSimpleMaker creates a new SimpleMaker bot using BaseBot + SimpleLadderStrategy.
@@ -83,6 +91,13 @@ func NewSimpleMaker(
 		DrawdownReducePct:   cfg.DrawdownReducePct,
 		RecoveryHours:       cfg.RecoveryHours,
 		MaxRecoverySizeMult: cfg.MaxRecoverySizeMult,
+		// Rebalance settings
+		EnableRebalance:   cfg.EnableRebalance,
+		TargetInvRatio:    cfg.TargetInvRatio,
+		RebalanceK:        cfg.RebalanceK,
+		MaxRebalanceMult:  cfg.MaxRebalanceMult,
+		MinRebalanceMult:  cfg.MinRebalanceMult,
+		RebalanceDeadzone: cfg.RebalanceDeadzone,
 	}
 
 	// Create strategy
