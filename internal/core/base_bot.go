@@ -194,13 +194,22 @@ func (b *BaseBot) Stop(ctx context.Context) error {
 	if b.redis != nil && b.cfg.BotID != "" {
 		removed, err := b.redis.ClearOrdersByBotID(shutdownCtx, b.cfg.Symbol, b.cfg.BotID)
 		if err != nil {
-			log.Printf("[%s] WARNING: Failed to clear Redis: %v", b.strategy.Name(), err)
+			log.Printf("[%s] WARNING: Failed to clear orders from Redis: %v", b.strategy.Name(), err)
 		} else {
 			log.Printf("[%s] Cleared %d orders from Redis", b.strategy.Name(), removed)
 		}
 	}
 
-	// 5. Stop exchange connection
+	// 5. Clear balances from Redis
+	if b.redis != nil && b.cfg.BotID != "" && b.cfg.Exchange != "" {
+		if err := b.redis.ClearMMBalances(shutdownCtx, b.cfg.Exchange, b.cfg.Symbol, b.cfg.BotID); err != nil {
+			log.Printf("[%s] WARNING: Failed to clear balances from Redis: %v", b.strategy.Name(), err)
+		} else {
+			log.Printf("[%s] Cleared balances from Redis", b.strategy.Name())
+		}
+	}
+
+	// 6. Stop exchange connection
 	if err := b.exch.Stop(shutdownCtx); err != nil {
 		log.Printf("[%s] WARNING: Exchange stop failed: %v", b.strategy.Name(), err)
 	}

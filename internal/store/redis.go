@@ -281,6 +281,18 @@ func (s *RedisStore) SetMMBalances(ctx context.Context, exchange, symbol, botID 
 	return nil
 }
 
+// ClearMMBalances removes balance data for a specific bot from Redis
+// Key: balance:{exchange}:{symbol}, Field: {botId}
+func (s *RedisStore) ClearMMBalances(ctx context.Context, exchange, symbol, botID string) error {
+	key := fmt.Sprintf("balance:%s:%s", exchange, symbol)
+
+	if err := s.client.HDel(ctx, key, botID).Err(); err != nil {
+		return fmt.Errorf("failed to clear MM balances: %w", err)
+	}
+
+	return nil
+}
+
 // GetMMBalances retrieves all bot balances for a symbol from Redis
 // Key: balance:{exchange}:{symbol}
 func (s *RedisStore) GetMMBalances(ctx context.Context, exchange, symbol string) (map[string]*BotBalances, error) {
