@@ -36,6 +36,11 @@ type BaseBot struct {
 	cancel  context.CancelFunc
 	mode    Mode
 
+	// Replace lock - prevent race condition with double orders
+	replaceMu    sync.Mutex
+	replacing    bool
+	replaceStart time.Time
+
 	// Tick tracking
 	tickCount           int
 	configCheckInterval int
@@ -736,12 +741,39 @@ func (b *BaseBot) cancelAllOrders(reason string) error {
 
 // replaceOrders cancels all orders and places new ones
 func (b *BaseBot) replaceOrders(desired []DesiredOrder, reason string) error {
+	// Prevent race condition - skip if already replacing
+	b.replaceMu.Lock()
+	if b.replacing {
+		elapsed := time.Since(b.replaceStart)
+		b.replaceMu.Unlock()
+		log.Printf("[%s] Skip REPLACE: already in progress (%v ago)", b.strategy.Name(), elapsed)
+		return nil
+	}
+	// Also skip if last replace was < 2 seconds ago (cooldown)
+	if time.Since(b.replaceStart) < 2*time.Second {
+		b.replaceMu.Unlock()
+		log.Printf("[%s] Skip REPLACE: cooldown active", b.strategy.Name())
+		return nil
+	}
+	b.replacing = true
+	b.replaceStart = time.Now()
+	b.replaceMu.Unlock()
+
+	defer func() {
+		b.replaceMu.Lock()
+		b.replacing = false
+		b.replaceMu.Unlock()
+	}()
+
 	log.Printf("[%s] Replacing orders (%d new): %s", b.strategy.Name(), len(desired), reason)
 
 	// Cancel all existing orders
 	if err := b.exch.CancelAllOrders(b.ctx, b.cfg.Symbol); err != nil {
 		return fmt.Errorf("cancel failed: %w", err)
 	}
+
+	// Wait for cancels to propagate before placing new orders
+	time.Sleep(500 * time.Millisecond)
 
 	b.orderTracker.Clear()
 
@@ -772,9 +804,12 @@ func (b *BaseBot) replaceOrders(desired []DesiredOrder, reason string) error {
 	// Place orders via batch API
 	resp, err := b.exch.BatchPlaceOrders(b.ctx, reqs)
 	if err != nil {
-		// Fallback to individual orders
+		// Fallback to individual orders with delay to avoid rate limit
 		log.Printf("[%s] Batch failed, falling back to individual orders: %v", b.strategy.Name(), err)
-		for _, req := range reqs {
+		for i, req := range reqs {
+			if i > 0 {
+				time.Sleep(200 * time.Millisecond) // 200ms delay between orders
+			}
 			order, err := b.exch.PlaceOrder(b.ctx, req)
 			if err != nil {
 				log.Printf("[%s] Place order failed: %v", b.strategy.Name(), err)
@@ -835,9 +870,12 @@ func (b *BaseBot) amendOrders(toCancel []string, toAdd []DesiredOrder, reason st
 	// Place orders via batch API
 	resp, err := b.exch.BatchPlaceOrders(b.ctx, reqs)
 	if err != nil {
-		// Fallback to individual orders
+		// Fallback to individual orders with delay to avoid rate limit
 		log.Printf("[%s] Batch add failed, falling back to individual orders: %v", b.strategy.Name(), err)
-		for _, req := range reqs {
+		for i, req := range reqs {
+			if i > 0 {
+				time.Sleep(200 * time.Millisecond) // 200ms delay between orders
+			}
 			order, err := b.exch.PlaceOrder(b.ctx, req)
 			if err != nil {
 				log.Printf("[%s] Place order failed: %v", b.strategy.Name(), err)
