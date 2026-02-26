@@ -75,7 +75,7 @@ func main() {
 		BaseAsset:  simpleConfig.BaseAsset,
 		QuoteAsset: simpleConfig.QuoteAsset,
 		Exchange:   exchangeName,
-		ExchangeID: cfg.UserExchangeKeyID,
+		ExchangeID: cfg.ExchangeID,
 		BotID:      cfg.UserExchangeKeyID,
 		BotType:    "mm-engine",
 

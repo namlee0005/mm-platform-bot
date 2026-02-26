@@ -41,6 +41,9 @@ type BaseBot struct {
 	configCheckInterval int
 	lastTickTime        int64
 
+	// Partner bot for rebalancing
+	partnerBotID string
+
 	// Callbacks
 	onOrderEvent OrderEventCallback
 }
@@ -87,6 +90,9 @@ func NewBaseBot(
 	bot.balanceTracker = NewBalanceTracker(cfg.BaseAsset, cfg.QuoteAsset)
 	bot.orderTracker = NewOrderTracker()
 	bot.marketData = NewMarketDataCache()
+
+	// Use last trade price by default (better for thin orderbooks where we are the only MM)
+	bot.marketData.UseLastTradePrice(false)
 
 	return bot
 }
@@ -144,6 +150,19 @@ func (b *BaseBot) Start(ctx context.Context) error {
 	// Publish initial balances to Redis
 	b.publishAllBalancesToRedis()
 
+	// 7. Find partner bot for rebalancing
+	if b.mongo != nil && b.cfg.ExchangeID != "" {
+		partner, err := b.mongo.FindPartnerBot(b.ctx, b.cfg.ExchangeID, b.cfg.Symbol, b.cfg.BotType)
+		if err != nil {
+			log.Printf("[%s] WARNING: Failed to find partner bot: %v", b.strategy.Name(), err)
+		} else if partner != nil {
+			b.partnerBotID = partner.BotID
+			log.Printf("[%s] Found partner bot: %s (%s)", b.strategy.Name(), partner.BotID, partner.BotType)
+		} else {
+			log.Printf("[%s] No partner bot found for rebalancing", b.strategy.Name())
+		}
+	}
+
 	snap, err := b.getSnapshot()
 	if err != nil {
 		return fmt.Errorf("failed to get initial snapshot: %w", err)
@@ -193,7 +212,27 @@ func (b *BaseBot) Stop(ctx context.Context) error {
 		log.Printf("[%s] Cancelled all orders", b.strategy.Name())
 	}
 
-	// 4. Clear orders from Redis
+	// 4. Emit cancel events for all tracked orders (for WebSocket broadcast)
+	if b.onOrderEvent != nil {
+		allOrders := b.orderTracker.GetAll()
+		for _, order := range allOrders {
+			b.onOrderEvent(BotOrderEvent{
+				Type:      OrderEventTypeCancel,
+				Symbol:    b.cfg.Symbol,
+				OrderID:   order.OrderID,
+				Side:      order.Side,
+				Price:     order.Price,
+				Qty:       order.Qty,
+				Reason:    "shutdown",
+				Timestamp: time.Now().UnixMilli(),
+			})
+		}
+		if len(allOrders) > 0 {
+			log.Printf("[%s] Emitted %d cancel events for shutdown", b.strategy.Name(), len(allOrders))
+		}
+	}
+
+	// 5. Clear orders from Redis
 	if b.redis != nil && b.cfg.BotID != "" {
 		removed, err := b.redis.ClearOrdersByBotID(shutdownCtx, b.cfg.Symbol, b.cfg.BotID)
 		if err != nil {
@@ -203,7 +242,7 @@ func (b *BaseBot) Stop(ctx context.Context) error {
 		}
 	}
 
-	// 5. Clear balances from Redis
+	// 6. Clear balances from Redis
 	if b.redis != nil && b.cfg.BotID != "" && b.cfg.Exchange != "" {
 		if err := b.redis.ClearMMBalances(shutdownCtx, b.cfg.Exchange, b.cfg.Symbol, b.cfg.BotID); err != nil {
 			log.Printf("[%s] WARNING: Failed to clear balances from Redis: %v", b.strategy.Name(), err)
@@ -212,7 +251,7 @@ func (b *BaseBot) Stop(ctx context.Context) error {
 		}
 	}
 
-	// 6. Stop exchange connection
+	// 7. Stop exchange connection
 	if err := b.exch.Stop(shutdownCtx); err != nil {
 		log.Printf("[%s] WARNING: Exchange stop failed: %v", b.strategy.Name(), err)
 	}
@@ -265,7 +304,12 @@ func (b *BaseBot) tick() error {
 	now := time.Now().UnixMilli()
 	b.lastTickTime = now
 
-	// 1. Get current market snapshot
+	// 1. Fetch last trade price (before snapshot so it can be used as mid)
+	if ticker, err := b.exch.GetTicker(b.ctx, b.cfg.Symbol); err == nil && ticker > 0 {
+		b.marketData.SetLastTradePrice(ticker)
+	}
+
+	// 2. Get current market snapshot
 	snap, err := b.getSnapshot()
 	if err != nil {
 		return fmt.Errorf("snapshot failed: %w", err)
@@ -286,13 +330,20 @@ func (b *BaseBot) tick() error {
 	// 3. Get live orders
 	liveOrders := b.orderTracker.GetAll()
 
-	// 4. Build tick input
+	// 4. Get combined balance from Redis (for rebalancing)
+	var combinedBalance *BalanceState
+	if b.redis != nil {
+		combinedBalance = b.getCombinedBalanceFromRedis(snap.Mid)
+	}
+
+	// 5. Build tick input
 	input := &TickInput{
-		Snapshot:   snap,
-		Balance:    balance,
-		LiveOrders: liveOrders,
-		Timestamp:  now,
-		Mode:       b.mode,
+		Snapshot:        snap,
+		Balance:         balance,
+		CombinedBalance: combinedBalance,
+		LiveOrders:      liveOrders,
+		Timestamp:       now,
+		Mode:            b.mode,
 	}
 
 	// 5. Execute strategy tick
@@ -306,23 +357,22 @@ func (b *BaseBot) tick() error {
 		b.mode = output.NewMode
 	}
 
-	// 7. Execute the action
+	// 7. Log tick summary (before action, so it always logs)
+	invRatio, invDev := balance.ComputeInventory(snap.Mid, 0.5) // TODO: get target ratio from strategy
+	log.Printf("[%s] mid=%.8f, inv=%.2f%% (dev=%.2f%%), orders=%d, action=%s",
+		b.strategy.Name(), snap.Mid, invRatio*100, invDev*100, len(liveOrders), output.Action)
+
+	// 8. Execute the action
 	switch output.Action {
 	case TickActionCancelAll:
 		return b.cancelAllOrders(output.Reason)
 	case TickActionKeep:
 		// Do nothing
-		log.Printf("[%s] Keep orders: %s", b.strategy.Name(), output.Reason)
 	case TickActionReplace:
 		return b.replaceOrders(output.DesiredOrders, output.Reason)
 	case TickActionAmend:
 		return b.amendOrders(output.OrdersToCancel, output.OrdersToAdd, output.Reason)
 	}
-
-	// Log tick summary
-	invRatio, invDev := balance.ComputeInventory(snap.Mid, 0.5) // TODO: get target ratio from strategy
-	log.Printf("[%s] mid=%.6f, inv=%.2f%% (dev=%.2f%%), orders=%d, action=%s",
-		b.strategy.Name(), snap.Mid, invRatio*100, invDev*100, len(liveOrders), output.Action)
 
 	return nil
 }
@@ -485,6 +535,9 @@ func (b *BaseBot) handleFill(event *types.FillEvent) {
 	log.Printf("[FILL] %s %s @ %.8f x %.6f (order=%s)",
 		event.Side, event.Symbol, event.Price, event.Quantity, event.OrderID)
 
+	// Update last trade price for market data
+	b.marketData.SetLastTradePrice(event.Price)
+
 	// Forward to strategy
 	b.strategy.OnFill(&FillEvent{
 		OrderID:         event.OrderID,
@@ -586,6 +639,81 @@ func (b *BaseBot) getBalanceState() (*BalanceState, error) {
 	}
 
 	return b.balanceTracker.UpdateFromAccount(acct), nil
+}
+
+// getCombinedBalanceFromRedis fetches and aggregates balances from current bot + partner bot via Redis
+func (b *BaseBot) getCombinedBalanceFromRedis(mid float64) *BalanceState {
+	if b.redis == nil || b.partnerBotID == "" {
+		log.Printf("[%s] Rebalance skip: redis=%v, partnerBotID=%s", b.strategy.Name(), b.redis != nil, b.partnerBotID)
+		return nil // No partner bot found, skip rebalancing
+	}
+
+	// Get current bot's balance from Redis
+	myBalance, err := b.redis.GetBotBalances(b.ctx, b.cfg.Exchange, b.cfg.Symbol, b.cfg.BotID)
+	if err != nil {
+		log.Printf("[%s] Rebalance: failed to get my balance: %v", b.strategy.Name(), err)
+		return nil
+	}
+	if myBalance == nil {
+		log.Printf("[%s] Rebalance: my balance not found in Redis (botID=%s)", b.strategy.Name(), b.cfg.BotID)
+		return nil
+	}
+
+	// Get partner bot's balance from Redis
+	partnerBalance, err := b.redis.GetBotBalances(b.ctx, b.cfg.Exchange, b.cfg.Symbol, b.partnerBotID)
+	if err != nil {
+		log.Printf("[%s] Rebalance: failed to get partner balance: %v", b.strategy.Name(), err)
+		return nil
+	}
+	if partnerBalance == nil {
+		log.Printf("[%s] Rebalance: partner balance not found in Redis (partnerID=%s)", b.strategy.Name(), b.partnerBotID)
+		return nil // Partner balance not available yet
+	}
+
+	// Aggregate balances from both bots
+	var totalBaseFree, totalBaseLocked, totalQuoteFree, totalQuoteLocked float64
+
+	// Add my balance
+	if myBalance.Balances != nil {
+		if baseBal, ok := myBalance.Balances[b.cfg.BaseAsset]; ok {
+			totalBaseFree += baseBal.Free
+			totalBaseLocked += baseBal.Locked
+		}
+		if quoteBal, ok := myBalance.Balances[b.cfg.QuoteAsset]; ok {
+			totalQuoteFree += quoteBal.Free
+			totalQuoteLocked += quoteBal.Locked
+		}
+	}
+
+	// Add partner balance
+	if partnerBalance.Balances != nil {
+		if baseBal, ok := partnerBalance.Balances[b.cfg.BaseAsset]; ok {
+			totalBaseFree += baseBal.Free
+			totalBaseLocked += baseBal.Locked
+		}
+		if quoteBal, ok := partnerBalance.Balances[b.cfg.QuoteAsset]; ok {
+			totalQuoteFree += quoteBal.Free
+			totalQuoteLocked += quoteBal.Locked
+		}
+	}
+
+	// Only return if we have meaningful data
+	if totalBaseFree+totalBaseLocked+totalQuoteFree+totalQuoteLocked <= 0 {
+		log.Printf("[%s] Rebalance: combined balance is zero", b.strategy.Name())
+		return nil
+	}
+
+	log.Printf("[%s] Rebalance combined: base=%.2f (free=%.2f, locked=%.2f), quote=%.2f (free=%.2f, locked=%.2f)",
+		b.strategy.Name(),
+		totalBaseFree+totalBaseLocked, totalBaseFree, totalBaseLocked,
+		totalQuoteFree+totalQuoteLocked, totalQuoteFree, totalQuoteLocked)
+
+	return &BalanceState{
+		BaseFree:    totalBaseFree,
+		BaseLocked:  totalBaseLocked,
+		QuoteFree:   totalQuoteFree,
+		QuoteLocked: totalQuoteLocked,
+	}
 }
 
 // cancelAllOrders cancels all orders

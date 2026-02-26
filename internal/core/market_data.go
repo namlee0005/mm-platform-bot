@@ -21,6 +21,10 @@ type MarketDataCache struct {
 	lastBestBid float64
 	lastBestAsk float64
 
+	// Last trade price (preferred over mid when available)
+	lastTradePrice float64
+	useLastTrade   bool // If true, prefer lastTradePrice over calculated mid
+
 	// Last update time
 	lastUpdate time.Time
 }
@@ -133,6 +137,11 @@ func (m *MarketDataCache) BuildSnapshot(depth *exchange.Depth) (*Snapshot, error
 		asks = append(asks, PriceLevel{Price: p, Qty: q})
 	}
 
+	// If useLastTrade is enabled and we have a valid lastTradePrice, use it instead of mid
+	if m.useLastTrade && m.lastTradePrice > 0 {
+		mid = m.lastTradePrice
+	}
+
 	return &Snapshot{
 		BestBid:     bestBid,
 		BestAsk:     bestAsk,
@@ -156,9 +165,26 @@ func (m *MarketDataCache) SetLastPrice(price float64) {
 	}
 }
 
+// SetLastTradePrice sets the last trade price (from fills or public trades)
+func (m *MarketDataCache) SetLastTradePrice(price float64) {
+	if price > 0 {
+		m.lastTradePrice = price
+	}
+}
+
+// UseLastTradePrice enables using last trade price instead of calculated mid
+func (m *MarketDataCache) UseLastTradePrice(enable bool) {
+	m.useLastTrade = enable
+}
+
 // GetLastMid returns the last known mid price
 func (m *MarketDataCache) GetLastMid() float64 {
 	return m.lastMid
+}
+
+// GetLastTradePrice returns the last trade price
+func (m *MarketDataCache) GetLastTradePrice() float64 {
+	return m.lastTradePrice
 }
 
 // GetTickSize returns the cached tick size

@@ -92,7 +92,7 @@ func main() {
 		BaseAsset:           simpleConfig.BaseAsset,
 		QuoteAsset:          simpleConfig.QuoteAsset,
 		Exchange:            exchangeName,
-		ExchangeID:          cfg.UserExchangeKeyID,
+		ExchangeID:          cfg.ExchangeID,
 		BotID:               botID,
 		BotType:             botType,
 		TickIntervalMs:      simpleConfig.TickIntervalMs,

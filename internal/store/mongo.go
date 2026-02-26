@@ -233,8 +233,6 @@ func (s *MongoStore) FindPartnerBot(ctx context.Context, exchangeID, symbol, cur
 		"exchangeId":      exchangeObjID,
 		"config.symbol":   symbol,
 		"config.bot_type": bson.M{"$in": []string{partnerBotType, partnerBotType[6:]}}, // "maker-ask" or "ask"
-		"isActive":        true,
-		"isDeleted":       bson.M{"$ne": true},
 	}
 
 	err = collection.FindOne(ctx, filter).Decode(&result)

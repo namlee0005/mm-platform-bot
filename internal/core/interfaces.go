@@ -48,11 +48,12 @@ type Strategy interface {
 
 // TickInput contains all data needed for a strategy tick
 type TickInput struct {
-	Snapshot   *Snapshot
-	Balance    *BalanceState
-	LiveOrders []LiveOrder
-	Timestamp  int64
-	Mode       Mode // Current operating mode
+	Snapshot        *Snapshot
+	Balance         *BalanceState // Current bot's balance
+	CombinedBalance *BalanceState // Combined balance from all bots (for rebalancing), nil if not available
+	LiveOrders      []LiveOrder
+	Timestamp       int64
+	Mode            Mode // Current operating mode
 }
 
 // TickOutput contains the result of a strategy tick
@@ -213,6 +214,9 @@ type BaseBotConfig struct {
 
 	// Config check interval (in ticks)
 	ConfigCheckInterval int
+
+	// Price source
+	UseLastTradePrice bool // Use last trade price instead of mid (bid+ask)/2
 }
 
 // ComputeInventory computes inventory metrics based on balance and mid price

@@ -88,6 +88,9 @@ type SimpleLadderStrategy struct {
 	currentMode    SimpleLadderMode // Current operating mode
 	modeChangedAt  time.Time        // When mode last changed
 	recoveryTarget float64          // Target NAV for recovery
+
+	// Rebalance state
+	cachedInvDev float64 // Cached inventory deviation for level reduction
 }
 
 // SimpleLadderMode represents the operating mode
@@ -273,16 +276,21 @@ func (s *SimpleLadderStrategy) Tick(ctx context.Context, input *core.TickInput) 
 	// Calculate size multiplier based on mode
 	sizeMult := s.calculateSizeMultiplier(drawdown, mode)
 
-	// Calculate inventory rebalance multiplier
+	// Calculate inventory rebalance multiplier (only if CombinedBalance from Redis is available)
 	var rebalanceMult float64 = 1.0
 	var invRatio, invDev float64
-	if s.cfg.EnableRebalance {
-		invRatio, invDev, rebalanceMult = s.calculateRebalanceMultiplier(balance, mid)
+	if s.cfg.EnableRebalance && input.CombinedBalance != nil {
+		invRatio, invDev, rebalanceMult = s.calculateRebalanceMultiplier(input.CombinedBalance, mid)
 		if len(s.navHistory)%60 == 0 { // Log periodically
-			log.Printf("[%s] Rebalance: inv=%.1f%% (target=%.1f%%), dev=%.1f%%, mult=%.2f",
+			log.Printf("[%s] Rebalance: inv=%.1f%% (target=%.1f%%), dev=%.1f%%, mult=%.2f (combined)",
 				s.Name(), invRatio*100, s.cfg.TargetInvRatio*100, invDev*100, rebalanceMult)
 		}
 	}
+
+	// Store invDev for level reduction in ladder generation
+	s.mu.Lock()
+	s.cachedInvDev = invDev
+	s.mu.Unlock()
 
 	// Combine multipliers
 	finalMult := sizeMult * rebalanceMult
@@ -647,8 +655,8 @@ func (s *SimpleLadderStrategy) UpdateConfig(newCfg interface{}) error {
 	s.cachedMid = 0
 	s.cachedBalance = 0
 
-	log.Printf("[%s] Config updated: spread=%.0fbps, levels=%d, depth=$%.0f",
-		s.Name(), s.cfg.SpreadBps, s.cfg.NumLevels, s.cfg.TargetDepthNotional)
+	log.Printf("[%s] Config updated: spread=%.0fbps, depthBps=%.0f, levels=%d, depth=$%.0f",
+		s.Name(), s.cfg.SpreadBps, s.cfg.DepthBps, s.cfg.NumLevels, s.cfg.TargetDepthNotional)
 
 	return nil
 }
@@ -731,6 +739,43 @@ func (s *SimpleLadderStrategy) computeDesiredOrders(mid float64, availableBalanc
 		numLevels = 5
 	}
 
+	// Reduce levels based on inventory deviation (rebalance)
+	// BID: reduce levels when invDev > 0 (too much base, reduce buying)
+	// ASK: reduce levels when invDev < 0 (too much quote, reduce selling)
+	// Note: cachedInvDev is read without lock because this function is called
+	// from within getOrRegenerateLadder which already holds s.mu.Lock()
+	if s.cfg.EnableRebalance {
+		invDev := s.cachedInvDev
+
+		shouldReduce := false
+		if s.cfg.BotSide == BotSideBid && invDev > s.cfg.RebalanceDeadzone {
+			// Too much base, reduce buy levels
+			shouldReduce = true
+		} else if s.cfg.BotSide == BotSideAsk && invDev < -s.cfg.RebalanceDeadzone {
+			// Too much quote, reduce sell levels
+			shouldReduce = true
+		}
+
+		if shouldReduce {
+			// Reduce levels proportionally: more deviation = fewer levels
+			// effectiveDev ranges from 0 to ~0.5, multiply by RebalanceK to get reduction factor
+			effectiveDev := math.Abs(invDev) - s.cfg.RebalanceDeadzone
+			reductionFactor := 1.0 - effectiveDev*s.cfg.RebalanceK
+			if reductionFactor < 0.2 {
+				reductionFactor = 0.2 // Keep at least 20% of levels
+			}
+			newLevels := int(float64(numLevels) * reductionFactor)
+			if newLevels < 1 {
+				newLevels = 1
+			}
+			if newLevels < numLevels {
+				log.Printf("[%s] Rebalance level reduction: %d -> %d levels (invDev=%.1f%%)",
+					s.Name(), numLevels, newLevels, invDev*100)
+				numLevels = newLevels
+			}
+		}
+	}
+
 	// Calculate price range for ladder
 	// First level: at spreadBps from mid
 	// Last level: at depthBps from mid
@@ -747,6 +792,20 @@ func (s *SimpleLadderStrategy) computeDesiredOrders(mid float64, availableBalanc
 
 	// Calculate base step between levels (in price)
 	priceRange := math.Abs(lastPrice - firstPrice)
+
+	// Ensure levels fit within price range with minimum gap (tickSize)
+	// If too many levels, reduce to fit within ±depthBps
+	minStepRequired := s.tickSize // Minimum 1 tick between levels
+	maxLevelsThatFit := int(priceRange/minStepRequired) + 1
+	if maxLevelsThatFit < 1 {
+		maxLevelsThatFit = 1
+	}
+	if numLevels > maxLevelsThatFit {
+		log.Printf("[%s] Reducing levels to fit within %.0fbps: %d -> %d",
+			s.Name(), depthBps, numLevels, maxLevelsThatFit)
+		numLevels = maxLevelsThatFit
+	}
+
 	baseStep := priceRange / float64(numLevels-1)
 	if numLevels == 1 {
 		baseStep = 0

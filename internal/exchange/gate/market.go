@@ -93,3 +93,27 @@ func (c *Client) GetDepth(ctx context.Context, symbol string) (*exchange.Depth, 
 		Asks: orderBook.Asks,
 	}, nil
 }
+
+// GetTicker returns the last trade price for a symbol
+func (c *Client) GetTicker(ctx context.Context, symbol string) (float64, error) {
+	gateSymbol := convertSymbol(symbol)
+	query := fmt.Sprintf("currency_pair=%s", gateSymbol)
+
+	body, err := c.doPublicRequest(ctx, "GET", "/spot/tickers", query)
+	if err != nil {
+		return 0, fmt.Errorf("failed to get ticker: %w", err)
+	}
+
+	var tickers []struct {
+		Last string `json:"last"`
+	}
+	if err := json.Unmarshal(body, &tickers); err != nil {
+		return 0, fmt.Errorf("failed to unmarshal ticker: %w", err)
+	}
+
+	if len(tickers) == 0 {
+		return 0, fmt.Errorf("no ticker data")
+	}
+
+	return parseFloatSafe(tickers[0].Last), nil
+}

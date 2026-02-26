@@ -178,7 +178,7 @@ func createSimpleMaker(
 		BaseAsset:           simpleConfig.BaseAsset,
 		QuoteAsset:          simpleConfig.QuoteAsset,
 		Exchange:            exchangeName,
-		ExchangeID:          cfg.UserExchangeKeyID,
+		ExchangeID:          cfg.ExchangeID, // Exchange account ID (shared between maker-bid/ask)
 		BotID:               botID,
 		BotType:             string(side),
 		TickIntervalMs:      simpleConfig.TickIntervalMs,
@@ -251,7 +251,7 @@ func createMMEngine(
 		BaseAsset:  simpleConfig.BaseAsset,
 		QuoteAsset: simpleConfig.QuoteAsset,
 		Exchange:   exchangeName,
-		ExchangeID: cfg.UserExchangeKeyID,
+		ExchangeID: cfg.ExchangeID,
 		BotID:      botID,
 		BotType:    "mm-engine",
 

@@ -24,6 +24,9 @@ type Exchange interface {
 	// SubscribeUserStream WebSocket operations
 	SubscribeUserStream(ctx context.Context, handlers UserStreamHandlers) error
 
+	// GetTicker returns the last trade price for a symbol
+	GetTicker(ctx context.Context, symbol string) (float64, error)
+
 	// Start Lifecycle
 	Start(ctx context.Context) error
 	Stop(ctx context.Context) error

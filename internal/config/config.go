@@ -54,6 +54,8 @@ type TradingConfig struct {
 type Config struct {
 	// User exchange key ID (for config reload)
 	UserExchangeKeyID string
+	// Exchange ID (for finding partner bot - shared between maker-bid and maker-ask)
+	ExchangeID string
 
 	// Exchange settings
 	ExchangeName      string // "mexc", "gate", etc.
@@ -169,6 +171,8 @@ func Load() (*Config, error) {
 	cfg := &Config{
 		// User exchange key ID (for config reload)
 		UserExchangeKeyID: userExchangeKeyID,
+		// Exchange ID (shared between maker-bid and maker-ask)
+		ExchangeID: userExchangeKey.ExchangeID.Hex(),
 
 		// Exchange settings - decrypted
 		ExchangeName:      exchange.Name,
