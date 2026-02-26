@@ -217,6 +217,10 @@ func (b *BaseBot) Stop(ctx context.Context) error {
 		log.Printf("[%s] Cancelled all orders", b.strategy.Name())
 	}
 
+	// Wait for cancels to propagate before proceeding
+	log.Printf("[%s] Waiting for cancel confirmations...", b.strategy.Name())
+	time.Sleep(2 * time.Second)
+
 	// 4. Emit cancel events for all tracked orders (for WebSocket broadcast)
 	if b.onOrderEvent != nil {
 		allOrders := b.orderTracker.GetAll()
