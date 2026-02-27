@@ -16,12 +16,11 @@ import (
 	"mm-platform-engine/internal/exchange/gate"
 	"mm-platform-engine/internal/exchange/mexc"
 	"mm-platform-engine/internal/store"
-	"mm-platform-engine/internal/strategy"
 )
 
 func main() {
 	log.Println("========================================")
-	log.Println("    Simple Maker Bot")
+	log.Println("    Simple Maker Bot (2-Sided)")
 	log.Println("========================================")
 
 	// Load config from MongoDB
@@ -66,24 +65,7 @@ func main() {
 
 	// Bot ID for identifying this instance
 	botID := cfg.UserExchangeKeyID
-
-	// Get bot_type from MongoDB config (FIXED side - không switch)
-	botType := cfg.SimpleConfig.BotType
-	if botType == "" {
-		log.Fatal("bot_type is required in config (maker-bid or maker-ask)")
-	}
-
-	var botSide strategy.BotSide
-	switch strings.ToLower(botType) {
-	case "maker-bid", "bid":
-		botSide = strategy.BotSideBid
-		log.Println("Mode: MAKER-BID (BUY orders only) - FIXED")
-	case "maker-ask", "ask":
-		botSide = strategy.BotSideAsk
-		log.Println("Mode: MAKER-ASK (SELL orders only) - FIXED")
-	default:
-		log.Fatalf("Invalid bot_type: %s (must be 'maker-bid' or 'maker-ask')", botType)
-	}
+	botType := "simple-maker"
 
 	// Create simple maker config from loaded config
 	simpleConfig := cfg.SimpleConfig
@@ -96,7 +78,6 @@ func main() {
 		BotID:               botID,
 		BotType:             botType,
 		TickIntervalMs:      simpleConfig.TickIntervalMs,
-		BotSide:             botSide,
 		SpreadBps:           simpleConfig.SpreadMinBps,
 		NumLevels:           simpleConfig.NumLevels,
 		TargetDepthNotional: simpleConfig.TargetDepthNotional,
@@ -129,8 +110,8 @@ func main() {
 		makerCfg.DepthBps = 200 // default: 200 bps = ±2% from mid
 	}
 
-	log.Printf("Simple Maker config: side=%s, spread=%.0fbps, levels=%d, gapTicks=1-%d, depth=$%.0f, depthBps=%.0f, regenBps=%.0f",
-		makerCfg.BotSide, makerCfg.SpreadBps, makerCfg.NumLevels, makerCfg.LevelGapTicksMax, makerCfg.TargetDepthNotional, makerCfg.DepthBps, makerCfg.LadderRegenBps)
+	log.Printf("Simple Maker config: spread=%.0fbps, levels=%d, gapTicks=1-%d, depth=$%.0f, depthBps=%.0f, regenBps=%.0f",
+		makerCfg.SpreadBps, makerCfg.NumLevels, makerCfg.LevelGapTicksMax, makerCfg.TargetDepthNotional, makerCfg.DepthBps, makerCfg.LadderRegenBps)
 
 	// Create simple maker using new bot factory
 	maker := bot.NewSimpleMaker(makerCfg, exch, redis, mongo)
@@ -163,8 +144,8 @@ func main() {
 	}
 
 	// Update status in Redis
-	statusKey := string(botSide) // "bid" or "ask"
-	if err := redis.SetStatus(ctx, makerCfg.Symbol+":"+statusKey, "running"); err != nil {
+	statusKey := makerCfg.Symbol + ":simple-maker"
+	if err := redis.SetStatus(ctx, statusKey, "running"); err != nil {
 		log.Printf("Failed to set status: %v", err)
 	}
 
@@ -172,7 +153,7 @@ func main() {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
-	log.Printf("Simple Maker %s is running. Press Ctrl+C to stop.", botSide)
+	log.Printf("Simple Maker (2-sided) is running. Press Ctrl+C to stop.")
 
 	// Wait for first signal
 	sig := <-sigCh
@@ -183,7 +164,7 @@ func main() {
 	signal.Stop(sigCh)
 
 	// Update status
-	if err := redis.SetStatus(context.Background(), makerCfg.Symbol+":"+statusKey, "stopped"); err != nil {
+	if err := redis.SetStatus(context.Background(), statusKey, "stopped"); err != nil {
 		log.Printf("Failed to set status: %v", err)
 	}
 

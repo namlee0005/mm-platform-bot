@@ -46,8 +46,8 @@ type BaseBot struct {
 	configCheckInterval int
 	lastTickTime        int64
 
-	// Partner bot for rebalancing
-	partnerBotID string
+	// Track recently filled orders (to ignore late NEW events)
+	filledOrders map[string]int64 // orderID -> fill timestamp
 
 	// Callbacks
 	onOrderEvent OrderEventCallback
@@ -89,6 +89,7 @@ func NewBaseBot(
 		mongo:               mongo,
 		mode:                ModeNormal,
 		configCheckInterval: configCheckInterval,
+		filledOrders:        make(map[string]int64),
 	}
 
 	// Initialize components
@@ -154,19 +155,6 @@ func (b *BaseBot) Start(ctx context.Context) error {
 
 	// Publish initial balances to Redis
 	b.publishAllBalancesToRedis()
-
-	// 7. Find partner bot for rebalancing
-	if b.mongo != nil && b.cfg.ExchangeID != "" {
-		partner, err := b.mongo.FindPartnerBot(b.ctx, b.cfg.ExchangeID, b.cfg.Symbol, b.cfg.BotType)
-		if err != nil {
-			log.Printf("[%s] WARNING: Failed to find partner bot: %v", b.strategy.Name(), err)
-		} else if partner != nil {
-			b.partnerBotID = partner.BotID
-			log.Printf("[%s] Found partner bot: %s (%s)", b.strategy.Name(), partner.BotID, partner.BotType)
-		} else {
-			log.Printf("[%s] No partner bot found for rebalancing", b.strategy.Name())
-		}
-	}
 
 	snap, err := b.getSnapshot()
 	if err != nil {
@@ -339,20 +327,13 @@ func (b *BaseBot) tick() error {
 	// 3. Get live orders
 	liveOrders := b.orderTracker.GetAll()
 
-	// 4. Get combined balance from Redis (for rebalancing)
-	var combinedBalance *BalanceState
-	if b.redis != nil {
-		combinedBalance = b.getCombinedBalanceFromRedis(snap.Mid)
-	}
-
-	// 5. Build tick input
+	// 4. Build tick input
 	input := &TickInput{
-		Snapshot:        snap,
-		Balance:         balance,
-		CombinedBalance: combinedBalance,
-		LiveOrders:      liveOrders,
-		Timestamp:       now,
-		Mode:            b.mode,
+		Snapshot:   snap,
+		Balance:    balance,
+		LiveOrders: liveOrders,
+		Timestamp:  now,
+		Mode:       b.mode,
 	}
 
 	// 5. Execute strategy tick
@@ -446,9 +427,28 @@ func (b *BaseBot) publishAllBalancesToRedis() {
 }
 
 func (b *BaseBot) handleOrderUpdate(event *types.OrderEvent) {
+	now := time.Now()
+	eventTime := event.Timestamp
+	latency := now.Sub(eventTime)
+
+	// Debug log với timestamp chi tiết
+	log.Printf("[DEBUG][OrderUpdate] %s order=%s status=%s | event_time=%s recv_time=%s latency=%v",
+		event.Side, event.OrderID, event.Status,
+		eventTime.Format("15:04:05.000"), now.Format("15:04:05.000"), latency)
+
 	// Update order tracker
 	switch event.Status {
 	case "NEW":
+		// Check if order was already filled (ignore late NEW events)
+		b.mu.RLock()
+		_, wasFilled := b.filledOrders[event.OrderID]
+		b.mu.RUnlock()
+
+		if wasFilled {
+			log.Printf("[DEBUG][OrderUpdate] NEW event ignored - order already filled: %s", event.OrderID)
+			break
+		}
+
 		// Only add if not already exists (logOrderPlaced already added with requestedPrice)
 		if existing := b.orderTracker.Get(event.OrderID); existing == nil {
 			b.orderTracker.Add(&LiveOrder{
@@ -461,11 +461,15 @@ func (b *BaseBot) handleOrderUpdate(event *types.OrderEvent) {
 				LevelIndex:    parseLevelFromTag(event.ClientOrderID),
 				PlacedAt:      event.Timestamp,
 			})
+			log.Printf("[DEBUG][OrderUpdate] NEW order added to tracker: %s", event.OrderID)
+		} else {
+			log.Printf("[DEBUG][OrderUpdate] NEW event but order already in tracker (placed via REST): %s", event.OrderID)
 		}
 	case "PARTIALLY_FILLED":
 		b.orderTracker.UpdateRemaining(event.OrderID, event.Quantity-event.ExecutedQty)
 	case "FILLED", "CANCELED", "EXPIRED", "REJECTED":
 		b.orderTracker.Remove(event.OrderID)
+		log.Printf("[DEBUG][OrderUpdate] Order removed from tracker: %s status=%s", event.OrderID, event.Status)
 	}
 
 	// Forward to strategy
@@ -541,8 +545,32 @@ func (b *BaseBot) handleOrderUpdate(event *types.OrderEvent) {
 }
 
 func (b *BaseBot) handleFill(event *types.FillEvent) {
+	now := time.Now()
+	eventTime := event.Timestamp
+	latency := now.Sub(eventTime)
+
 	log.Printf("[FILL] %s %s @ %.8f x %.6f (order=%s)",
 		event.Side, event.Symbol, event.Price, event.Quantity, event.OrderID)
+	log.Printf("[DEBUG][Fill] order=%s | event_time=%s recv_time=%s latency=%v",
+		event.OrderID, eventTime.Format("15:04:05.000"), now.Format("15:04:05.000"), latency)
+
+	// Remove filled order from tracker immediately
+	// (don't wait for FILLED status event which may arrive late)
+	b.orderTracker.Remove(event.OrderID)
+
+	// Track filled order to ignore late NEW events
+	b.mu.Lock()
+	b.filledOrders[event.OrderID] = time.Now().UnixMilli()
+	// Cleanup old entries (older than 60 seconds)
+	cutoff := time.Now().UnixMilli() - 60000
+	for id, ts := range b.filledOrders {
+		if ts < cutoff {
+			delete(b.filledOrders, id)
+		}
+	}
+	b.mu.Unlock()
+
+	log.Printf("[DEBUG][Fill] Order removed from tracker: %s", event.OrderID)
 
 	// Update last trade price for market data
 	b.marketData.SetLastTradePrice(event.Price)
@@ -648,81 +676,6 @@ func (b *BaseBot) getBalanceState() (*BalanceState, error) {
 	}
 
 	return b.balanceTracker.UpdateFromAccount(acct), nil
-}
-
-// getCombinedBalanceFromRedis fetches and aggregates balances from current bot + partner bot via Redis
-func (b *BaseBot) getCombinedBalanceFromRedis(mid float64) *BalanceState {
-	if b.redis == nil || b.partnerBotID == "" {
-		log.Printf("[%s] Rebalance skip: redis=%v, partnerBotID=%s", b.strategy.Name(), b.redis != nil, b.partnerBotID)
-		return nil // No partner bot found, skip rebalancing
-	}
-
-	// Get current bot's balance from Redis
-	myBalance, err := b.redis.GetBotBalances(b.ctx, b.cfg.Exchange, b.cfg.Symbol, b.cfg.BotID)
-	if err != nil {
-		log.Printf("[%s] Rebalance: failed to get my balance: %v", b.strategy.Name(), err)
-		return nil
-	}
-	if myBalance == nil {
-		log.Printf("[%s] Rebalance: my balance not found in Redis (botID=%s)", b.strategy.Name(), b.cfg.BotID)
-		return nil
-	}
-
-	// Get partner bot's balance from Redis
-	partnerBalance, err := b.redis.GetBotBalances(b.ctx, b.cfg.Exchange, b.cfg.Symbol, b.partnerBotID)
-	if err != nil {
-		log.Printf("[%s] Rebalance: failed to get partner balance: %v", b.strategy.Name(), err)
-		return nil
-	}
-	if partnerBalance == nil {
-		log.Printf("[%s] Rebalance: partner balance not found in Redis (partnerID=%s)", b.strategy.Name(), b.partnerBotID)
-		return nil // Partner balance not available yet
-	}
-
-	// Aggregate balances from both bots
-	var totalBaseFree, totalBaseLocked, totalQuoteFree, totalQuoteLocked float64
-
-	// Add my balance
-	if myBalance.Balances != nil {
-		if baseBal, ok := myBalance.Balances[b.cfg.BaseAsset]; ok {
-			totalBaseFree += baseBal.Free
-			totalBaseLocked += baseBal.Locked
-		}
-		if quoteBal, ok := myBalance.Balances[b.cfg.QuoteAsset]; ok {
-			totalQuoteFree += quoteBal.Free
-			totalQuoteLocked += quoteBal.Locked
-		}
-	}
-
-	// Add partner balance
-	if partnerBalance.Balances != nil {
-		if baseBal, ok := partnerBalance.Balances[b.cfg.BaseAsset]; ok {
-			totalBaseFree += baseBal.Free
-			totalBaseLocked += baseBal.Locked
-		}
-		if quoteBal, ok := partnerBalance.Balances[b.cfg.QuoteAsset]; ok {
-			totalQuoteFree += quoteBal.Free
-			totalQuoteLocked += quoteBal.Locked
-		}
-	}
-
-	// Only return if we have meaningful data
-	if totalBaseFree+totalBaseLocked+totalQuoteFree+totalQuoteLocked <= 0 {
-		log.Printf("[%s] Rebalance: combined balance is zero", b.strategy.Name())
-		return nil
-	}
-
-	log.Printf("[%s] Rebalance combined: base=%.2f (free=%.2f, locked=%.2f), quote=%.2f (free=%.2f, locked=%.2f)",
-		b.strategy.Name(),
-		totalBaseFree+totalBaseLocked, totalBaseFree, totalBaseLocked,
-		totalQuoteFree+totalQuoteLocked, totalQuoteFree, totalQuoteLocked)
-
-	return &BalanceState{
-		BaseFree:    totalBaseFree,
-		BaseLocked:  totalBaseLocked,
-		QuoteFree:   totalQuoteFree,
-		QuoteLocked: totalQuoteLocked,
-	}
 }
 
 // cancelAllOrders cancels all orders

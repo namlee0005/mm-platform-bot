@@ -14,17 +14,8 @@ import (
 	"mm-platform-engine/internal/types"
 )
 
-// BotSide defines which side this strategy handles
-type BotSide string
-
-const (
-	BotSideBid BotSide = "bid" // maker-bid: only BUY orders
-	BotSideAsk BotSide = "ask" // maker-ask: only SELL orders
-)
-
 // SimpleLadderConfig is the configuration for SimpleLadderStrategy
 type SimpleLadderConfig struct {
-	BotSide             BotSide `json:"bot_side"`
 	SpreadBps           float64 `json:"spread_bps"`
 	NumLevels           int     `json:"num_levels"`
 	TargetDepthNotional float64 `json:"target_depth_notional"`
@@ -44,20 +35,12 @@ type SimpleLadderConfig struct {
 	RecoveryHours       float64 `json:"recovery_hours"`         // Target recovery time in hours (24-72)
 	MaxRecoverySizeMult float64 `json:"max_recovery_size_mult"` // Max size multiplier during recovery (e.g., 0.3 = 30%)
 
-	// Inventory rebalancing settings
-	EnableRebalance   bool    `json:"enable_rebalance"`   // Enable inventory-aware sizing
-	TargetInvRatio    float64 `json:"target_inv_ratio"`   // Target inventory ratio (default 0.5 = 50% base)
-	RebalanceK        float64 `json:"rebalance_k"`        // Rebalance sensitivity (default 2.0)
-	MaxRebalanceMult  float64 `json:"max_rebalance_mult"` // Max size multiplier for rebalance (default 2.0)
-	MinRebalanceMult  float64 `json:"min_rebalance_mult"` // Min size multiplier for rebalance (default 0.2)
-	RebalanceDeadzone float64 `json:"rebalance_deadzone"` // Deadzone - no adjustment if deviation < this (default 0.05)
-
 	// Debug settings
 	DebugCancelSleep bool `json:"debug_cancel_sleep"` // Enable 30s sleep after cancel (for debugging WebSocket)
 }
 
-// SimpleLadderStrategy implements a one-sided market maker strategy
-// that places a ladder of orders on either the bid or ask side.
+// SimpleLadderStrategy implements a two-sided market maker strategy
+// that places a ladder of orders on both the bid and ask sides.
 type SimpleLadderStrategy struct {
 	cfg *SimpleLadderConfig
 
@@ -88,9 +71,6 @@ type SimpleLadderStrategy struct {
 	currentMode    SimpleLadderMode // Current operating mode
 	modeChangedAt  time.Time        // When mode last changed
 	recoveryTarget float64          // Target NAV for recovery
-
-	// Rebalance state
-	cachedInvDev float64 // Cached inventory deviation for level reduction
 }
 
 // SimpleLadderMode represents the operating mode
@@ -151,23 +131,6 @@ func NewSimpleLadderStrategy(cfg *SimpleLadderConfig) *SimpleLadderStrategy {
 		cfg.MaxRecoverySizeMult = 0.3 // 30% size during max recovery
 	}
 
-	// Rebalance defaults
-	if cfg.TargetInvRatio == 0 {
-		cfg.TargetInvRatio = 0.5 // 50% base, 50% quote
-	}
-	if cfg.RebalanceK == 0 {
-		cfg.RebalanceK = 2.0 // sensitivity factor
-	}
-	if cfg.MaxRebalanceMult == 0 {
-		cfg.MaxRebalanceMult = 2.0 // max 2x size
-	}
-	if cfg.MinRebalanceMult == 0 {
-		cfg.MinRebalanceMult = 0.2 // min 0.2x size
-	}
-	if cfg.RebalanceDeadzone == 0 {
-		cfg.RebalanceDeadzone = 0.05 // 5% deadzone
-	}
-
 	return &SimpleLadderStrategy{
 		cfg:            cfg,
 		fillCooldowns:  make(map[float64]int64),
@@ -180,7 +143,7 @@ func NewSimpleLadderStrategy(cfg *SimpleLadderConfig) *SimpleLadderStrategy {
 
 // Name returns the strategy name
 func (s *SimpleLadderStrategy) Name() string {
-	return fmt.Sprintf("SimpleLadder[%s]", s.cfg.BotSide)
+	return "SimpleLadder"
 }
 
 // Init initializes the strategy with market state
@@ -257,55 +220,25 @@ func (s *SimpleLadderStrategy) Tick(ctx context.Context, input *core.TickInput) 
 		}
 	}
 
-	// Get available balance for this side
+	// Get total available balance (both sides)
 	availableBalance := s.getAvailableBalance(balance, mid)
 
 	// Check if we have minimum balance to trade
-	minBalance := s.cfg.MinBalanceToTrade
-	if minBalance == 0 {
-		minBalance = s.minNotional
-	}
-
-	if availableBalance < minBalance {
+	// Need TargetDepthNotional * 2 (one for each side)
+	minRequired := s.cfg.TargetDepthNotional * 2
+	if availableBalance < minRequired {
 		return &core.TickOutput{
 			Action: core.TickActionCancelAll,
-			Reason: fmt.Sprintf("insufficient balance: %.4f < %.4f", availableBalance, minBalance),
+			Reason: fmt.Sprintf("insufficient balance: %.2f < %.2f (need %0.f per side)", availableBalance, minRequired, s.cfg.TargetDepthNotional),
 		}, nil
 	}
 
 	// Calculate size multiplier based on mode
 	sizeMult := s.calculateSizeMultiplier(drawdown, mode)
 
-	// Calculate inventory rebalance multiplier (only if CombinedBalance from Redis is available)
-	var rebalanceMult float64 = 1.0
-	var invRatio, invDev float64
-	if s.cfg.EnableRebalance && input.CombinedBalance != nil {
-		invRatio, invDev, rebalanceMult = s.calculateRebalanceMultiplier(input.CombinedBalance, mid)
-
-		// Log when inventory is skewed (outside deadzone)
-		if math.Abs(invDev) > s.cfg.RebalanceDeadzone {
-			baseValue := (input.CombinedBalance.BaseFree + input.CombinedBalance.BaseLocked) * mid
-			quoteValue := input.CombinedBalance.QuoteFree + input.CombinedBalance.QuoteLocked
-			action := "REDUCE"
-			if rebalanceMult > 1.0 {
-				action = "INCREASE"
-			}
-			log.Printf("[%s] REBALANCE %s: inv=%.1f%% (dev=%.1f%%), base=$%.0f, quote=$%.0f, sizeMult=%.2f",
-				s.Name(), action, invRatio*100, invDev*100, baseValue, quoteValue, rebalanceMult)
-		}
-	}
-
-	// Store invDev for level reduction in ladder generation
-	s.mu.Lock()
-	s.cachedInvDev = invDev
-	s.mu.Unlock()
-
-	// Combine multipliers
-	finalMult := sizeMult * rebalanceMult
-
 	// Check if we should regenerate ladder
 	currentOrderCount := len(input.LiveOrders)
-	desired := s.getOrRegenerateLadder(mid, availableBalance, currentOrderCount)
+	desired := s.getOrRegenerateLadder(mid, balance, currentOrderCount)
 
 	if len(desired) == 0 {
 		return &core.TickOutput{
@@ -314,17 +247,11 @@ func (s *SimpleLadderStrategy) Tick(ctx context.Context, input *core.TickInput) 
 		}, nil
 	}
 
-	// Apply combined size multiplier
-	if finalMult != 1.0 {
-		desired = s.applySizeMultiplier(desired, finalMult)
-		if finalMult < 1.0 {
-			log.Printf("[%s] Size reduced: risk=%.2f × rebalance=%.2f = %.2f", s.Name(), sizeMult, rebalanceMult, finalMult)
-		} else {
-			log.Printf("[%s] Size increased: risk=%.2f × rebalance=%.2f = %.2f", s.Name(), sizeMult, rebalanceMult, finalMult)
-		}
+	// Apply size multiplier if in recovery mode
+	if sizeMult != 1.0 {
+		desired = s.applySizeMultiplier(desired, sizeMult)
+		log.Printf("[%s] Size adjusted: mult=%.2f", s.Name(), sizeMult)
 	}
-
-	_ = invRatio // suppress unused warning when rebalance disabled
 
 	// Compute order diff (incremental update)
 	diff := s.computeOrderDiff(input.LiveOrders, desired)
@@ -479,91 +406,6 @@ func (s *SimpleLadderStrategy) calculateSizeMultiplier(drawdown float64, mode Si
 	}
 }
 
-// calculateRebalanceMultiplier calculates size multiplier based on inventory deviation
-// Returns: invRatio, invDeviation, multiplier
-// When one side reduces (levels + size), the other side increases size to compensate
-func (s *SimpleLadderStrategy) calculateRebalanceMultiplier(balance *core.BalanceState, mid float64) (float64, float64, float64) {
-	// Calculate inventory ratio (base value / total value)
-	baseValue := (balance.BaseFree + balance.BaseLocked) * mid
-	quoteValue := balance.QuoteFree + balance.QuoteLocked
-	totalValue := baseValue + quoteValue
-
-	if totalValue <= 0 {
-		return 0.5, 0, 1.0
-	}
-
-	invRatio := baseValue / totalValue
-	invDev := invRatio - s.cfg.TargetInvRatio
-
-	// If within deadzone, no adjustment
-	if math.Abs(invDev) <= s.cfg.RebalanceDeadzone {
-		return invRatio, invDev, 1.0
-	}
-
-	effectiveDev := math.Abs(invDev) - s.cfg.RebalanceDeadzone
-
-	// Calculate reduction factor for the "reduce" side (used for compensation)
-	// This is the same formula used in level reduction
-	reductionSizeMult := 1.0 - effectiveDev*s.cfg.RebalanceK
-	if reductionSizeMult < s.cfg.MinRebalanceMult {
-		reductionSizeMult = s.cfg.MinRebalanceMult
-	}
-
-	// Level reduction factor (same formula as in computeDesiredOrders)
-	levelReductionFactor := 1.0 - effectiveDev*s.cfg.RebalanceK
-	if levelReductionFactor < 0.2 {
-		levelReductionFactor = 0.2
-	}
-
-	// Total reduction on the "reduce" side = levelFactor × sizeMult
-	totalReduction := levelReductionFactor * reductionSizeMult
-
-	// The "increase" side needs to compensate: add back what was reduced
-	// compensationMult = 1 + (1 - totalReduction) = 2 - totalReduction
-	compensationMult := 2.0 - totalReduction
-
-	var mult float64
-
-	if s.cfg.BotSide == BotSideBid {
-		if invDev > 0 {
-			// BID reduces (too much base)
-			mult = reductionSizeMult
-		} else {
-			// BID increases to compensate for ASK reduction
-			mult = compensationMult
-		}
-	} else {
-		if invDev < 0 {
-			// ASK reduces (too much quote)
-			mult = reductionSizeMult
-		} else {
-			// ASK increases to compensate for BID reduction
-			mult = compensationMult
-		}
-	}
-
-	// Clamp to min/max
-	if mult > s.cfg.MaxRebalanceMult {
-		mult = s.cfg.MaxRebalanceMult
-	}
-	if mult < s.cfg.MinRebalanceMult {
-		mult = s.cfg.MinRebalanceMult
-	}
-
-	return invRatio, invDev, mult
-}
-
-// sign returns -1, 0, or 1 depending on the sign of x
-func sign(x float64) float64 {
-	if x > 0 {
-		return 1
-	}
-	if x < 0 {
-		return -1
-	}
-	return 0
-}
-
 // applySizeMultiplier applies size multiplier to all orders
 func (s *SimpleLadderStrategy) applySizeMultiplier(orders []core.DesiredOrder, mult float64) []core.DesiredOrder {
 	result := make([]core.DesiredOrder, 0, len(orders))
@@ -693,13 +535,10 @@ func (s *SimpleLadderStrategy) UpdateConfig(newCfg interface{}) error {
 	return nil
 }
 
-// getAvailableBalance returns available balance for this side
+// getAvailableBalance returns total available balance (both base and quote as notional)
 func (s *SimpleLadderStrategy) getAvailableBalance(balance *core.BalanceState, mid float64) float64 {
-	if s.cfg.BotSide == BotSideBid {
-		return balance.QuoteFree // Need quote to buy
-	}
-	// For ask, convert base to notional value
-	return balance.BaseFree * mid
+	// Total notional = base value + quote value
+	return (balance.BaseFree * mid) + balance.QuoteFree
 }
 
 // shouldRegenerateLadder checks if we need to regenerate the ladder
@@ -722,14 +561,15 @@ func (s *SimpleLadderStrategy) shouldRegenerateLadder(mid, balance float64, curr
 }
 
 // getOrRegenerateLadder returns cached ladder or generates new one
-func (s *SimpleLadderStrategy) getOrRegenerateLadder(mid, balance float64, currentOrderCount int) []core.DesiredOrder {
-	shouldRegen, reason := s.shouldRegenerateLadder(mid, balance, currentOrderCount)
+func (s *SimpleLadderStrategy) getOrRegenerateLadder(mid float64, balance *core.BalanceState, currentOrderCount int) []core.DesiredOrder {
+	totalBalance := s.getAvailableBalance(balance, mid)
+	shouldRegen, reason := s.shouldRegenerateLadder(mid, totalBalance, currentOrderCount)
 
 	if shouldRegen {
 		s.mu.Lock()
 		s.cachedLadder = s.computeDesiredOrders(mid, balance)
 		s.cachedMid = mid
-		s.cachedBalance = balance
+		s.cachedBalance = totalBalance
 		s.mu.Unlock()
 		log.Printf("[%s] Regenerated ladder: reason=%s, levels=%d", s.Name(), reason, len(s.cachedLadder))
 	}
@@ -739,22 +579,8 @@ func (s *SimpleLadderStrategy) getOrRegenerateLadder(mid, balance float64, curre
 	return s.cachedLadder
 }
 
-// computeDesiredOrders computes the desired order ladder
-func (s *SimpleLadderStrategy) computeDesiredOrders(mid float64, availableBalance float64) []core.DesiredOrder {
-	// Target depth for this side (no division - config is per-side)
-	targetDepthOneSide := s.cfg.TargetDepthNotional
-
-	// Calculate effective depth based on available balance
-	effectiveDepth := targetDepthOneSide
-	if availableBalance < effectiveDepth {
-		effectiveDepth = availableBalance * 0.9
-	}
-
-	side := "BUY"
-	if s.cfg.BotSide == BotSideAsk {
-		side = "SELL"
-	}
-
+// computeDesiredOrders computes the desired order ladder for BOTH sides
+func (s *SimpleLadderStrategy) computeDesiredOrders(mid float64, balance *core.BalanceState) []core.DesiredOrder {
 	// Calculate depth limit prices
 	depthBps := s.cfg.DepthBps
 	if depthBps <= 0 {
@@ -771,46 +597,77 @@ func (s *SimpleLadderStrategy) computeDesiredOrders(mid float64, availableBalanc
 		numLevels = 5
 	}
 
-	// Reduce levels based on inventory deviation (rebalance)
-	// BID: reduce levels when invDev > 0 (too much base, reduce buying)
-	// ASK: reduce levels when invDev < 0 (too much quote, reduce selling)
-	// Note: Only reduce levels, size increase is handled by rebalanceMult in Tick()
-	if s.cfg.EnableRebalance {
-		invDev := s.cachedInvDev
+	// Target depth per side (config is per-side, not total)
+	targetDepthPerSide := s.cfg.TargetDepthNotional
 
-		shouldReduce := false
-		if s.cfg.BotSide == BotSideBid && invDev > s.cfg.RebalanceDeadzone {
-			shouldReduce = true // Too much base, reduce buying
-		} else if s.cfg.BotSide == BotSideAsk && invDev < -s.cfg.RebalanceDeadzone {
-			shouldReduce = true // Too much quote, reduce selling
-		}
+	// Calculate inventory skew
+	// invRatio = baseValue / totalValue (0.5 = balanced)
+	// invSkew > 0: too much base → ASK closer to mid, BID further
+	// invSkew < 0: too much quote → BID closer to mid, ASK further
+	baseValue := balance.BaseFree * mid
+	quoteValue := balance.QuoteFree
+	totalValue := baseValue + quoteValue
+	invRatio := 0.5
+	if totalValue > 0 {
+		invRatio = baseValue / totalValue
+	}
+	invSkew := invRatio - 0.5 // -0.5 to +0.5
 
-		if shouldReduce {
-			// Reduce levels proportionally: more deviation = fewer levels
-			effectiveDev := math.Abs(invDev) - s.cfg.RebalanceDeadzone
-			reductionFactor := 1.0 - effectiveDev*s.cfg.RebalanceK
-			if reductionFactor < 0.2 {
-				reductionFactor = 0.2 // Keep at least 20% of levels
-			}
-			newLevels := int(float64(numLevels) * reductionFactor)
-			if newLevels < 1 {
-				newLevels = 1
-			}
-			if newLevels < numLevels {
-				log.Printf("[%s] REBALANCE REDUCE levels: %d -> %d (invDev=%.1f%%)",
-					s.Name(), numLevels, newLevels, invDev*100)
-				numLevels = newLevels
-			}
-		}
+	// Adjust spread based on skew
+	// skewBps: how much to shift the "heavy" side towards depthBps
+	// Max shift = (depthBps - spreadBps) when fully skewed
+	maxShift := depthBps - spreadBps
+	skewBps := math.Abs(invSkew) * 2 * maxShift // 0 to maxShift
+
+	// BID spreadBps: increase if too much base (invSkew > 0)
+	// ASK spreadBps: increase if too much quote (invSkew < 0)
+	bidSpreadBps := spreadBps
+	askSpreadBps := spreadBps
+	if invSkew > 0.05 { // Too much base - BID further, ASK closer
+		bidSpreadBps = spreadBps + skewBps
+		askSpreadBps = spreadBps
+	} else if invSkew < -0.05 { // Too much quote - ASK further, BID closer
+		askSpreadBps = spreadBps + skewBps
+		bidSpreadBps = spreadBps
 	}
 
+	// Cap to not exceed depthBps
+	if bidSpreadBps > depthBps {
+		bidSpreadBps = depthBps * 0.9
+	}
+	if askSpreadBps > depthBps {
+		askSpreadBps = depthBps * 0.9
+	}
+
+	if math.Abs(invSkew) > 0.05 {
+		log.Printf("[%s] Inventory skew: %.1f%% (base=$%.0f, quote=$%.0f) → BID@%.0fbps, ASK@%.0fbps",
+			s.Name(), invSkew*100, baseValue, quoteValue, bidSpreadBps, askSpreadBps)
+	}
+
+	// Short batchID to fit Gate.io 30 char limit
+	timestamp := time.Now().UnixMilli() % 100000000
+	batchID := fmt.Sprintf("%d%03d", timestamp, rand.Intn(1000))
+
+	var orders []core.DesiredOrder
+
+	// Generate BID orders (with adjusted spread)
+	bidOrders := s.generateSideOrders(mid, bidSpreadBps, depthBps, numLevels, targetDepthPerSide, "BUY", batchID)
+	orders = append(orders, bidOrders...)
+
+	// Generate ASK orders (with adjusted spread)
+	askOrders := s.generateSideOrders(mid, askSpreadBps, depthBps, numLevels, targetDepthPerSide, "SELL", batchID)
+	orders = append(orders, askOrders...)
+
+	return orders
+}
+
+// generateSideOrders generates orders for one side (BUY or SELL)
+func (s *SimpleLadderStrategy) generateSideOrders(mid, spreadBps, depthBps float64, numLevels int, targetDepth float64, side string, batchID string) []core.DesiredOrder {
 	// Calculate price range for ladder
 	// First level: at spreadBps from mid
 	// Last level: at depthBps from mid
-	// Distribute levels evenly within this range
-
 	var firstPrice, lastPrice float64
-	if s.cfg.BotSide == BotSideBid {
+	if side == "BUY" {
 		firstPrice = mid * (1.0 - spreadBps/10000.0)
 		lastPrice = mid * (1.0 - depthBps/10000.0)
 	} else {
@@ -822,15 +679,12 @@ func (s *SimpleLadderStrategy) computeDesiredOrders(mid float64, availableBalanc
 	priceRange := math.Abs(lastPrice - firstPrice)
 
 	// Ensure levels fit within price range with minimum gap (tickSize)
-	// If too many levels, reduce to fit within ±depthBps
-	minStepRequired := s.tickSize // Minimum 1 tick between levels
+	minStepRequired := s.tickSize
 	maxLevelsThatFit := int(priceRange/minStepRequired) + 1
 	if maxLevelsThatFit < 1 {
 		maxLevelsThatFit = 1
 	}
 	if numLevels > maxLevelsThatFit {
-		log.Printf("[%s] Reducing levels to fit within %.0fbps: %d -> %d",
-			s.Name(), depthBps, numLevels, maxLevelsThatFit)
 		numLevels = maxLevelsThatFit
 	}
 
@@ -839,39 +693,32 @@ func (s *SimpleLadderStrategy) computeDesiredOrders(mid float64, availableBalanc
 		baseStep = 0
 	}
 
-	// Calculate max jitter - should be smaller than baseStep to avoid overlaps
-	// Max jitter = min(LevelGapTicksMax * tickSize, baseStep * 0.3)
+	// Calculate max jitter
 	maxGapTicks := s.cfg.LevelGapTicksMax
 	if maxGapTicks <= 0 {
 		maxGapTicks = 3
 	}
 	maxJitterTicks := s.tickSize * float64(maxGapTicks)
-	maxJitterStep := baseStep * 0.3 // Max 30% of step to avoid overlaps
-
+	maxJitterStep := baseStep * 0.3
 	maxJitter := maxJitterTicks
 	if maxJitterStep < maxJitter && maxJitterStep > 0 {
 		maxJitter = maxJitterStep
 	}
 
-	// Generate prices: evenly distributed with small random jitter
+	// Generate prices
 	levelPrices := make([]float64, 0, numLevels)
-
 	for level := 0; level < numLevels; level++ {
 		var basePrice float64
-		if s.cfg.BotSide == BotSideBid {
-			// Bid: firstPrice (highest) -> lastPrice (lowest)
+		if side == "BUY" {
 			basePrice = firstPrice - baseStep*float64(level)
 		} else {
-			// Ask: firstPrice (lowest) -> lastPrice (highest)
 			basePrice = firstPrice + baseStep*float64(level)
 		}
 
-		// Add random jitter (except for first and last levels to maintain bounds)
 		var price float64
 		if level == 0 || level == numLevels-1 {
 			price = basePrice
 		} else {
-			// Random jitter: ±maxJitter (capped to avoid overlaps)
 			jitter := (rand.Float64()*2 - 1) * maxJitter
 			price = basePrice + jitter
 		}
@@ -879,7 +726,7 @@ func (s *SimpleLadderStrategy) computeDesiredOrders(mid float64, availableBalanc
 		price = s.roundToTick(price)
 
 		// Ensure within bounds
-		if s.cfg.BotSide == BotSideBid {
+		if side == "BUY" {
 			minPrice := mid * (1.0 - depthBps/10000.0)
 			if price < minPrice {
 				price = s.roundToTick(minPrice)
@@ -900,66 +747,38 @@ func (s *SimpleLadderStrategy) computeDesiredOrders(mid float64, availableBalanc
 		levelPrices = append(levelPrices, price)
 	}
 
-	// Sort prices to ensure proper order after jitter
-	// BID: highest to lowest (descending)
-	// ASK: lowest to highest (ascending)
-	if s.cfg.BotSide == BotSideBid {
+	// Sort prices
+	if side == "BUY" {
 		sort.Float64s(levelPrices)
-		// Reverse for descending order
+		// Reverse for descending order (highest first for bids)
 		for i, j := 0, len(levelPrices)-1; i < j; i, j = i+1, j-1 {
 			levelPrices[i], levelPrices[j] = levelPrices[j], levelPrices[i]
 		}
 	} else {
-		sort.Float64s(levelPrices)
+		sort.Float64s(levelPrices) // Ascending for asks
 	}
 
-	// Remove duplicate prices (can happen with small ranges and rounding)
 	levelPrices = s.removeDuplicatePrices(levelPrices)
-
 	actualLevels := len(levelPrices)
 	if actualLevels == 0 {
 		return nil
 	}
 
-	// Warn if we couldn't fit all requested levels
-	if actualLevels < numLevels {
-		ticksInRange := priceRange / s.tickSize
-		log.Printf("[%s] WARNING: Only %d/%d levels fit in range. Price range=%.8f, tickSize=%.8f, ticks=%.0f",
-			s.Name(), actualLevels, numLevels, priceRange, s.tickSize, ticksInRange)
+	// Generate orders with sizes
+	orders := make([]core.DesiredOrder, 0, actualLevels)
+	baseNotionalPerLevel := targetDepth / float64(actualLevels)
+
+	sideTag := "B"
+	if side == "SELL" {
+		sideTag = "A"
 	}
 
-	// Pass 2: Calculate random sizes (uniform base with jitter)
-	// Each level gets roughly equal notional with random variation
-
-	orders := make([]core.DesiredOrder, 0, actualLevels)
-	var totalNotionalUsed float64
-	// Short batchID to fit Gate.io 30 char limit: use last 8 digits of timestamp + 3 digit random
-	timestamp := time.Now().UnixMilli() % 100000000 // Last 8 digits
-	batchID := fmt.Sprintf("%d%03d", timestamp, rand.Intn(1000))
-
-	// Base notional per level (uniform distribution)
-	baseNotionalPerLevel := effectiveDepth / float64(actualLevels)
-
 	for level := 0; level < actualLevels; level++ {
-		remainingBalance := availableBalance - totalNotionalUsed
-		if remainingBalance < s.minNotional {
-			break
-		}
-
 		price := levelPrices[level]
 
-		// Random size multiplier: 0.5x to 1.5x of base size
-		// This gives good randomness while keeping sizes reasonable
-		randomMult := 0.5 + rand.Float64() // 0.5 to 1.5
-		baseSizeNotional := baseNotionalPerLevel * randomMult
-
-		// Add additional jitter from config
-		sizeJitter := 1.0 + s.cfg.SizeJitterPct*(2*rand.Float64()-1)
-		sizeNotional := baseSizeNotional * sizeJitter
-
-		if sizeNotional > remainingBalance {
-			sizeNotional = remainingBalance * 0.95
-		}
+		// Random size: base × (1.0 to 1.5) - ensures total > targetDepth
+		jitter := 1.0 + rand.Float64()*0.5
+		sizeNotional := baseNotionalPerLevel * jitter
 
 		qty := sizeNotional / price
 		qty = s.roundToStep(qty)
@@ -974,10 +793,8 @@ func (s *SimpleLadderStrategy) computeDesiredOrders(mid float64, availableBalanc
 			Price:      price,
 			Qty:        qty,
 			LevelIndex: level,
-			Tag:        fmt.Sprintf("SM_%s_L%d_%s", batchID, level, s.cfg.BotSide),
+			Tag:        fmt.Sprintf("SM_%s_L%d_%s", batchID, level, sideTag),
 		})
-
-		totalNotionalUsed += orderNotional
 	}
 
 	return orders

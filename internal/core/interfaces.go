@@ -48,12 +48,11 @@ type Strategy interface {
 
 // TickInput contains all data needed for a strategy tick
 type TickInput struct {
-	Snapshot        *Snapshot
-	Balance         *BalanceState // Current bot's balance
-	CombinedBalance *BalanceState // Combined balance from all bots (for rebalancing), nil if not available
-	LiveOrders      []LiveOrder
-	Timestamp       int64
-	Mode            Mode // Current operating mode
+	Snapshot   *Snapshot
+	Balance    *BalanceState // Current bot's balance
+	LiveOrders []LiveOrder
+	Timestamp  int64
+	Mode       Mode // Current operating mode
 }
 
 // TickOutput contains the result of a strategy tick

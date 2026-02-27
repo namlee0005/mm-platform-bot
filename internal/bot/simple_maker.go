@@ -22,18 +22,17 @@ type SimpleMakerConfig struct {
 	TickIntervalMs int `json:"tick_interval_ms"`
 
 	// Strategy settings
-	BotSide             strategy.BotSide `json:"bot_side"`
-	SpreadBps           float64          `json:"spread_bps"`
-	NumLevels           int              `json:"num_levels"`
-	TargetDepthNotional float64          `json:"target_depth_notional"`
-	DepthBps            float64          `json:"depth_bps"`
-	PriceJitterPct      float64          `json:"price_jitter_pct"`
-	SizeJitterPct       float64          `json:"size_jitter_pct"`
-	MinBalanceToTrade   float64          `json:"min_balance_to_trade"`
-	LadderRegenBps      float64          `json:"ladder_regen_bps"`
-	LevelGapTicksMax    int              `json:"level_gap_ticks_max"`
-	TargetRatio         float64          `json:"target_ratio"`
-	RatioK              float64          `json:"ratio_k"`
+	SpreadBps           float64 `json:"spread_bps"`
+	NumLevels           int     `json:"num_levels"`
+	TargetDepthNotional float64 `json:"target_depth_notional"`
+	DepthBps            float64 `json:"depth_bps"`
+	PriceJitterPct      float64 `json:"price_jitter_pct"`
+	SizeJitterPct       float64 `json:"size_jitter_pct"`
+	MinBalanceToTrade   float64 `json:"min_balance_to_trade"`
+	LadderRegenBps      float64 `json:"ladder_regen_bps"`
+	LevelGapTicksMax    int     `json:"level_gap_ticks_max"`
+	TargetRatio         float64 `json:"target_ratio"`
+	RatioK              float64 `json:"ratio_k"`
 
 	// Risk settings
 	DrawdownLimitPct    float64 `json:"drawdown_limit_pct"`     // Max drawdown before pause (default 5%)
@@ -41,14 +40,6 @@ type SimpleMakerConfig struct {
 	DrawdownReducePct   float64 `json:"drawdown_reduce_pct"`    // Start reducing size (default 2%)
 	RecoveryHours       float64 `json:"recovery_hours"`         // Target recovery time (default 48h)
 	MaxRecoverySizeMult float64 `json:"max_recovery_size_mult"` // Min size during recovery (default 30%)
-
-	// Inventory rebalancing settings
-	EnableRebalance   bool    `json:"enable_rebalance"`   // Enable inventory-aware sizing
-	TargetInvRatio    float64 `json:"target_inv_ratio"`   // Target inventory ratio (default 0.5)
-	RebalanceK        float64 `json:"rebalance_k"`        // Rebalance sensitivity (default 2.0)
-	MaxRebalanceMult  float64 `json:"max_rebalance_mult"` // Max size multiplier (default 2.0)
-	MinRebalanceMult  float64 `json:"min_rebalance_mult"` // Min size multiplier (default 0.2)
-	RebalanceDeadzone float64 `json:"rebalance_deadzone"` // Deadzone (default 0.05)
 
 	// Debug settings
 	DebugCancelSleep bool `json:"debug_cancel_sleep"` // Sleep 30s after cancel for WebSocket debug
@@ -74,11 +65,8 @@ func NewSimpleMaker(
 		TickIntervalMs: cfg.TickIntervalMs,
 	}
 
-	//cfg.DebugCancelSleep = false
-
 	// Create strategy config
 	strategyCfg := &strategy.SimpleLadderConfig{
-		BotSide:             cfg.BotSide,
 		SpreadBps:           cfg.SpreadBps,
 		NumLevels:           cfg.NumLevels,
 		TargetDepthNotional: cfg.TargetDepthNotional,
@@ -96,13 +84,6 @@ func NewSimpleMaker(
 		DrawdownReducePct:   cfg.DrawdownReducePct,
 		RecoveryHours:       cfg.RecoveryHours,
 		MaxRecoverySizeMult: cfg.MaxRecoverySizeMult,
-		// Rebalance settings
-		EnableRebalance:   cfg.EnableRebalance,
-		TargetInvRatio:    cfg.TargetInvRatio,
-		RebalanceK:        cfg.RebalanceK,
-		MaxRebalanceMult:  cfg.MaxRebalanceMult,
-		MinRebalanceMult:  cfg.MinRebalanceMult,
-		RebalanceDeadzone: cfg.RebalanceDeadzone,
 		// Debug settings
 		DebugCancelSleep: cfg.DebugCancelSleep,
 	}

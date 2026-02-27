@@ -17,7 +17,6 @@ import (
 	"mm-platform-engine/internal/exchange/gate"
 	"mm-platform-engine/internal/exchange/mexc"
 	"mm-platform-engine/internal/store"
-	"mm-platform-engine/internal/strategy"
 )
 
 func main() {
@@ -37,7 +36,7 @@ func main() {
 		botType = cfg.SimpleConfig.BotType
 	}
 	if botType == "" {
-		log.Fatal("BOT_TYPE is required (env or config.bot_type)")
+		botType = "simple-maker" // Default to simple-maker (2-sided)
 	}
 
 	log.Printf("Loaded config for %s on %s, bot_type=%s",
@@ -82,20 +81,21 @@ func main() {
 	var maker *core.BaseBot
 
 	switch strings.ToLower(botType) {
-	case "maker-bid", "bid":
-		maker = createSimpleMaker(cfg, exch, redis, mongo, strategy.BotSideBid, exchangeName, botID)
-		log.Println("Mode: MAKER-BID (BUY orders only)")
-
-	case "maker-ask", "ask":
-		maker = createSimpleMaker(cfg, exch, redis, mongo, strategy.BotSideAsk, exchangeName, botID)
-		log.Println("Mode: MAKER-ASK (SELL orders only)")
+	case "simple-maker", "maker", "maker-bid", "maker-ask", "bid", "ask":
+		// All simple/one-sided types now use 2-sided simple-maker
+		maker = createSimpleMaker(cfg, exch, redis, mongo, exchangeName, botID)
+		log.Println("Mode: SIMPLE-MAKER (2-sided market maker)")
 
 	case "mm-engine", "engine", "mm":
 		maker = createMMEngine(cfg, exch, redis, mongo, exchangeName, botID)
-		log.Println("Mode: MM-ENGINE (TWO-SIDED market maker)")
+		log.Println("Mode: MM-ENGINE (advanced 2-sided market maker)")
+
+	case "depth-filler", "filler", "depth":
+		maker = createDepthFiller(cfg, exch, redis, mongo, exchangeName, botID)
+		log.Println("Mode: DEPTH-FILLER (order book depth filler)")
 
 	default:
-		log.Fatalf("Invalid bot_type: %s (must be 'maker-bid', 'maker-ask', or 'mm-engine')", botType)
+		log.Fatalf("Invalid bot_type: %s (must be 'simple-maker', 'mm-engine', or 'depth-filler')", botType)
 	}
 
 	// Wire up Redis Stream for order events
@@ -161,13 +161,12 @@ func main() {
 	log.Println("Bot stopped successfully")
 }
 
-// createSimpleMaker creates a SimpleMaker bot (one-sided)
+// createSimpleMaker creates a SimpleMaker bot (2-sided)
 func createSimpleMaker(
 	cfg *config.Config,
 	exch exchange.Exchange,
 	redis *store.RedisStore,
 	mongo *store.MongoStore,
-	side strategy.BotSide,
 	exchangeName string,
 	botID string,
 ) *core.BaseBot {
@@ -178,11 +177,10 @@ func createSimpleMaker(
 		BaseAsset:           simpleConfig.BaseAsset,
 		QuoteAsset:          simpleConfig.QuoteAsset,
 		Exchange:            exchangeName,
-		ExchangeID:          cfg.ExchangeID, // Exchange account ID (shared between maker-bid/ask)
+		ExchangeID:          cfg.ExchangeID,
 		BotID:               botID,
-		BotType:             string(side),
+		BotType:             "simple-maker",
 		TickIntervalMs:      simpleConfig.TickIntervalMs,
-		BotSide:             side,
 		SpreadBps:           simpleConfig.SpreadMinBps,
 		NumLevels:           simpleConfig.NumLevels,
 		TargetDepthNotional: simpleConfig.TargetDepthNotional,
@@ -192,17 +190,10 @@ func createSimpleMaker(
 		LevelGapTicksMax:    simpleConfig.LevelGapTicksMax,
 		// Risk settings
 		DrawdownLimitPct:    simpleConfig.DrawdownLimitPct,
-		DrawdownWarnPct:     simpleConfig.DrawdownLimitPct * 0.6, // 60% of limit as warning
-		DrawdownReducePct:   simpleConfig.DrawdownLimitPct * 0.4, // 40% of limit to start reducing
-		RecoveryHours:       48,                                  // 48 hours target recovery
-		MaxRecoverySizeMult: 0.3,                                 // 30% size at max drawdown
-		// Rebalance settings - auto-adjust size based on inventory
-		EnableRebalance:   true,                     // Enable by default for one-sided bots
-		TargetInvRatio:    simpleConfig.TargetRatio, // Target 50/50 by default
-		RebalanceK:        2.0,                      // Sensitivity
-		MaxRebalanceMult:  2.0,                      // Max 2x size when rebalancing
-		MinRebalanceMult:  0.2,                      // Min 0.2x size
-		RebalanceDeadzone: 0.05,                     // 5% deadzone
+		DrawdownWarnPct:     simpleConfig.DrawdownLimitPct * 0.6,
+		DrawdownReducePct:   simpleConfig.DrawdownLimitPct * 0.4,
+		RecoveryHours:       48,
+		MaxRecoverySizeMult: 0.3,
 	}
 
 	// Set defaults
@@ -228,8 +219,8 @@ func createSimpleMaker(
 		makerCfg.DepthBps = 200
 	}
 
-	log.Printf("SimpleMaker config: side=%s, spread=%.0fbps, levels=%d, depth=$%.0f",
-		makerCfg.BotSide, makerCfg.SpreadBps, makerCfg.NumLevels, makerCfg.TargetDepthNotional)
+	log.Printf("SimpleMaker config: spread=%.0fbps, levels=%d, depth=$%.0f",
+		makerCfg.SpreadBps, makerCfg.NumLevels, makerCfg.TargetDepthNotional)
 
 	return bot.NewSimpleMaker(makerCfg, exch, redis, mongo)
 }
@@ -321,6 +312,55 @@ func createMMEngine(
 		engineCfg.NumLevels, engineCfg.TargetRatio, engineCfg.BaseSpreadBps)
 
 	return bot.NewMMEngine(engineCfg, exch, redis, mongo)
+}
+
+// createDepthFiller creates a DepthFiller bot (order book depth filler)
+func createDepthFiller(
+	cfg *config.Config,
+	exch exchange.Exchange,
+	redis *store.RedisStore,
+	mongo *store.MongoStore,
+	exchangeName string,
+	botID string,
+) *core.BaseBot {
+	simpleConfig := cfg.SimpleConfig
+
+	fillerCfg := &bot.DepthFillerConfig{
+		Symbol:     simpleConfig.Symbol,
+		BaseAsset:  simpleConfig.BaseAsset,
+		QuoteAsset: simpleConfig.QuoteAsset,
+		Exchange:   exchangeName,
+		ExchangeID: cfg.ExchangeID,
+		BotID:      botID,
+		BotType:    "depth-filler",
+
+		TickIntervalMs:      simpleConfig.TickIntervalMs,
+		MinDepthPct:         5,  // 5% from mid
+		MaxDepthPct:         50, // 50% from mid
+		NumLevels:           10, // 10 levels per side
+		TargetDepthNotional: simpleConfig.TargetDepthNotional,
+		TimeSleepMs:         200, // 200ms between orders
+		RemoveThresholdPct:  5,   // Remove when within 5%
+		LadderRegenBps:      100, // Regen when mid moves 1%
+	}
+
+	// Override NumLevels from config if available
+	if simpleConfig.NumLevels > 0 {
+		fillerCfg.NumLevels = simpleConfig.NumLevels
+	}
+
+	// Set defaults
+	if fillerCfg.TickIntervalMs == 0 {
+		fillerCfg.TickIntervalMs = 5000
+	}
+	if fillerCfg.TargetDepthNotional == 0 {
+		fillerCfg.TargetDepthNotional = 100 // $100 per side default
+	}
+
+	log.Printf("DepthFiller config: depth=%.1f%%-%.1f%%, levels=%d, notional=$%.0f",
+		fillerCfg.MinDepthPct, fillerCfg.MaxDepthPct, fillerCfg.NumLevels, fillerCfg.TargetDepthNotional)
+
+	return bot.NewDepthFiller(fillerCfg, exch, redis, mongo)
 }
 
 // convertToGateSymbol converts symbol from "BTCUSDT" to "BTC_USDT" format
