@@ -49,6 +49,9 @@ type BaseBot struct {
 	// Track recently filled orders (to ignore late NEW events)
 	filledOrders map[string]int64 // orderID -> fill timestamp
 
+	// Track WS-confirmed orders (to prevent duplicate WS emissions)
+	confirmedOrders map[string]bool // orderID -> confirmed
+
 	// Callbacks
 	onOrderEvent OrderEventCallback
 }
@@ -90,6 +93,7 @@ func NewBaseBot(
 		mode:                ModeNormal,
 		configCheckInterval: configCheckInterval,
 		filledOrders:        make(map[string]int64),
+		confirmedOrders:     make(map[string]bool),
 	}
 
 	// Initialize components
@@ -98,7 +102,7 @@ func NewBaseBot(
 	bot.marketData = NewMarketDataCache()
 
 	// Use last trade price by default (better for thin orderbooks where we are the only MM)
-	bot.marketData.UseLastTradePrice(false)
+	bot.marketData.UseLastTradePrice(true)
 
 	return bot
 }
@@ -327,13 +331,23 @@ func (b *BaseBot) tick() error {
 	// 3. Get live orders
 	liveOrders := b.orderTracker.GetAll()
 
-	// 4. Build tick input
+	// 4. Get recent trades (for VWAP fair price calculation)
+	// Use 100 trades limit (should cover ~10-15 minutes on most markets)
+	recentTrades, err := b.exch.GetRecentTrades(b.ctx, b.cfg.Symbol, 100)
+	if err != nil {
+		// Log warning but continue - strategy will use fallback
+		log.Printf("[BaseBot] ⚠️  Failed to get recent trades: %v (will use fallback)", err)
+		recentTrades = []exchange.Trade{} // Empty trades
+	}
+
+	// 5. Build tick input
 	input := &TickInput{
-		Snapshot:   snap,
-		Balance:    balance,
-		LiveOrders: liveOrders,
-		Timestamp:  now,
-		Mode:       b.mode,
+		Snapshot:     snap,
+		Balance:      balance,
+		LiveOrders:   liveOrders,
+		Timestamp:    now,
+		Mode:         b.mode,
+		RecentTrades: recentTrades,
 	}
 
 	// 5. Execute strategy tick
@@ -427,14 +441,12 @@ func (b *BaseBot) publishAllBalancesToRedis() {
 }
 
 func (b *BaseBot) handleOrderUpdate(event *types.OrderEvent) {
-	now := time.Now()
-	eventTime := event.Timestamp
-	latency := now.Sub(eventTime)
+	// Debug log với timestamp chi tiết (removed)
 
-	// Debug log với timestamp chi tiết
-	log.Printf("[DEBUG][OrderUpdate] %s order=%s status=%s | event_time=%s recv_time=%s latency=%v",
-		event.Side, event.OrderID, event.Status,
-		eventTime.Format("15:04:05.000"), now.Format("15:04:05.000"), latency)
+	// Skip FILLED - already handled completely by handleFill
+	if event.Status == "FILLED" {
+		return
+	}
 
 	// Update order tracker
 	switch event.Status {
@@ -442,12 +454,22 @@ func (b *BaseBot) handleOrderUpdate(event *types.OrderEvent) {
 		// Check if order was already filled (ignore late NEW events)
 		b.mu.RLock()
 		_, wasFilled := b.filledOrders[event.OrderID]
+		wasConfirmed := b.confirmedOrders[event.OrderID]
 		b.mu.RUnlock()
 
 		if wasFilled {
-			log.Printf("[DEBUG][OrderUpdate] NEW event ignored - order already filled: %s", event.OrderID)
-			break
+			return // Exit immediately without emitting WS events
 		}
+
+		// Check if this is a duplicate NEW event from exchange
+		if wasConfirmed {
+			return // Exit immediately without emitting duplicate WS events
+		}
+
+		// Mark as confirmed (first NEW event received)
+		b.mu.Lock()
+		b.confirmedOrders[event.OrderID] = true
+		b.mu.Unlock()
 
 		// Only add if not already exists (logOrderPlaced already added with requestedPrice)
 		if existing := b.orderTracker.Get(event.OrderID); existing == nil {
@@ -461,15 +483,16 @@ func (b *BaseBot) handleOrderUpdate(event *types.OrderEvent) {
 				LevelIndex:    parseLevelFromTag(event.ClientOrderID),
 				PlacedAt:      event.Timestamp,
 			})
-			log.Printf("[DEBUG][OrderUpdate] NEW order added to tracker: %s", event.OrderID)
 		} else {
-			log.Printf("[DEBUG][OrderUpdate] NEW event but order already in tracker (placed via REST): %s", event.OrderID)
 		}
 	case "PARTIALLY_FILLED":
 		b.orderTracker.UpdateRemaining(event.OrderID, event.Quantity-event.ExecutedQty)
-	case "FILLED", "CANCELED", "EXPIRED", "REJECTED":
+	case "CANCELED", "EXPIRED", "REJECTED":
 		b.orderTracker.Remove(event.OrderID)
-		log.Printf("[DEBUG][OrderUpdate] Order removed from tracker: %s status=%s", event.OrderID, event.Status)
+		// Clean up confirmedOrders map
+		b.mu.Lock()
+		delete(b.confirmedOrders, event.OrderID)
+		b.mu.Unlock()
 	}
 
 	// Forward to strategy
@@ -485,21 +508,21 @@ func (b *BaseBot) handleOrderUpdate(event *types.OrderEvent) {
 		Timestamp:     event.Timestamp,
 	})
 
-	// Emit order event callback
-	if b.onOrderEvent != nil {
+	// Emit order event callback (skip FILLED - already emitted by handleFill)
+	if b.onOrderEvent != nil && event.Status != "FILLED" {
 		var eventType OrderEventType
 		switch event.Status {
 		case "NEW":
 			eventType = OrderEventTypePlace
 		case "CANCELED":
 			eventType = OrderEventTypeCancel
-		case "FILLED":
-			eventType = OrderEventTypeFill
 		case "PARTIALLY_FILLED":
 			eventType = OrderEventTypePartialFill
 		default:
 			eventType = OrderEventType(event.Status)
 		}
+
+		level := parseLevelFromTag(event.ClientOrderID)
 
 		b.onOrderEvent(BotOrderEvent{
 			Type:      eventType,
@@ -508,7 +531,7 @@ func (b *BaseBot) handleOrderUpdate(event *types.OrderEvent) {
 			Side:      event.Side,
 			Price:     event.Price,
 			Qty:       event.Quantity,
-			Level:     parseLevelFromTag(event.ClientOrderID),
+			Level:     level,
 			Reason:    event.Status,
 			Timestamp: event.Timestamp.UnixMilli(),
 		})
@@ -549,28 +572,49 @@ func (b *BaseBot) handleFill(event *types.FillEvent) {
 	eventTime := event.Timestamp
 	latency := now.Sub(eventTime)
 
-	log.Printf("[FILL] %s %s @ %.8f x %.6f (order=%s)",
-		event.Side, event.Symbol, event.Price, event.Quantity, event.OrderID)
+	// Check if this is partial or fulfill
+	existingOrder := b.orderTracker.Get(event.OrderID)
+	isPartialFill := false
+	if existingOrder != nil {
+		isPartialFill = event.Quantity < existingOrder.RemainingQty
+	}
+
+	fillType := "FULL"
+	if isPartialFill {
+		fillType = "PARTIAL"
+	}
+
+	log.Printf("[FILL] %s %s @ %.8f x %.6f (order=%s) [%s]",
+		event.Side, event.Symbol, event.Price, event.Quantity, event.OrderID, fillType)
 	log.Printf("[DEBUG][Fill] order=%s | event_time=%s recv_time=%s latency=%v",
 		event.OrderID, eventTime.Format("15:04:05.000"), now.Format("15:04:05.000"), latency)
 
-	// Remove filled order from tracker immediately
-	// (don't wait for FILLED status event which may arrive late)
-	b.orderTracker.Remove(event.OrderID)
+	// Handle partial vs full fill
+	if isPartialFill && existingOrder != nil {
+		// Partial fill - update remaining quantity
+		newRemaining := existingOrder.RemainingQty - event.Quantity
+		b.orderTracker.UpdateRemaining(event.OrderID, newRemaining)
+		log.Printf("[DEBUG][Fill] PARTIAL - Updated remaining: %.6f -> %.6f", existingOrder.RemainingQty, newRemaining)
+	} else {
+		// Full fill - remove from tracker
+		b.orderTracker.Remove(event.OrderID)
 
-	// Track filled order to ignore late NEW events
-	b.mu.Lock()
-	b.filledOrders[event.OrderID] = time.Now().UnixMilli()
-	// Cleanup old entries (older than 60 seconds)
-	cutoff := time.Now().UnixMilli() - 60000
-	for id, ts := range b.filledOrders {
-		if ts < cutoff {
-			delete(b.filledOrders, id)
+		// Track filled order to ignore late NEW events (only for full fills)
+		b.mu.Lock()
+		b.filledOrders[event.OrderID] = time.Now().UnixMilli()
+		// Clean up confirmedOrders map
+		delete(b.confirmedOrders, event.OrderID)
+		// Cleanup old entries (older than 60 seconds)
+		cutoff := time.Now().UnixMilli() - 60000
+		for id, ts := range b.filledOrders {
+			if ts < cutoff {
+				delete(b.filledOrders, id)
+			}
 		}
-	}
-	b.mu.Unlock()
+		b.mu.Unlock()
 
-	log.Printf("[DEBUG][Fill] Order removed from tracker: %s", event.OrderID)
+		log.Printf("[DEBUG][Fill] FULL - Order removed from tracker: %s", event.OrderID)
+	}
 
 	// Update last trade price for market data
 	b.marketData.SetLastTradePrice(event.Price)
@@ -591,6 +635,9 @@ func (b *BaseBot) handleFill(event *types.FillEvent) {
 
 	// Emit fill event callback
 	if b.onOrderEvent != nil {
+		log.Printf("[WS_EMIT_FILL] side=%s order=%s price=%.8f qty=%.2f",
+			event.Side, event.OrderID, event.Price, event.Quantity)
+
 		b.onOrderEvent(BotOrderEvent{
 			Type:      OrderEventTypeFill,
 			Symbol:    event.Symbol,

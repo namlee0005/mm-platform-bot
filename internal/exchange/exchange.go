@@ -2,6 +2,8 @@ package exchange
 
 import (
 	"context"
+	"time"
+
 	"mm-platform-engine/internal/types"
 )
 
@@ -26,6 +28,11 @@ type Exchange interface {
 
 	// GetTicker returns the last trade price for a symbol
 	GetTicker(ctx context.Context, symbol string) (float64, error)
+
+	// GetRecentTrades returns recent market trades (for VWAP calculation)
+	// limit: maximum number of trades to return (e.g., 100)
+	// Returns trades in chronological order (oldest first)
+	GetRecentTrades(ctx context.Context, symbol string, limit int) ([]Trade, error)
 
 	// Start Lifecycle
 	Start(ctx context.Context) error
@@ -107,4 +114,12 @@ type Filter struct {
 type Depth struct {
 	Bids [][]string `json:"bids"`
 	Asks [][]string `json:"asks"`
+}
+
+// Trade represents a market trade (filled order)
+type Trade struct {
+	Price        float64   `json:"price"`
+	Quantity     float64   `json:"quantity"`
+	Timestamp    time.Time `json:"timestamp"`
+	IsBuyerMaker bool      `json:"isBuyerMaker"` // true if buyer placed order (sell was aggressive)
 }

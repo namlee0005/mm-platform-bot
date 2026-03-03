@@ -1,6 +1,7 @@
 package bot
 
 import (
+	"mm-platform-engine/internal/config"
 	"mm-platform-engine/internal/core"
 	"mm-platform-engine/internal/exchange"
 	"mm-platform-engine/internal/store"
@@ -9,33 +10,18 @@ import (
 
 // SimpleMakerConfig wraps the strategy config with bot-level settings
 type SimpleMakerConfig struct {
-	// Bot identification
-	Symbol     string `json:"symbol"`
-	BaseAsset  string `json:"base_asset"`
-	QuoteAsset string `json:"quote_asset"`
-	Exchange   string `json:"exchange"`
-	ExchangeID string `json:"exchange_id"`
-	BotID      string `json:"bot_id"`
-	BotType    string `json:"bot_type"`
+	*config.SimpleConfig // Embed base config from MongoDB
 
-	// Tick settings
-	TickIntervalMs int `json:"tick_interval_ms"`
+	// Bot identification (not in MongoDB config)
+	Exchange       string `json:"exchange"`
+	ExchangeID     string `json:"exchange_id"`
+	BotID          string `json:"bot_id"`
+	BotType        string `json:"bot_type"`
+	TickIntervalMs int    `json:"tick_interval_ms"`
 
-	// Strategy settings
-	SpreadBps           float64 `json:"spread_bps"`
-	NumLevels           int     `json:"num_levels"`
-	TargetDepthNotional float64 `json:"target_depth_notional"`
-	DepthBps            float64 `json:"depth_bps"`
+	// Strategy-specific settings (not in MongoDB)
 	PriceJitterPct      float64 `json:"price_jitter_pct"`
 	SizeJitterPct       float64 `json:"size_jitter_pct"`
-	MinBalanceToTrade   float64 `json:"min_balance_to_trade"`
-	LadderRegenBps      float64 `json:"ladder_regen_bps"`
-	LevelGapTicksMax    int     `json:"level_gap_ticks_max"`
-	TargetRatio         float64 `json:"target_ratio"`
-	RatioK              float64 `json:"ratio_k"`
-
-	// Risk settings
-	DrawdownLimitPct    float64 `json:"drawdown_limit_pct"`     // Max drawdown before pause (default 5%)
 	DrawdownWarnPct     float64 `json:"drawdown_warn_pct"`      // Warning threshold (default 3%)
 	DrawdownReducePct   float64 `json:"drawdown_reduce_pct"`    // Start reducing size (default 2%)
 	RecoveryHours       float64 `json:"recovery_hours"`         // Target recovery time (default 48h)
@@ -65,27 +51,16 @@ func NewSimpleMaker(
 		TickIntervalMs: cfg.TickIntervalMs,
 	}
 
-	// Create strategy config
+	// Create strategy config - just pass embedded config + strategy-specific fields
 	strategyCfg := &strategy.SimpleLadderConfig{
-		SpreadBps:           cfg.SpreadBps,
-		NumLevels:           cfg.NumLevels,
-		TargetDepthNotional: cfg.TargetDepthNotional,
-		DepthBps:            cfg.DepthBps,
+		SimpleConfig:        cfg.SimpleConfig, // Pass embedded MongoDB config directly
 		PriceJitterPct:      cfg.PriceJitterPct,
 		SizeJitterPct:       cfg.SizeJitterPct,
-		MinBalanceToTrade:   cfg.MinBalanceToTrade,
-		LadderRegenBps:      cfg.LadderRegenBps,
-		LevelGapTicksMax:    cfg.LevelGapTicksMax,
-		TargetRatio:         cfg.TargetRatio,
-		RatioK:              cfg.RatioK,
-		// Risk settings
-		DrawdownLimitPct:    cfg.DrawdownLimitPct,
 		DrawdownWarnPct:     cfg.DrawdownWarnPct,
 		DrawdownReducePct:   cfg.DrawdownReducePct,
 		RecoveryHours:       cfg.RecoveryHours,
 		MaxRecoverySizeMult: cfg.MaxRecoverySizeMult,
-		// Debug settings
-		DebugCancelSleep: cfg.DebugCancelSleep,
+		DebugCancelSleep:    cfg.DebugCancelSleep,
 	}
 
 	// Create strategy

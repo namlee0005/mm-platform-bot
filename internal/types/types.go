@@ -103,7 +103,8 @@ type SimpleConfigUpdate struct {
 	LadderRegenBps    float64 `bson:"ladder_regen_bps,omitempty"`
 	MinBalanceToTrade float64 `bson:"min_balance_to_trade,omitempty"`
 	LevelGapTicksMax  int     `bson:"level_gap_ticks_max,omitempty"`
-	DepthBps          float64 `bson:"depth_bps,omitempty"` // max distance from mid in bps (e.g., 200 = 2%)
+	DepthBps          float64 `bson:"depth_bps,omitempty"`        // max distance from mid in bps (e.g., 200 = 2%)
+	FillCooldownMs    int     `bson:"fill_cooldown_ms,omitempty"` // cooldown after fill in ms (e.g., 5000 = 5s)
 }
 
 type ReplaceThresholds struct {

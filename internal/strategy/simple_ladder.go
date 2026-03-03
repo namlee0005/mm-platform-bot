@@ -10,26 +10,56 @@ import (
 	"sync"
 	"time"
 
+	"mm-platform-engine/internal/config"
 	"mm-platform-engine/internal/core"
+	"mm-platform-engine/internal/exchange"
 	"mm-platform-engine/internal/types"
+)
+
+// Order sizing constants
+const (
+	// Size jitter multiplier range: order size will be base * (MIN to MAX)
+	// Controlled range ensures total stays within ~1.5x target_depth_notional
+	// Example: target=$100, 5 levels, base=$20 → orders $14-$26 → total ~$80-$120
+	sizeJitterMin = 0.7 // Minimum 70% of base size
+	sizeJitterMax = 1.3 // Maximum 130% of base size
+)
+
+// Inventory management constants
+const (
+	// Inventory skew threshold above which spread adjustments kick in
+	// Example: 0.05 = 5% deviation from balanced (50/50) triggers adjustment
+	inventorySkewThreshold = 0.05
+
+	// Spread split ratio bounds when adjusting for inventory
+	// Limits how asymmetric the BID/ASK spread can become
+	spreadSplitRatioMin = 0.3 // BID can get minimum 30% of total spread
+	spreadSplitRatioMax = 0.7 // BID can get maximum 70% of total spread
+)
+
+// Fair price calculation constants
+const (
+	// VWAP calculation window for fair price
+	vwapWindowMinutes = 10 // Use 10 minutes of trade history
+
+	// Maximum age of VWAP before considering it stale
+	maxVWAPStalenessMinutes = 30 // Warn if VWAP older than 30 minutes
+
+	// Minimum number of trades required for reliable VWAP
+	minTradesForVWAP = 3
+
+	// Inventory adjustment strength: bps per 10% inventory skew
+	// Example: 10% skew → ±20 bps adjustment
+	inventoryAdjustmentBps = 20.0
 )
 
 // SimpleLadderConfig is the configuration for SimpleLadderStrategy
 type SimpleLadderConfig struct {
-	SpreadBps           float64 `json:"spread_bps"`
-	NumLevels           int     `json:"num_levels"`
-	TargetDepthNotional float64 `json:"target_depth_notional"`
-	DepthBps            float64 `json:"depth_bps"`
+	*config.SimpleConfig // Embed base config from MongoDB
+
+	// Strategy-specific settings (not in MongoDB config)
 	PriceJitterPct      float64 `json:"price_jitter_pct"`
 	SizeJitterPct       float64 `json:"size_jitter_pct"`
-	MinBalanceToTrade   float64 `json:"min_balance_to_trade"`
-	LadderRegenBps      float64 `json:"ladder_regen_bps"`
-	LevelGapTicksMax    int     `json:"level_gap_ticks_max"`
-	TargetRatio         float64 `json:"target_ratio"`
-	RatioK              float64 `json:"ratio_k"`
-
-	// Risk settings
-	DrawdownLimitPct    float64 `json:"drawdown_limit_pct"`     // Max drawdown before pause (e.g., 0.05 = 5%)
 	DrawdownWarnPct     float64 `json:"drawdown_warn_pct"`      // Warning threshold (e.g., 0.03 = 3%)
 	DrawdownReducePct   float64 `json:"drawdown_reduce_pct"`    // Start reducing size at this level (e.g., 0.02 = 2%)
 	RecoveryHours       float64 `json:"recovery_hours"`         // Target recovery time in hours (24-72)
@@ -37,6 +67,15 @@ type SimpleLadderConfig struct {
 
 	// Debug settings
 	DebugCancelSleep bool `json:"debug_cancel_sleep"` // Enable 30s sleep after cancel (for debugging WebSocket)
+}
+
+// vwapResult contains VWAP calculation result with metadata
+type vwapResult struct {
+	price       float64       // Calculated VWAP price
+	tradeCount  int           // Number of trades used
+	totalVolume float64       // Total volume in calculation
+	oldestTrade time.Time     // Timestamp of oldest trade
+	age         time.Duration // Age of oldest trade
 }
 
 // SimpleLadderStrategy implements a two-sided market maker strategy
@@ -61,9 +100,14 @@ type SimpleLadderStrategy struct {
 	fillCooldownMs int64
 	lastFillTime   int64 // Last fill timestamp (ms) for global cooldown
 
+	// Regeneration cooldown tracking
+	lastRegenTime   int64 // Last regeneration timestamp (ms)
+	regenCooldownMs int64 // Cooldown after regeneration (default 30s)
+
 	// Cancel tracking (for debug)
-	lastCancelTime int64           // Last EXTERNAL cancel timestamp (ms)
-	pendingCancels map[string]bool // Order IDs that bot is canceling (internal)
+	lastCancelTime int64            // Last EXTERNAL cancel timestamp (ms)
+	pendingCancels map[string]bool  // Order IDs that bot is canceling (internal)
+	recentFills    map[string]int64 // Order IDs that were recently filled (orderID -> timestamp)
 
 	// Risk tracking
 	peakNAV        float64          // Peak NAV for drawdown calculation
@@ -71,6 +115,12 @@ type SimpleLadderStrategy struct {
 	currentMode    SimpleLadderMode // Current operating mode
 	modeChangedAt  time.Time        // When mode last changed
 	recoveryTarget float64          // Target NAV for recovery
+
+	// Fair price tracking (VWAP-based)
+	lastFairPrice     float64   // Last calculated fair price
+	lastFairPriceTime time.Time // When fair price was last updated
+	lastVWAP          float64   // Last calculated VWAP (without inventory adjustment)
+	lastVWAPTime      time.Time // When VWAP was last calculated
 }
 
 // SimpleLadderMode represents the operating mode
@@ -95,8 +145,11 @@ func NewSimpleLadderStrategy(cfg *SimpleLadderConfig) *SimpleLadderStrategy {
 	if cfg.NumLevels == 0 {
 		cfg.NumLevels = 5
 	}
-	if cfg.SpreadBps == 0 {
-		cfg.SpreadBps = 50
+	if cfg.SpreadMinBps == 0 {
+		cfg.SpreadMinBps = 40 // 0.4% first level min
+	}
+	if cfg.SpreadMaxBps == 0 {
+		cfg.SpreadMaxBps = 100 // 1% first level max
 	}
 	if cfg.PriceJitterPct == 0 {
 		cfg.PriceJitterPct = 0.2
@@ -108,7 +161,7 @@ func NewSimpleLadderStrategy(cfg *SimpleLadderConfig) *SimpleLadderStrategy {
 		cfg.LadderRegenBps = 50
 	}
 	if cfg.DepthBps == 0 {
-		cfg.DepthBps = 200
+		cfg.DepthBps = 200 // 2% max depth
 	}
 	if cfg.LevelGapTicksMax == 0 {
 		cfg.LevelGapTicksMax = 3
@@ -131,13 +184,24 @@ func NewSimpleLadderStrategy(cfg *SimpleLadderConfig) *SimpleLadderStrategy {
 		cfg.MaxRecoverySizeMult = 0.3 // 30% size during max recovery
 	}
 
+	// Set default fill cooldown if not configured
+	fillCooldownMs := int64(cfg.FillCooldownMs)
+	if fillCooldownMs == 0 {
+		fillCooldownMs = 5000 // Default 5 seconds
+	}
+
+	// Set default regeneration cooldown (30 seconds to prevent ping-pong)
+	regenCooldownMs := int64(30000) // 30 seconds default
+
 	return &SimpleLadderStrategy{
-		cfg:            cfg,
-		fillCooldowns:  make(map[float64]int64),
-		fillCooldownMs: 5000 + rand.Int63n(5000),
-		pendingCancels: make(map[string]bool),
-		navHistory:     make([]navSnapshot, 0, 1000),
-		currentMode:    ModeNormal,
+		cfg:             cfg,
+		fillCooldowns:   make(map[float64]int64),
+		fillCooldownMs:  fillCooldownMs,
+		regenCooldownMs: regenCooldownMs,
+		pendingCancels:  make(map[string]bool),
+		recentFills:     make(map[string]int64),
+		navHistory:      make([]navSnapshot, 0, 1000),
+		currentMode:     ModeNormal,
 	}
 }
 
@@ -166,9 +230,20 @@ func (s *SimpleLadderStrategy) Init(ctx context.Context, snap *core.Snapshot, ba
 func (s *SimpleLadderStrategy) Tick(ctx context.Context, input *core.TickInput) (*core.TickOutput, error) {
 	snap := input.Snapshot
 	balance := input.Balance
-	mid := snap.Mid
+	orderBookMid := snap.Mid // Order book mid (fallback)
 
-	// Calculate current NAV
+	// Calculate fair price using VWAP + inventory adjustment
+	fairPrice, isFreshVWAP := s.calculateFairPrice(input.RecentTrades, balance, orderBookMid)
+
+	// Log if using fallback vs fresh VWAP
+	if !isFreshVWAP {
+		log.Printf("[%s] Using fallback price (no fresh VWAP): %.8f", s.Name(), fairPrice)
+	}
+
+	// Use fair price for all calculations (instead of order book mid)
+	mid := fairPrice
+
+	// Calculate current NAV (use fair price for valuation)
 	nav := s.calculateNAV(balance, mid)
 
 	// Update risk state
@@ -189,23 +264,12 @@ func (s *SimpleLadderStrategy) Tick(ctx context.Context, input *core.TickInput) 
 		}, nil
 	}
 
-	// Check fill cooldown - don't place new orders immediately after a fill
+	// Check fill cooldown - we still regenerate after fills,
+	// but cooldown prevents placing orders at the SAME PRICE as fills
+	// The cooldown is applied later during order generation (in computeDesiredOrders)
 	s.mu.RLock()
-	lastFill := s.lastFillTime
-	cooldownMs := s.fillCooldownMs
 	lastCancel := s.lastCancelTime
 	s.mu.RUnlock()
-
-	if lastFill > 0 {
-		elapsed := time.Now().UnixMilli() - lastFill
-		if elapsed < cooldownMs {
-			remaining := cooldownMs - elapsed
-			return &core.TickOutput{
-				Action: core.TickActionKeep,
-				Reason: fmt.Sprintf("fill_cooldown: %dms remaining", remaining),
-			}, nil
-		}
-	}
 
 	// Debug: Sleep 30s after cancel to observe WebSocket events
 	if s.cfg.DebugCancelSleep && lastCancel > 0 {
@@ -271,6 +335,13 @@ func (s *SimpleLadderStrategy) Tick(ctx context.Context, input *core.TickInput) 
 		}, nil
 
 	case core.TickActionReplace:
+		// Mark all live orders as pending internal cancel (so we don't trigger external cancel)
+		s.mu.Lock()
+		for _, order := range input.LiveOrders {
+			s.pendingCancels[order.OrderID] = true
+		}
+		s.mu.Unlock()
+
 		return &core.TickOutput{
 			Action:        core.TickActionReplace,
 			DesiredOrders: desired,
@@ -464,10 +535,22 @@ func (s *SimpleLadderStrategy) OnFill(event *core.FillEvent) {
 	fillPrice := s.roundToTick(event.Price)
 	s.fillCooldowns[fillPrice] = now
 	s.lastFillTime = now
-	s.fillCooldownMs = 5000 + rand.Int63n(5000) // 5-10 seconds random cooldown
+	// fillCooldownMs is set from config (no longer random)
 
-	// Clear cached ladder to force regeneration after cooldown
-	s.cachedLadder = nil
+	// Track filled orders to ignore late CANCELED events
+	s.recentFills[event.OrderID] = now
+
+	// Cleanup old filled orders (older than 60 seconds)
+	cutoff := now - 60000
+	for id, ts := range s.recentFills {
+		if ts < cutoff {
+			delete(s.recentFills, id)
+		}
+	}
+
+	// Don't clear cached ladder - let normal logic handle regeneration
+	// Only regenerate if inventory changes significantly or mid moves
+	// s.cachedLadder = nil  // Removed: too aggressive
 
 	log.Printf("[%s] Fill at %.8f, cooldown %dms activated",
 		s.Name(), fillPrice, s.fillCooldownMs)
@@ -489,6 +572,16 @@ func (s *SimpleLadderStrategy) OnOrderUpdate(event *core.OrderEvent) {
 			delete(s.pendingCancels, event.OrderID)
 			s.mu.Unlock()
 			log.Printf("[%s] Internal cancel confirmed: %s", s.Name(), event.OrderID)
+			return
+		}
+
+		// Check if this order was recently filled (partial or full)
+		// Late CANCELED events for filled orders should be ignored
+		_, wasFilled := s.recentFills[event.OrderID]
+		if wasFilled {
+			delete(s.recentFills, event.OrderID) // Clean up
+			s.mu.Unlock()
+			log.Printf("[%s] Filled order canceled (late event): %s", s.Name(), event.OrderID)
 			return
 		}
 
@@ -516,7 +609,7 @@ func (s *SimpleLadderStrategy) UpdateConfig(newCfg interface{}) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.cfg.SpreadBps = cfg.SpreadMinBps
+	s.cfg.SpreadMinBps = cfg.SpreadMinBps
 	s.cfg.NumLevels = cfg.NumLevels
 	s.cfg.TargetDepthNotional = cfg.TargetDepthNotional
 	s.cfg.LadderRegenBps = cfg.LadderRegenBps
@@ -530,7 +623,7 @@ func (s *SimpleLadderStrategy) UpdateConfig(newCfg interface{}) error {
 	s.cachedBalance = 0
 
 	log.Printf("[%s] Config updated: spread=%.0fbps, depthBps=%.0f, levels=%d, depth=$%.0f",
-		s.Name(), s.cfg.SpreadBps, s.cfg.DepthBps, s.cfg.NumLevels, s.cfg.TargetDepthNotional)
+		s.Name(), s.cfg.SpreadMinBps, s.cfg.DepthBps, s.cfg.NumLevels, s.cfg.TargetDepthNotional)
 
 	return nil
 }
@@ -546,9 +639,30 @@ func (s *SimpleLadderStrategy) shouldRegenerateLadder(mid, balance float64, curr
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	// First time
+	// First time - always allow
 	if s.cachedMid == 0 || len(s.cachedLadder) == 0 {
 		return true, "initial"
+	}
+
+	// Check regeneration cooldown to prevent ping-pong
+	// Skip this check if orders are missing (fills happened)
+	expectedOrderCount := s.cfg.NumLevels * 2 // Both sides
+	ordersMissing := currentOrderCount < expectedOrderCount
+
+	if !ordersMissing && s.lastRegenTime > 0 {
+		elapsed := time.Now().UnixMilli() - s.lastRegenTime
+		if elapsed < s.regenCooldownMs {
+			// Still in cooldown - don't regenerate
+			// This prevents rapid regenerations when mid ping-pongs
+			return false, ""
+		}
+	}
+
+	// Order count changed (fills happened) - regenerate immediately
+	// This is critical: when fills happen, orders are removed from book and mid changes
+	if ordersMissing {
+		missing := expectedOrderCount - currentOrderCount
+		return true, fmt.Sprintf("missing_%d_orders", missing)
 	}
 
 	// Mid moved significantly
@@ -570,6 +684,7 @@ func (s *SimpleLadderStrategy) getOrRegenerateLadder(mid float64, balance *core.
 		s.cachedLadder = s.computeDesiredOrders(mid, balance)
 		s.cachedMid = mid
 		s.cachedBalance = totalBalance
+		s.lastRegenTime = time.Now().UnixMilli() // Update regeneration timestamp
 		s.mu.Unlock()
 		log.Printf("[%s] Regenerated ladder: reason=%s, levels=%d", s.Name(), reason, len(s.cachedLadder))
 	}
@@ -579,7 +694,211 @@ func (s *SimpleLadderStrategy) getOrRegenerateLadder(mid float64, balance *core.
 	return s.cachedLadder
 }
 
-// computeDesiredOrders computes the desired order ladder for BOTH sides
+// calculateVWAP computes volume-weighted average price from recent trades
+// Returns VWAP result with metadata, or error if insufficient data
+func calculateVWAP(trades []exchange.Trade, windowDuration time.Duration) (*vwapResult, error) {
+	if len(trades) == 0 {
+		return nil, fmt.Errorf("no trades provided")
+	}
+
+	now := time.Now()
+	cutoff := now.Add(-windowDuration)
+
+	var totalValue float64
+	var totalVolume float64
+	var oldestTrade time.Time
+	var tradeCount int
+
+	for _, trade := range trades {
+		// Only include trades within window
+		if trade.Timestamp.Before(cutoff) {
+			continue
+		}
+
+		value := trade.Price * trade.Quantity
+		totalValue += value
+		totalVolume += trade.Quantity
+		tradeCount++
+
+		// Track oldest trade in window
+		if oldestTrade.IsZero() || trade.Timestamp.Before(oldestTrade) {
+			oldestTrade = trade.Timestamp
+		}
+	}
+
+	if tradeCount < minTradesForVWAP {
+		return nil, fmt.Errorf("insufficient trades: %d < %d required", tradeCount, minTradesForVWAP)
+	}
+
+	if totalVolume == 0 {
+		return nil, fmt.Errorf("zero total volume")
+	}
+
+	vwap := totalValue / totalVolume
+	age := now.Sub(oldestTrade)
+
+	return &vwapResult{
+		price:       vwap,
+		tradeCount:  tradeCount,
+		totalVolume: totalVolume,
+		oldestTrade: oldestTrade,
+		age:         age,
+	}, nil
+}
+
+// calculateFairPrice computes fair price using VWAP with inventory adjustment
+// Returns fair price and whether it's from fresh data
+func (s *SimpleLadderStrategy) calculateFairPrice(trades []exchange.Trade, balance *core.BalanceState, mid float64) (float64, bool) {
+	// Try to calculate VWAP from recent trades
+	vwapRes, err := calculateVWAP(trades, vwapWindowMinutes*time.Minute)
+
+	var basePrice float64
+	var isFresh bool
+
+	if err != nil {
+		// No valid VWAP - use fallback
+		if s.lastVWAP > 0 && time.Since(s.lastVWAPTime) < maxVWAPStalenessMinutes*time.Minute {
+			// Use cached VWAP if not too stale
+			basePrice = s.lastVWAP
+			isFresh = false
+			log.Printf("[FairPrice] ⚠️  No recent trades, using cached VWAP: %.8f (age: %v)",
+				basePrice, time.Since(s.lastVWAPTime))
+		} else {
+			// Emergency fallback: use order book mid
+			basePrice = mid
+			isFresh = false
+			log.Printf("[FairPrice] 🔴 No VWAP available, using order book mid: %.8f", basePrice)
+		}
+	} else {
+		// Valid VWAP
+		basePrice = vwapRes.price
+		isFresh = true
+
+		// Update cache
+		s.lastVWAP = basePrice
+		s.lastVWAPTime = time.Now()
+
+		// Log VWAP calculation
+		if vwapRes.age > time.Duration(maxVWAPStalenessMinutes)*time.Minute {
+			log.Printf("[FairPrice] ⚠️  VWAP stale: %.8f (trades=%d, age=%v, volume=%.2f)",
+				basePrice, vwapRes.tradeCount, vwapRes.age, vwapRes.totalVolume)
+		} else {
+			log.Printf("[FairPrice] VWAP: %.8f (trades=%d, age=%v, volume=%.2f)",
+				basePrice, vwapRes.tradeCount, vwapRes.age, vwapRes.totalVolume)
+		}
+	}
+
+	// Calculate inventory state
+	inv := calculateInventoryState(balance.BaseFree, balance.QuoteFree, basePrice)
+
+	// Apply inventory adjustment
+	// Positive skew (too much base) → lower price to encourage selling
+	// Negative skew (too much quote) → raise price to encourage buying
+	adjustment := -inv.skew * basePrice * (inventoryAdjustmentBps / 10000.0)
+
+	fairPrice := basePrice + adjustment
+
+	// Log inventory adjustment if significant
+	if math.Abs(inv.skew) > inventorySkewThreshold {
+		log.Printf("[FairPrice] Inventory adj: skew=%.1f%%, base=$%.0f, quote=$%.0f → adj=%.8f",
+			inv.skew*100, inv.baseValue, inv.quoteValue, adjustment)
+	}
+
+	log.Printf("[FairPrice] Final: %.8f (base=%.8f, inv_adj=%.8f)", fairPrice, basePrice, adjustment)
+
+	// Update cache
+	s.lastFairPrice = fairPrice
+	s.lastFairPriceTime = time.Now()
+
+	return fairPrice, isFresh
+}
+
+// inventoryState represents the current inventory position
+type inventoryState struct {
+	baseValue  float64 // Value of base asset in quote terms
+	quoteValue float64 // Value of quote asset
+	ratio      float64 // baseValue / totalValue (0.5 = balanced)
+	skew       float64 // Deviation from balanced: ratio - 0.5 (-0.5 to +0.5)
+}
+
+// calculateInventoryState computes current inventory position and skew
+// Returns inventory state for spread adjustment decisions
+func calculateInventoryState(baseFree, quoteFree, mid float64) inventoryState {
+	baseValue := baseFree * mid
+	quoteValue := quoteFree
+	totalValue := baseValue + quoteValue
+
+	ratio := 0.5 // Default to balanced if no value
+	if totalValue > 0 {
+		ratio = baseValue / totalValue
+	}
+
+	return inventoryState{
+		baseValue:  baseValue,
+		quoteValue: quoteValue,
+		ratio:      ratio,
+		skew:       ratio - 0.5, // -0.5 (all quote) to +0.5 (all base)
+	}
+}
+
+// spreadAllocation represents how total spread is divided between BID and ASK
+type spreadAllocation struct {
+	totalBps float64 // Total spread from first BID to first ASK
+	bidBps   float64 // BID offset from mid
+	askBps   float64 // ASK offset from mid
+}
+
+// calculateSpreadAllocation determines how to split total spread between BID and ASK
+// Adjusts for inventory skew to encourage balanced position
+func calculateSpreadAllocation(spreadMinBps, spreadMaxBps float64, invSkew float64) spreadAllocation {
+	// Random total spread within configured range
+	totalSpread := spreadMinBps + rand.Float64()*(spreadMaxBps-spreadMinBps)
+
+	// Split ratio: 0.5 = balanced (50/50), adjusted by inventory skew
+	// invSkew > 0 (too much base): BID gets more spread (further from mid) to sell base
+	// invSkew < 0 (too much quote): ASK gets more spread (further from mid) to buy base
+	splitRatio := 0.5 + invSkew
+
+	// Clamp to prevent extreme asymmetry
+	if splitRatio < spreadSplitRatioMin {
+		splitRatio = spreadSplitRatioMin
+	}
+	if splitRatio > spreadSplitRatioMax {
+		splitRatio = spreadSplitRatioMax
+	}
+
+	return spreadAllocation{
+		totalBps: totalSpread,
+		bidBps:   totalSpread * splitRatio,
+		askBps:   totalSpread * (1.0 - splitRatio),
+	}
+}
+
+// calculateSizeMultiplier returns a random multiplier for order size
+// Wide range creates unpredictable order patterns
+func calculateSizeMultiplier() float64 {
+	return sizeJitterMin + rand.Float64()*(sizeJitterMax-sizeJitterMin)
+}
+
+// computeDesiredOrders generates a two-sided order ladder with the following logic:
+//
+// 1. Spread Allocation:
+//   - Total spread (first BID to first ASK) is randomized within [spread_min_bps, spread_max_bps]
+//   - Spread is split between BID and ASK based on inventory skew
+//   - Balanced inventory (50/50): symmetric split
+//   - Excess base: BID gets more spread (further from mid) to encourage selling
+//   - Excess quote: ASK gets more spread (further from mid) to encourage buying
+//
+// 2. Order Generation:
+//   - First level: placed at calculated spread offset
+//   - Other levels: distributed from first level to depth_bps
+//   - Order sizes: randomized (70% to 130% of base) for variation while controlling total
+//
+// 3. Volume Distribution:
+//   - Total target volume per side: target_depth_notional
+//   - Distributed across num_levels with random size variation
+//
+// Returns: Slice of desired orders for both BID and ASK sides
 func (s *SimpleLadderStrategy) computeDesiredOrders(mid float64, balance *core.BalanceState) []core.DesiredOrder {
 	// Calculate depth limit prices
 	depthBps := s.cfg.DepthBps
@@ -587,9 +906,14 @@ func (s *SimpleLadderStrategy) computeDesiredOrders(mid float64, balance *core.B
 		depthBps = 200
 	}
 
-	spreadBps := s.cfg.SpreadBps
-	if spreadBps <= 0 {
-		spreadBps = 50
+	spreadMinBps := s.cfg.SpreadMinBps
+	if spreadMinBps <= 0 {
+		spreadMinBps = 40
+	}
+
+	spreadMaxBps := s.cfg.SpreadMaxBps
+	if spreadMaxBps <= 0 {
+		spreadMaxBps = 100
 	}
 
 	numLevels := s.cfg.NumLevels
@@ -600,48 +924,16 @@ func (s *SimpleLadderStrategy) computeDesiredOrders(mid float64, balance *core.B
 	// Target depth per side (config is per-side, not total)
 	targetDepthPerSide := s.cfg.TargetDepthNotional
 
-	// Calculate inventory skew
-	// invRatio = baseValue / totalValue (0.5 = balanced)
-	// invSkew > 0: too much base → ASK closer to mid, BID further
-	// invSkew < 0: too much quote → BID closer to mid, ASK further
-	baseValue := balance.BaseFree * mid
-	quoteValue := balance.QuoteFree
-	totalValue := baseValue + quoteValue
-	invRatio := 0.5
-	if totalValue > 0 {
-		invRatio = baseValue / totalValue
-	}
-	invSkew := invRatio - 0.5 // -0.5 to +0.5
+	// Calculate current inventory state
+	inv := calculateInventoryState(balance.BaseFree, balance.QuoteFree, mid)
 
-	// Adjust spread based on skew
-	// skewBps: how much to shift the "heavy" side towards depthBps
-	// Max shift = (depthBps - spreadBps) when fully skewed
-	maxShift := depthBps - spreadBps
-	skewBps := math.Abs(invSkew) * 2 * maxShift // 0 to maxShift
+	// Allocate spread between BID and ASK based on inventory
+	spread := calculateSpreadAllocation(spreadMinBps, spreadMaxBps, inv.skew)
 
-	// BID spreadBps: increase if too much base (invSkew > 0)
-	// ASK spreadBps: increase if too much quote (invSkew < 0)
-	bidSpreadBps := spreadBps
-	askSpreadBps := spreadBps
-	if invSkew > 0.05 { // Too much base - BID further, ASK closer
-		bidSpreadBps = spreadBps + skewBps
-		askSpreadBps = spreadBps
-	} else if invSkew < -0.05 { // Too much quote - ASK further, BID closer
-		askSpreadBps = spreadBps + skewBps
-		bidSpreadBps = spreadBps
-	}
-
-	// Cap to not exceed depthBps
-	if bidSpreadBps > depthBps {
-		bidSpreadBps = depthBps * 0.9
-	}
-	if askSpreadBps > depthBps {
-		askSpreadBps = depthBps * 0.9
-	}
-
-	if math.Abs(invSkew) > 0.05 {
-		log.Printf("[%s] Inventory skew: %.1f%% (base=$%.0f, quote=$%.0f) → BID@%.0fbps, ASK@%.0fbps",
-			s.Name(), invSkew*100, baseValue, quoteValue, bidSpreadBps, askSpreadBps)
+	// Log inventory adjustments when significant
+	if math.Abs(inv.skew) > inventorySkewThreshold {
+		log.Printf("[%s] Inventory skew: %.1f%% (base=$%.0f, quote=$%.0f) → total_spread=%.1fbps, BID=%.1fbps, ASK=%.1fbps",
+			s.Name(), inv.skew*100, inv.baseValue, inv.quoteValue, spread.totalBps, spread.bidBps, spread.askBps)
 	}
 
 	// Short batchID to fit Gate.io 30 char limit
@@ -650,28 +942,43 @@ func (s *SimpleLadderStrategy) computeDesiredOrders(mid float64, balance *core.B
 
 	var orders []core.DesiredOrder
 
-	// Generate BID orders (with adjusted spread)
-	bidOrders := s.generateSideOrders(mid, bidSpreadBps, depthBps, numLevels, targetDepthPerSide, "BUY", batchID)
+	// Generate BID orders (first level at spread.bidBps, others spread to depthBps)
+	bidOrders := s.generateSideOrders(mid, spread.bidBps, depthBps, numLevels, targetDepthPerSide, "BUY", batchID)
 	orders = append(orders, bidOrders...)
 
-	// Generate ASK orders (with adjusted spread)
-	askOrders := s.generateSideOrders(mid, askSpreadBps, depthBps, numLevels, targetDepthPerSide, "SELL", batchID)
+	// Generate ASK orders (first level at spread.askBps, others spread to depthBps)
+	askOrders := s.generateSideOrders(mid, spread.askBps, depthBps, numLevels, targetDepthPerSide, "SELL", batchID)
 	orders = append(orders, askOrders...)
+
+	// Log first level spread for both sides
+	if len(bidOrders) > 0 && len(askOrders) > 0 {
+		bidFirstPrice := bidOrders[0].Price
+		askFirstPrice := askOrders[0].Price
+		bidSpreadBps := (mid - bidFirstPrice) / mid * 10000
+		askSpreadBps := (askFirstPrice - mid) / mid * 10000
+		bidSpreadPct := bidSpreadBps / 100.0
+		askSpreadPct := askSpreadBps / 100.0
+		log.Printf("[%s] First level spread: BID %.2f%% (%.1fbps), ASK %.2f%% (%.1fbps), mid=%.8f",
+			s.Name(), bidSpreadPct, bidSpreadBps, askSpreadPct, askSpreadBps, mid)
+	}
 
 	return orders
 }
 
 // generateSideOrders generates orders for one side (BUY or SELL)
-func (s *SimpleLadderStrategy) generateSideOrders(mid, spreadBps, depthBps float64, numLevels int, targetDepth float64, side string, batchID string) []core.DesiredOrder {
+func (s *SimpleLadderStrategy) generateSideOrders(mid, firstLevelSpreadBps, depthBps float64, numLevels int, targetDepth float64, side string, batchID string) []core.DesiredOrder {
+	// First level is at firstLevelSpreadBps from mid (calculated in computeDesiredOrders)
+	// Other levels spread from first level to depthBps
+
 	// Calculate price range for ladder
-	// First level: at spreadBps from mid
+	// First level: at firstLevelSpreadBps from mid (randomized)
 	// Last level: at depthBps from mid
 	var firstPrice, lastPrice float64
 	if side == "BUY" {
-		firstPrice = mid * (1.0 - spreadBps/10000.0)
+		firstPrice = mid * (1.0 - firstLevelSpreadBps/10000.0)
 		lastPrice = mid * (1.0 - depthBps/10000.0)
 	} else {
-		firstPrice = mid * (1.0 + spreadBps/10000.0)
+		firstPrice = mid * (1.0 + firstLevelSpreadBps/10000.0)
 		lastPrice = mid * (1.0 + depthBps/10000.0)
 	}
 
@@ -729,18 +1036,18 @@ func (s *SimpleLadderStrategy) generateSideOrders(mid, spreadBps, depthBps float
 		if side == "BUY" {
 			minPrice := mid * (1.0 - depthBps/10000.0)
 			if price < minPrice {
-				price = s.roundToTick(minPrice)
+				price = s.ceilToTick(minPrice) // Round UP to ensure we don't go below minPrice
 			}
 			if price > mid {
-				price = s.roundToTick(mid * (1.0 - spreadBps/10000.0))
+				price = s.roundToTick(mid * (1.0 - firstLevelSpreadBps/10000.0))
 			}
 		} else {
 			maxPrice := mid * (1.0 + depthBps/10000.0)
 			if price > maxPrice {
-				price = s.roundToTick(maxPrice)
+				price = s.floorToTick(maxPrice) // Round DOWN to ensure we don't exceed maxPrice
 			}
 			if price < mid {
-				price = s.roundToTick(mid * (1.0 + spreadBps/10000.0))
+				price = s.roundToTick(mid * (1.0 + firstLevelSpreadBps/10000.0))
 			}
 		}
 
@@ -776,9 +1083,9 @@ func (s *SimpleLadderStrategy) generateSideOrders(mid, spreadBps, depthBps float
 	for level := 0; level < actualLevels; level++ {
 		price := levelPrices[level]
 
-		// Random size: base × (1.0 to 1.5) - ensures total > targetDepth
-		jitter := 1.0 + rand.Float64()*0.5
-		sizeNotional := baseNotionalPerLevel * jitter
+		// Apply size multiplier for unpredictable order sizes
+		sizeMultiplier := calculateSizeMultiplier()
+		sizeNotional := baseNotionalPerLevel * sizeMultiplier
 
 		qty := sizeNotional / price
 		qty = s.roundToStep(qty)
@@ -950,6 +1257,22 @@ func (s *SimpleLadderStrategy) roundToTick(price float64) float64 {
 		return price
 	}
 	return math.Round(price/s.tickSize) * s.tickSize
+}
+
+// floorToTick rounds price DOWN to tick size (ensures price doesn't exceed max)
+func (s *SimpleLadderStrategy) floorToTick(price float64) float64 {
+	if s.tickSize <= 0 {
+		return price
+	}
+	return math.Floor(price/s.tickSize) * s.tickSize
+}
+
+// ceilToTick rounds price UP to tick size (ensures price doesn't go below min)
+func (s *SimpleLadderStrategy) ceilToTick(price float64) float64 {
+	if s.tickSize <= 0 {
+		return price
+	}
+	return math.Ceil(price/s.tickSize) * s.tickSize
 }
 
 // roundToStep rounds quantity to step size

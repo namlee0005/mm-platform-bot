@@ -3,6 +3,8 @@ package core
 import (
 	"context"
 	"time"
+
+	"mm-platform-engine/internal/exchange"
 )
 
 // TickAction defines what action the strategy wants after computing a tick
@@ -48,11 +50,12 @@ type Strategy interface {
 
 // TickInput contains all data needed for a strategy tick
 type TickInput struct {
-	Snapshot   *Snapshot
-	Balance    *BalanceState // Current bot's balance
-	LiveOrders []LiveOrder
-	Timestamp  int64
-	Mode       Mode // Current operating mode
+	Snapshot     *Snapshot
+	Balance      *BalanceState // Current bot's balance
+	LiveOrders   []LiveOrder
+	Timestamp    int64
+	Mode         Mode             // Current operating mode
+	RecentTrades []exchange.Trade // Recent market trades (for VWAP fair price calculation)
 }
 
 // TickOutput contains the result of a strategy tick

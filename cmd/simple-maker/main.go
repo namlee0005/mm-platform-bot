@@ -68,50 +68,49 @@ func main() {
 	botType := "simple-maker"
 
 	// Create simple maker config from loaded config
-	simpleConfig := cfg.SimpleConfig
+	simpleConfig := &cfg.SimpleConfig
+
+	// Set defaults for embedded config
+	if simpleConfig.SpreadMinBps == 0 {
+		simpleConfig.SpreadMinBps = 40
+	}
+	if simpleConfig.SpreadMaxBps == 0 {
+		simpleConfig.SpreadMaxBps = 100
+	}
+	if simpleConfig.NumLevels == 0 {
+		simpleConfig.NumLevels = 5
+	}
+	if simpleConfig.TargetDepthNotional == 0 {
+		simpleConfig.TargetDepthNotional = 10000
+	}
+	if simpleConfig.TickIntervalMs == 0 {
+		simpleConfig.TickIntervalMs = 5000
+	}
+	if simpleConfig.LadderRegenBps == 0 {
+		simpleConfig.LadderRegenBps = 50
+	}
+	if simpleConfig.LevelGapTicksMax == 0 {
+		simpleConfig.LevelGapTicksMax = 20
+	}
+	if simpleConfig.DepthBps == 0 {
+		simpleConfig.DepthBps = 200
+	}
+	if simpleConfig.FillCooldownMs == 0 {
+		simpleConfig.FillCooldownMs = 5000
+	}
+
+	// Create simplified config - embed MongoDB config + bot metadata
 	makerCfg := &bot.SimpleMakerConfig{
-		Symbol:              simpleConfig.Symbol,
-		BaseAsset:           simpleConfig.BaseAsset,
-		QuoteAsset:          simpleConfig.QuoteAsset,
-		Exchange:            exchangeName,
-		ExchangeID:          cfg.ExchangeID,
-		BotID:               botID,
-		BotType:             botType,
-		TickIntervalMs:      simpleConfig.TickIntervalMs,
-		SpreadBps:           simpleConfig.SpreadMinBps,
-		NumLevels:           simpleConfig.NumLevels,
-		TargetDepthNotional: simpleConfig.TargetDepthNotional,
-		DepthBps:            simpleConfig.DepthBps,
-		MinBalanceToTrade:   simpleConfig.MinBalanceToTrade,
-		LadderRegenBps:      simpleConfig.LadderRegenBps,
-		LevelGapTicksMax:    simpleConfig.LevelGapTicksMax,
+		SimpleConfig:   simpleConfig,
+		Exchange:       exchangeName,
+		ExchangeID:     cfg.ExchangeID,
+		BotID:          botID,
+		BotType:        botType,
+		TickIntervalMs: simpleConfig.TickIntervalMs,
 	}
 
-	// Set defaults if not configured
-	if makerCfg.SpreadBps == 0 {
-		makerCfg.SpreadBps = 50 // 0.5%
-	}
-	if makerCfg.NumLevels == 0 {
-		makerCfg.NumLevels = 5
-	}
-	if makerCfg.TargetDepthNotional == 0 {
-		makerCfg.TargetDepthNotional = 1000 // $1000 default
-	}
-	if makerCfg.TickIntervalMs == 0 {
-		makerCfg.TickIntervalMs = 5000
-	}
-	if makerCfg.LadderRegenBps == 0 {
-		makerCfg.LadderRegenBps = 50 // 0.5% default
-	}
-	if makerCfg.LevelGapTicksMax == 0 {
-		makerCfg.LevelGapTicksMax = 3 // default: 1-3 ticks random gap
-	}
-	if makerCfg.DepthBps == 0 {
-		makerCfg.DepthBps = 200 // default: 200 bps = ±2% from mid
-	}
-
-	log.Printf("Simple Maker config: spread=%.0fbps, levels=%d, gapTicks=1-%d, depth=$%.0f, depthBps=%.0f, regenBps=%.0f",
-		makerCfg.SpreadBps, makerCfg.NumLevels, makerCfg.LevelGapTicksMax, makerCfg.TargetDepthNotional, makerCfg.DepthBps, makerCfg.LadderRegenBps)
+	log.Printf("Simple Maker config: spread=%.0fbps, levels=%d, depth=$%.0f, cooldown=%dms",
+		simpleConfig.SpreadMinBps, simpleConfig.NumLevels, simpleConfig.TargetDepthNotional, simpleConfig.FillCooldownMs)
 
 	// Create simple maker using new bot factory
 	maker := bot.NewSimpleMaker(makerCfg, exch, redis, mongo)

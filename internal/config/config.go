@@ -400,6 +400,7 @@ type SimpleConfig struct {
 	LevelStepBps      float64 `json:"level_step_bps,omitempty" bson:"level_step_bps,omitempty"`             // DEPRECATED: use level_gap_ticks_max
 	LevelGapTicksMax  int     `json:"level_gap_ticks_max,omitempty" bson:"level_gap_ticks_max,omitempty"`   // max random ticks between levels (default 3)
 	DepthBps          float64 `json:"depth_bps,omitempty" bson:"depth_bps,omitempty"`                       // max distance from mid in bps (e.g., 200 = 2%)
+	FillCooldownMs    int     `json:"fill_cooldown_ms,omitempty" bson:"fill_cooldown_ms,omitempty"`         // cooldown after fill in ms (default 5000 = 5s)
 }
 
 // ToTradingConfig converts SimpleConfig to TradingConfig with auto-generated ladder

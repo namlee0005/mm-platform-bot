@@ -64,3 +64,12 @@ func (c *Client) GetTicker(ctx context.Context, symbol string) (float64, error) 
 	_, _ = fmt.Sscanf(ticker.Price, "%f", &price)
 	return price, nil
 }
+
+// GetRecentTrades returns recent market trades for VWAP calculation
+// TODO: Implement using MEXC /api/v3/trades endpoint
+// For now, returns empty slice - bot will fall back to order book mid
+func (c *Client) GetRecentTrades(ctx context.Context, symbol string, limit int) ([]exchange.Trade, error) {
+	// Stub implementation - returns empty trades
+	// Bot will use fallback logic (cached VWAP or order book mid)
+	return []exchange.Trade{}, nil
+}
