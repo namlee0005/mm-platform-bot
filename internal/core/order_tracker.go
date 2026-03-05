@@ -56,7 +56,7 @@ func (ot *OrderTracker) GetBySide(side string) []LiveOrder {
 	ot.mu.RLock()
 	defer ot.mu.RUnlock()
 
-	var orders []LiveOrder
+	orders := make([]LiveOrder, 0, len(ot.orders)/2)
 	for _, o := range ot.orders {
 		if o.Side == side {
 			orders = append(orders, *o)

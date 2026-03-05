@@ -16,11 +16,15 @@ import (
 type DepthFillerConfig struct {
 	MinDepthPct         float64 `json:"min_depth_pct"`         // Min depth from mid (e.g., 5 = 5%)
 	MaxDepthPct         float64 `json:"max_depth_pct"`         // Max depth from mid (e.g., 50 = 50%)
-	NumLevels           int     `json:"num_levels"`            // Number of levels per side
-	TargetDepthNotional float64 `json:"target_depth_notional"` // Total notional per side
+	NumLevels           int     `json:"num_levels"`            // Number of levels per side (0 = unlimited when UseFullBalance=true)
+	TargetDepthNotional float64 `json:"target_depth_notional"` // Total notional per side (ignored when UseFullBalance=true)
 	TimeSleepMs         int     `json:"time_sleep_ms"`         // Sleep between placing orders (rate limit)
 	RemoveThresholdPct  float64 `json:"remove_threshold_pct"`  // Remove when price within this % (default = min_depth)
 	LadderRegenBps      float64 `json:"ladder_regen_bps"`      // Regenerate when mid moves this much
+
+	// Full balance mode
+	UseFullBalance  bool    `json:"use_full_balance"`   // Use all available balance
+	MinOrderSizePct float64 `json:"min_order_size_pct"` // Min % of balance per order (default: 1%)
 }
 
 // DepthFillerStrategy places orders far from mid (5%-50%) to fill order book depth
@@ -53,7 +57,7 @@ func NewDepthFillerStrategy(cfg *DepthFillerConfig) *DepthFillerStrategy {
 	if cfg.MaxDepthPct == 0 {
 		cfg.MaxDepthPct = 50 // 50%
 	}
-	if cfg.NumLevels == 0 {
+	if cfg.NumLevels == 0 && !cfg.UseFullBalance {
 		cfg.NumLevels = 10
 	}
 	if cfg.TimeSleepMs == 0 {
@@ -64,6 +68,9 @@ func NewDepthFillerStrategy(cfg *DepthFillerConfig) *DepthFillerStrategy {
 	}
 	if cfg.LadderRegenBps == 0 {
 		cfg.LadderRegenBps = 100 // 1% move triggers regen
+	}
+	if cfg.MinOrderSizePct == 0 {
+		cfg.MinOrderSizePct = 1 // 1% of balance per order
 	}
 
 	return &DepthFillerStrategy{
@@ -88,8 +95,13 @@ func (s *DepthFillerStrategy) Init(ctx context.Context, snap *core.Snapshot, bal
 
 	log.Printf("[%s] Initialized: tickSize=%.8f, stepSize=%.8f, minNotional=%.2f",
 		s.Name(), s.tickSize, s.stepSize, s.minNotional)
-	log.Printf("[%s] Config: depth=%.1f%%-%.1f%%, levels=%d, sleepMs=%d",
-		s.Name(), s.cfg.MinDepthPct, s.cfg.MaxDepthPct, s.cfg.NumLevels, s.cfg.TimeSleepMs)
+	if s.cfg.UseFullBalance {
+		log.Printf("[%s] Config: depth=%.1f%%-%.1f%%, useFullBalance=true, minOrderSizePct=%.1f%%",
+			s.Name(), s.cfg.MinDepthPct, s.cfg.MaxDepthPct, s.cfg.MinOrderSizePct)
+	} else {
+		log.Printf("[%s] Config: depth=%.1f%%-%.1f%%, levels=%d, sleepMs=%d",
+			s.Name(), s.cfg.MinDepthPct, s.cfg.MaxDepthPct, s.cfg.NumLevels, s.cfg.TimeSleepMs)
+	}
 
 	return nil
 }
@@ -183,7 +195,10 @@ func (s *DepthFillerStrategy) shouldRegenerateLadder(mid float64, currentOrderCo
 	}
 
 	// Too few orders (more than half removed)
-	expectedOrders := s.cfg.NumLevels * 2
+	expectedOrders := len(s.cachedLadder)
+	if s.cfg.NumLevels > 0 {
+		expectedOrders = s.cfg.NumLevels * 2
+	}
 	if currentOrderCount < expectedOrders/2 {
 		return true, fmt.Sprintf("orders_low_%d/%d", currentOrderCount, expectedOrders)
 	}
@@ -193,6 +208,135 @@ func (s *DepthFillerStrategy) shouldRegenerateLadder(mid float64, currentOrderCo
 
 // computeDesiredOrders computes the desired order ladder
 func (s *DepthFillerStrategy) computeDesiredOrders(mid float64, balance *core.BalanceState) []core.DesiredOrder {
+	// Short batchID
+	timestamp := time.Now().UnixMilli() % 100000000
+	batchID := fmt.Sprintf("%d%03d", timestamp, rand.Intn(1000))
+
+	if s.cfg.UseFullBalance {
+		return s.computeFullBalanceOrders(mid, balance, batchID)
+	}
+	return s.computeFixedLevelOrders(mid, balance, batchID)
+}
+
+// computeFullBalanceOrders generates random orders using all available balance
+func (s *DepthFillerStrategy) computeFullBalanceOrders(mid float64, balance *core.BalanceState, batchID string) []core.DesiredOrder {
+	orders := make([]core.DesiredOrder, 0, 20)
+
+	// Calculate available balance for each side
+	quoteAvailable := balance.QuoteFree // For BID orders
+	baseAvailable := balance.BaseFree   // For ASK orders
+	baseNotional := baseAvailable * mid
+
+	// Calculate min order size based on total balance
+	totalNotional := quoteAvailable + baseNotional
+	minOrderNotional := totalNotional * s.cfg.MinOrderSizePct / 100.0
+
+	// Ensure minOrderNotional is at least minNotional
+	if minOrderNotional < s.minNotional {
+		minOrderNotional = s.minNotional
+	}
+
+	log.Printf("[%s] FullBalance mode: quoteAvail=%.2f, baseNotional=%.2f, minOrderNotional=%.2f",
+		s.Name(), quoteAvailable, baseNotional, minOrderNotional)
+
+	// Generate BID orders until quote balance depleted
+	bidOrders := s.generateRandomOrders(mid, "BUY", quoteAvailable, minOrderNotional, batchID)
+	orders = append(orders, bidOrders...)
+
+	// Generate ASK orders until base balance depleted
+	askOrders := s.generateRandomOrders(mid, "SELL", baseNotional, minOrderNotional, batchID)
+	orders = append(orders, askOrders...)
+
+	log.Printf("[%s] Generated %d BID + %d ASK = %d total orders",
+		s.Name(), len(bidOrders), len(askOrders), len(orders))
+
+	return orders
+}
+
+// generateRandomOrders generates random orders until totalNotional is depleted
+func (s *DepthFillerStrategy) generateRandomOrders(
+	mid float64,
+	side string,
+	totalNotional float64,
+	minOrderNotional float64,
+	batchID string,
+) []core.DesiredOrder {
+	var orders []core.DesiredOrder
+	remainingNotional := totalNotional
+
+	minDepth := s.cfg.MinDepthPct / 100.0
+	maxDepth := s.cfg.MaxDepthPct / 100.0
+
+	levelIndex := 0
+	prefix := "B"
+	if side == "SELL" {
+		prefix = "A"
+	}
+
+	for remainingNotional >= minOrderNotional {
+		// Random depth between min and max
+		depth := minDepth + rand.Float64()*(maxDepth-minDepth)
+
+		// Random order size (10% - 30% of remaining, but at least minOrderNotional)
+		maxOrderNotional := remainingNotional * 0.3
+		if maxOrderNotional < minOrderNotional*1.1 {
+			// Use remaining if it's close to min
+			maxOrderNotional = remainingNotional
+		}
+		minOrderSize := minOrderNotional
+		if minOrderSize > remainingNotional {
+			minOrderSize = remainingNotional
+		}
+		orderNotional := minOrderSize + rand.Float64()*(maxOrderNotional-minOrderSize)
+
+		// Ensure we don't exceed remaining
+		if orderNotional > remainingNotional {
+			orderNotional = remainingNotional
+		}
+
+		// Calculate price based on side
+		var price float64
+		if side == "BUY" {
+			price = mid * (1.0 - depth)
+		} else {
+			price = mid * (1.0 + depth)
+		}
+		price = s.roundToTick(price)
+
+		// Calculate qty
+		qty := orderNotional / price
+		qty = s.roundToStep(qty)
+
+		// Validate min notional
+		actualNotional := price * qty
+		if actualNotional < s.minNotional {
+			// Skip if too small
+			remainingNotional -= minOrderNotional * 0.1
+			continue
+		}
+
+		orders = append(orders, core.DesiredOrder{
+			Side:       side,
+			Price:      price,
+			Qty:        qty,
+			LevelIndex: levelIndex,
+			Tag:        fmt.Sprintf("DF_%s_%s%d", batchID, prefix, levelIndex),
+		})
+
+		remainingNotional -= actualNotional
+		levelIndex++
+
+		// Stop if remaining is too small
+		if remainingNotional < minOrderNotional {
+			break
+		}
+	}
+
+	return orders
+}
+
+// computeFixedLevelOrders generates fixed number of levels (original logic)
+func (s *DepthFillerStrategy) computeFixedLevelOrders(mid float64, balance *core.BalanceState, batchID string) []core.DesiredOrder {
 	minDepth := s.cfg.MinDepthPct / 100.0 // e.g., 0.05
 	maxDepth := s.cfg.MaxDepthPct / 100.0 // e.g., 0.50
 	numLevels := s.cfg.NumLevels
@@ -205,10 +349,6 @@ func (s *DepthFillerStrategy) computeDesiredOrders(mid float64, balance *core.Ba
 
 	// Target notional per level
 	notionalPerLevel := s.cfg.TargetDepthNotional / float64(numLevels)
-
-	// Short batchID
-	timestamp := time.Now().UnixMilli() % 100000000
-	batchID := fmt.Sprintf("%d%03d", timestamp, rand.Intn(1000))
 
 	var orders []core.DesiredOrder
 

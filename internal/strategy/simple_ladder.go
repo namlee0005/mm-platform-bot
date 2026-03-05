@@ -1185,7 +1185,6 @@ func (s *SimpleLadderStrategy) computeOrderDiff(live []core.LiveOrder, desired [
 	priceTolerance := s.tickSize * float64(maxGapTicks)
 
 	// Match sorted orders in parallel (1:1 matching by position)
-	matchedLive := make(map[string]bool)
 	var toCancel []string
 	var toAdd []core.DesiredOrder
 
@@ -1209,7 +1208,6 @@ func (s *SimpleLadderStrategy) computeOrderDiff(live []core.LiveOrder, desired [
 			// Both exist at this position - check if they match
 			priceDiff := math.Abs(l.Price - d.Price)
 			if l.Side == d.Side && priceDiff <= priceTolerance {
-				matchedLive[l.OrderID] = true
 				// Matched - no action needed
 			} else {
 				// Not matched - cancel live, add desired

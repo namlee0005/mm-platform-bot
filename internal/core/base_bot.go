@@ -72,7 +72,7 @@ func NewBaseBot(
 		cfg.RateLimitOrdersPerSec = 10
 	}
 	if cfg.BatchSize == 0 {
-		cfg.BatchSize = 20
+		cfg.BatchSize = 10
 	}
 
 	// Calculate config check interval (every 10 seconds worth of ticks)
@@ -441,7 +441,7 @@ func (b *BaseBot) publishAllBalancesToRedis() {
 }
 
 func (b *BaseBot) handleOrderUpdate(event *types.OrderEvent) {
-	// Debug log với timestamp chi tiết (removed)
+	// Debug log with detailed timestamp (removed)
 
 	// Skip FILLED - already handled completely by handleFill
 	if event.Status == "FILLED" {
@@ -572,7 +572,7 @@ func (b *BaseBot) handleFill(event *types.FillEvent) {
 	eventTime := event.Timestamp
 	latency := now.Sub(eventTime)
 
-	// Check if this is partial or fulfill
+	// Check if this is partial or full fill
 	existingOrder := b.orderTracker.Get(event.OrderID)
 	isPartialFill := false
 	if existingOrder != nil {
@@ -776,9 +776,6 @@ func (b *BaseBot) replaceOrders(desired []DesiredOrder, reason string) error {
 		return fmt.Errorf("cancel failed: %w", err)
 	}
 
-	// Wait for cancels to propagate before placing new orders
-	time.Sleep(500 * time.Millisecond)
-
 	b.orderTracker.Clear()
 
 	// Clear from Redis
@@ -805,31 +802,51 @@ func (b *BaseBot) replaceOrders(desired []DesiredOrder, reason string) error {
 		reqPrices[d.Tag] = d.Price
 	}
 
-	// Place orders via batch API
-	resp, err := b.exch.BatchPlaceOrders(b.ctx, reqs)
-	if err != nil {
-		// Fallback to individual orders with delay to avoid rate limit
-		log.Printf("[%s] Batch failed, falling back to individual orders: %v", b.strategy.Name(), err)
-		for i, req := range reqs {
-			if i > 0 {
-				time.Sleep(200 * time.Millisecond) // 200ms delay between orders
-			}
-			order, err := b.exch.PlaceOrder(b.ctx, req)
-			if err != nil {
-				log.Printf("[%s] Place order failed: %v", b.strategy.Name(), err)
-				continue
-			}
-			b.logOrderPlaced(order, req.ClientOrderID, req.Price)
-		}
-		return nil
+	// Place orders in batches of 5 to avoid rate limits
+	batchSize := b.cfg.BatchSize
+	if batchSize <= 0 || batchSize > 20 {
+		batchSize = 5 // Default batch size
 	}
 
-	// Log results
-	for _, order := range resp.Orders {
-		b.logOrderPlaced(order, order.ClientOrderID, reqPrices[order.ClientOrderID])
-	}
-	for _, errMsg := range resp.Errors {
-		log.Printf("[%s] Order error: %s", b.strategy.Name(), errMsg)
+	for i := 0; i < len(reqs); i += batchSize {
+		end := i + batchSize
+		if end > len(reqs) {
+			end = len(reqs)
+		}
+		batch := reqs[i:end]
+
+		// Add delay between batches (except first one)
+		if i > 0 {
+			time.Sleep(1 * time.Second)
+		}
+
+		// Place batch
+		resp, err := b.exch.BatchPlaceOrders(b.ctx, batch)
+		if err != nil {
+			// Fallback to individual orders with longer delay for rate limit
+			log.Printf("[%s] Batch %d failed, falling back to individual: %v", b.strategy.Name(), i/batchSize, err)
+			time.Sleep(5 * time.Second) // Wait for rate limit to reset
+			for j, req := range batch {
+				if j > 0 {
+					time.Sleep(1 * time.Second)
+				}
+				order, err := b.exch.PlaceOrder(b.ctx, req)
+				if err != nil {
+					log.Printf("[%s] Place order failed: %v", b.strategy.Name(), err)
+					continue
+				}
+				b.logOrderPlaced(order, req.ClientOrderID, req.Price)
+			}
+			continue
+		}
+
+		// Log results
+		for _, order := range resp.Orders {
+			b.logOrderPlaced(order, order.ClientOrderID, reqPrices[order.ClientOrderID])
+		}
+		for _, errMsg := range resp.Errors {
+			log.Printf("[%s] Order error: %s", b.strategy.Name(), errMsg)
+		}
 	}
 
 	return nil
@@ -871,31 +888,51 @@ func (b *BaseBot) amendOrders(toCancel []string, toAdd []DesiredOrder, reason st
 		reqPrices[d.Tag] = d.Price
 	}
 
-	// Place orders via batch API
-	resp, err := b.exch.BatchPlaceOrders(b.ctx, reqs)
-	if err != nil {
-		// Fallback to individual orders with delay to avoid rate limit
-		log.Printf("[%s] Batch add failed, falling back to individual orders: %v", b.strategy.Name(), err)
-		for i, req := range reqs {
-			if i > 0 {
-				time.Sleep(200 * time.Millisecond) // 200ms delay between orders
-			}
-			order, err := b.exch.PlaceOrder(b.ctx, req)
-			if err != nil {
-				log.Printf("[%s] Place order failed: %v", b.strategy.Name(), err)
-				continue
-			}
-			b.logOrderPlaced(order, req.ClientOrderID, req.Price)
-		}
-		return nil
+	// Place orders in batches of 5 to avoid rate limits
+	batchSize := b.cfg.BatchSize
+	if batchSize <= 0 || batchSize > 20 {
+		batchSize = 5
 	}
 
-	// Log results
-	for _, order := range resp.Orders {
-		b.logOrderPlaced(order, order.ClientOrderID, reqPrices[order.ClientOrderID])
-	}
-	for _, errMsg := range resp.Errors {
-		log.Printf("[%s] Order error: %s", b.strategy.Name(), errMsg)
+	for i := 0; i < len(reqs); i += batchSize {
+		end := i + batchSize
+		if end > len(reqs) {
+			end = len(reqs)
+		}
+		batch := reqs[i:end]
+
+		// Add delay between batches (except first one)
+		if i > 0 {
+			time.Sleep(1 * time.Second)
+		}
+
+		// Place batch
+		resp, err := b.exch.BatchPlaceOrders(b.ctx, batch)
+		if err != nil {
+			// Fallback to individual orders with longer delay for rate limit
+			log.Printf("[%s] Batch add %d failed, falling back to individual: %v", b.strategy.Name(), i/batchSize, err)
+			time.Sleep(5 * time.Second) // Wait for rate limit to reset
+			for j, req := range batch {
+				if j > 0 {
+					time.Sleep(1 * time.Second)
+				}
+				order, err := b.exch.PlaceOrder(b.ctx, req)
+				if err != nil {
+					log.Printf("[%s] Place order failed: %v", b.strategy.Name(), err)
+					continue
+				}
+				b.logOrderPlaced(order, req.ClientOrderID, req.Price)
+			}
+			continue
+		}
+
+		// Log results
+		for _, order := range resp.Orders {
+			b.logOrderPlaced(order, order.ClientOrderID, reqPrices[order.ClientOrderID])
+		}
+		for _, errMsg := range resp.Errors {
+			log.Printf("[%s] Order error: %s", b.strategy.Name(), errMsg)
+		}
 	}
 
 	return nil

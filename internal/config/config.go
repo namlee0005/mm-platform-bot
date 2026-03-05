@@ -401,6 +401,12 @@ type SimpleConfig struct {
 	LevelGapTicksMax  int     `json:"level_gap_ticks_max,omitempty" bson:"level_gap_ticks_max,omitempty"`   // max random ticks between levels (default 3)
 	DepthBps          float64 `json:"depth_bps,omitempty" bson:"depth_bps,omitempty"`                       // max distance from mid in bps (e.g., 200 = 2%)
 	FillCooldownMs    int     `json:"fill_cooldown_ms,omitempty" bson:"fill_cooldown_ms,omitempty"`         // cooldown after fill in ms (default 5000 = 5s)
+
+	// Depth Filler specific params
+	MinDepthPct     float64 `json:"min_depth_pct,omitempty" bson:"min_depth_pct,omitempty"`           // Min depth % from mid (default: 5)
+	MaxDepthPct     float64 `json:"max_depth_pct,omitempty" bson:"max_depth_pct,omitempty"`           // Max depth % from mid (default: 50)
+	UseFullBalance  bool    `json:"use_full_balance,omitempty" bson:"use_full_balance,omitempty"`     // Use all available balance
+	MinOrderSizePct float64 `json:"min_order_size_pct,omitempty" bson:"min_order_size_pct,omitempty"` // Min % of balance per order (default: 1%)
 }
 
 // ToTradingConfig converts SimpleConfig to TradingConfig with auto-generated ladder

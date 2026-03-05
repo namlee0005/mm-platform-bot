@@ -46,7 +46,11 @@ func (m *MarketDataCache) UpdateFromExchangeInfo(info *exchange.ExchangeInfo, sy
 			for _, f := range sym.Filters {
 				if f.FilterType == "MIN_NOTIONAL" || f.FilterType == "NOTIONAL" {
 					if f.MinNotional != "" {
-						m.minNotional, _ = strconv.ParseFloat(f.MinNotional, 64)
+						if val, err := strconv.ParseFloat(f.MinNotional, 64); err == nil {
+							m.minNotional = val
+						} else {
+							fmt.Printf("[MarketData] WARNING: failed to parse minNotional '%s': %v\n", f.MinNotional, err)
+						}
 					}
 				}
 			}

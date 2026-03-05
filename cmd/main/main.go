@@ -81,21 +81,17 @@ func main() {
 	var maker *core.BaseBot
 
 	switch strings.ToLower(botType) {
-	case "simple-maker", "maker", "maker-bid", "maker-ask", "bid", "ask":
+	case "simple-maker":
 		// All simple/one-sided types now use 2-sided simple-maker
 		maker = createSimpleMaker(cfg, exch, redis, mongo, exchangeName, botID)
 		log.Println("Mode: SIMPLE-MAKER (2-sided market maker)")
 
-	case "mm-engine", "engine", "mm":
-		maker = createMMEngine(cfg, exch, redis, mongo, exchangeName, botID)
-		log.Println("Mode: MM-ENGINE (advanced 2-sided market maker)")
-
-	case "depth-filler", "filler", "depth":
+	case "depth-filler":
 		maker = createDepthFiller(cfg, exch, redis, mongo, exchangeName, botID)
 		log.Println("Mode: DEPTH-FILLER (order book depth filler)")
 
 	default:
-		log.Fatalf("Invalid bot_type: %s (must be 'simple-maker', 'mm-engine', or 'depth-filler')", botType)
+		log.Fatalf("Invalid bot_type: %s (must be 'simple-maker' or 'depth-filler')", botType)
 	}
 
 	// Wire up Redis Stream for order events
@@ -222,95 +218,6 @@ func createSimpleMaker(
 	return bot.NewSimpleMaker(makerCfg, exch, redis, mongo)
 }
 
-// createMMEngine creates an MMEngine bot (two-sided)
-func createMMEngine(
-	cfg *config.Config,
-	exch exchange.Exchange,
-	redis *store.RedisStore,
-	mongo *store.MongoStore,
-	exchangeName string,
-	botID string,
-) *core.BaseBot {
-	simpleConfig := cfg.SimpleConfig
-	tradingConfig := cfg.TradingConfig
-
-	engineCfg := &bot.MMEngineConfig{
-		Symbol:     simpleConfig.Symbol,
-		BaseAsset:  simpleConfig.BaseAsset,
-		QuoteAsset: simpleConfig.QuoteAsset,
-		Exchange:   exchangeName,
-		ExchangeID: cfg.ExchangeID,
-		BotID:      botID,
-		BotType:    "mm-engine",
-
-		TickIntervalMs:      simpleConfig.TickIntervalMs,
-		BaseSpreadBps:       simpleConfig.SpreadMinBps,
-		MinSpreadBps:        simpleConfig.SpreadMinBps,
-		MaxSpreadBps:        simpleConfig.SpreadMaxBps,
-		VolMultiplierCap:    3.0,
-		NumLevels:           simpleConfig.NumLevels,
-		OffsetsBps:          tradingConfig.OffsetsBps,
-		SizeMult:            tradingConfig.SizeMult,
-		QuotePerOrder:       tradingConfig.QuotePerOrder,
-		TargetDepthNotional: simpleConfig.TargetDepthNotional,
-		MinOrdersPerSide:    3,
-		TargetRatio:         simpleConfig.TargetRatio,
-		Deadzone:            tradingConfig.Deadzone,
-		K:                   tradingConfig.K,
-		MaxSkewBps:          tradingConfig.MaxSkewBps,
-		MinOffsetBps:        tradingConfig.MinOffsetBps,
-		DSkewMaxBpsPerTick:  tradingConfig.DSkewMaxBpsPerTick,
-		SizeTiltCap:         0.3,
-		ImbalanceThreshold:  simpleConfig.ImbalanceThreshold,
-		RecoveryTarget:      0.05,
-
-		DrawdownLimitPct:     simpleConfig.DrawdownLimitPct,
-		DrawdownWarnPct:      simpleConfig.DrawdownLimitPct * 0.6,
-		DrawdownAction:       "pause",
-		MaxFillsPerMin:       simpleConfig.MaxFillsPerMin,
-		CooldownAfterFillMs:  200,
-		DefensiveCooldownSec: 60,
-
-		PriceMovePct:       2.0,
-		PriceMoveWindowSec: 10,
-		VolSpikeMultiplier: 3.0,
-		SweepDepthPct:      2.0,
-		SweepMinDepth:      10.0,
-
-		MicroOffsetTicks: 2,
-		QtyJitterPct:     0.05,
-		PriceJitterTicks: 3,
-
-		DefensiveSpreadMult: 2.0,
-		DefensiveSizeMult:   0.5,
-		RecoverySpreadMult:  1.2,
-		RecoverySizeMult:    1.0,
-		PreferOneSided:      false,
-	}
-
-	// Set defaults
-	if engineCfg.TickIntervalMs == 0 {
-		engineCfg.TickIntervalMs = 5000
-	}
-	if engineCfg.NumLevels == 0 {
-		engineCfg.NumLevels = 5
-	}
-	if engineCfg.TargetRatio == 0 {
-		engineCfg.TargetRatio = 0.5
-	}
-	if engineCfg.DrawdownLimitPct == 0 {
-		engineCfg.DrawdownLimitPct = 0.05
-	}
-	if engineCfg.MaxFillsPerMin == 0 {
-		engineCfg.MaxFillsPerMin = 20
-	}
-
-	log.Printf("MMEngine config: levels=%d, target_ratio=%.2f, base_spread=%.0f bps",
-		engineCfg.NumLevels, engineCfg.TargetRatio, engineCfg.BaseSpreadBps)
-
-	return bot.NewMMEngine(engineCfg, exch, redis, mongo)
-}
-
 // createDepthFiller creates a DepthFiller bot (order book depth filler)
 func createDepthFiller(
 	cfg *config.Config,
@@ -322,6 +229,22 @@ func createDepthFiller(
 ) *core.BaseBot {
 	simpleConfig := cfg.SimpleConfig
 
+	// Read depth range from config, with defaults
+	minDepthPct := simpleConfig.MinDepthPct
+	if minDepthPct == 0 {
+		minDepthPct = 5 // 5% from mid
+	}
+	maxDepthPct := simpleConfig.MaxDepthPct
+	if maxDepthPct == 0 {
+		maxDepthPct = 50 // 50% from mid
+	}
+
+	// Read min order size pct from config, with default
+	minOrderSizePct := simpleConfig.MinOrderSizePct
+	if minOrderSizePct == 0 {
+		minOrderSizePct = 1 // 1% of balance per order
+	}
+
 	fillerCfg := &bot.DepthFillerConfig{
 		Symbol:     simpleConfig.Symbol,
 		BaseAsset:  simpleConfig.BaseAsset,
@@ -332,30 +255,40 @@ func createDepthFiller(
 		BotType:    "depth-filler",
 
 		TickIntervalMs:      simpleConfig.TickIntervalMs,
-		MinDepthPct:         5,  // 5% from mid
-		MaxDepthPct:         50, // 50% from mid
-		NumLevels:           10, // 10 levels per side
+		MinDepthPct:         minDepthPct,
+		MaxDepthPct:         maxDepthPct,
+		NumLevels:           simpleConfig.NumLevels,
 		TargetDepthNotional: simpleConfig.TargetDepthNotional,
 		TimeSleepMs:         200, // 200ms between orders
-		RemoveThresholdPct:  5,   // Remove when within 5%
-		LadderRegenBps:      100, // Regen when mid moves 1%
-	}
+		RemoveThresholdPct:  minDepthPct,
+		LadderRegenBps:      simpleConfig.LadderRegenBps,
 
-	// Override NumLevels from config if available
-	if simpleConfig.NumLevels > 0 {
-		fillerCfg.NumLevels = simpleConfig.NumLevels
+		// Full balance mode
+		UseFullBalance:  simpleConfig.UseFullBalance,
+		MinOrderSizePct: minOrderSizePct,
 	}
 
 	// Set defaults
 	if fillerCfg.TickIntervalMs == 0 {
 		fillerCfg.TickIntervalMs = 5000
 	}
-	if fillerCfg.TargetDepthNotional == 0 {
+	if fillerCfg.LadderRegenBps == 0 {
+		fillerCfg.LadderRegenBps = 100 // Regen when mid moves 1%
+	}
+	if !fillerCfg.UseFullBalance && fillerCfg.TargetDepthNotional == 0 {
 		fillerCfg.TargetDepthNotional = 100 // $100 per side default
 	}
+	if !fillerCfg.UseFullBalance && fillerCfg.NumLevels == 0 {
+		fillerCfg.NumLevels = 10 // 10 levels per side default
+	}
 
-	log.Printf("DepthFiller config: depth=%.1f%%-%.1f%%, levels=%d, notional=$%.0f",
-		fillerCfg.MinDepthPct, fillerCfg.MaxDepthPct, fillerCfg.NumLevels, fillerCfg.TargetDepthNotional)
+	if fillerCfg.UseFullBalance {
+		log.Printf("DepthFiller config: depth=%.1f%%-%.1f%%, useFullBalance=true, minOrderSizePct=%.1f%%",
+			fillerCfg.MinDepthPct, fillerCfg.MaxDepthPct, fillerCfg.MinOrderSizePct)
+	} else {
+		log.Printf("DepthFiller config: depth=%.1f%%-%.1f%%, levels=%d, notional=$%.0f",
+			fillerCfg.MinDepthPct, fillerCfg.MaxDepthPct, fillerCfg.NumLevels, fillerCfg.TargetDepthNotional)
+	}
 
 	return bot.NewDepthFiller(fillerCfg, exch, redis, mongo)
 }

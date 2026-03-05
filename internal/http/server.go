@@ -13,9 +13,10 @@ import (
 
 // Server represents the HTTP server for health checks and metrics
 type Server struct {
-	port     int
-	server   *http.Server
-	exchange exchange.Exchange
+	port      int
+	server    *http.Server
+	exchange  exchange.Exchange
+	startTime time.Time
 }
 
 // NewServer creates a new HTTP server
@@ -37,10 +38,14 @@ func (s *Server) Start(ctx context.Context) error {
 	mux.HandleFunc("/orders", s.handleOrders)
 
 	s.server = &http.Server{
-		Addr:    fmt.Sprintf(":%d", s.port),
-		Handler: mux,
+		Addr:         fmt.Sprintf(":%d", s.port),
+		Handler:      mux,
+		ReadTimeout:  15 * time.Second,
+		WriteTimeout: 15 * time.Second,
+		IdleTimeout:  60 * time.Second,
 	}
 
+	s.startTime = time.Now()
 	log.Printf("Starting HTTP server on port %d", s.port)
 
 	// Start server in a goroutine
@@ -78,10 +83,12 @@ func (s *Server) Stop(ctx context.Context) error {
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]string{
+	if err := json.NewEncoder(w).Encode(map[string]string{
 		"status": "healthy",
 		"time":   time.Now().Format(time.RFC3339),
-	})
+	}); err != nil {
+		log.Printf("Error encoding health response: %v", err)
+	}
 }
 
 // handleReady handles readiness check requests
@@ -90,10 +97,12 @@ func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
 	// This is a simple check - could be more sophisticated
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]string{
+	if err := json.NewEncoder(w).Encode(map[string]string{
 		"status": "ready",
 		"time":   time.Now().Format(time.RFC3339),
-	})
+	}); err != nil {
+		log.Printf("Error encoding ready response: %v", err)
+	}
 }
 
 // handleMetrics handles metrics requests
@@ -102,10 +111,12 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	// In a real implementation, this would return Prometheus-style metrics
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]interface{}{
+	if err := json.NewEncoder(w).Encode(map[string]interface{}{
 		"timestamp": time.Now().Unix(),
-		"uptime":    time.Since(time.Now()).Seconds(), // Placeholder
-	})
+		"uptime":    time.Since(s.startTime).Seconds(),
+	}); err != nil {
+		log.Printf("Error encoding metrics response: %v", err)
+	}
 }
 
 // handleOrders handles requests to view open orders
@@ -123,9 +134,11 @@ func (s *Server) handleOrders(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
+	if err := json.NewEncoder(w).Encode(map[string]interface{}{
 		"symbol": symbol,
 		"count":  len(orders),
 		"orders": orders,
-	})
+	}); err != nil {
+		log.Printf("Error encoding orders response: %v", err)
+	}
 }
