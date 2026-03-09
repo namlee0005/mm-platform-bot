@@ -4,16 +4,18 @@ import "time"
 
 // FillEvent represents a trade execution event
 type FillEvent struct {
-	OrderID         string    `json:"orderId"`
-	ClientOrderID   string    `json:"clientOrderId"`
-	Symbol          string    `json:"symbol"`
-	Side            string    `json:"side"` // BUY or SELL
-	Price           float64   `json:"price"`
-	Quantity        float64   `json:"quantity"`
-	Commission      float64   `json:"commission"`
-	CommissionAsset string    `json:"commissionAsset"`
-	TradeID         string    `json:"tradeId"`
-	Timestamp       time.Time `json:"timestamp"`
+	OrderID         string    `json:"orderId" bson:"orderId"`
+	ClientOrderID   string    `json:"clientOrderId" bson:"clientOrderId"`
+	Symbol          string    `json:"symbol" bson:"symbol"`
+	Side            string    `json:"side" bson:"side"` // BUY or SELL
+	Price           float64   `json:"price" bson:"price"`
+	Quantity        float64   `json:"quantity" bson:"quantity"`
+	Commission      float64   `json:"commission" bson:"commission"`
+	CommissionAsset string    `json:"commissionAsset" bson:"commissionAsset"`
+	TradeID         string    `json:"tradeId" bson:"tradeId"`
+	Timestamp       time.Time `json:"timestamp" bson:"timestamp"`
+	BotID           string    `json:"botId" bson:"botId"`
+	Exchange        string    `json:"exchange" bson:"exchange"`
 }
 
 // AccountEvent represents an account balance update event

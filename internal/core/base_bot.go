@@ -651,6 +651,10 @@ func (b *BaseBot) handleFill(event *types.FillEvent) {
 		})
 	}
 
+	// Set bot metadata before saving
+	event.BotID = b.cfg.BotID
+	event.Exchange = b.cfg.Exchange
+
 	// Publish to Redis + MongoDB
 	if b.redis != nil {
 		b.redis.PublishFill(b.ctx, event)

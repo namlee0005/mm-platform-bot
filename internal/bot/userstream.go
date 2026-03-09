@@ -122,6 +122,10 @@ func (b *Bot) handleFill(event *types.FillEvent) {
 		}
 	}
 
+	// Set bot metadata before saving
+	event.BotID = b.userExchangeKeyID
+	event.Exchange = b.cfg.ExchangeName
+
 	// Publish to Redis
 	if err := b.redis.PublishFill(b.ctx, event); err != nil {
 		log.Printf("Failed to publish fill: %v", err)
