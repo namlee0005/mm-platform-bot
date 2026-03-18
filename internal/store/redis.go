@@ -378,8 +378,8 @@ func (s *RedisStore) SaveOrder(ctx context.Context, order *OrderInfo) error {
 		return fmt.Errorf("failed to save order to list: %w", err)
 	}
 
-	// Set expiration on the list key (24h)
-	s.client.Expire(ctx, key, 24*time.Hour)
+	// No expiration - orders should persist until explicitly deleted
+	// Active orders need to be visible to new users/clients
 
 	return nil
 }
