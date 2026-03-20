@@ -15,6 +15,7 @@ type MarketDataCache struct {
 	tickSize    float64
 	stepSize    float64
 	minNotional float64
+	maxOrderQty float64 // Maximum quantity per single order
 
 	// Last known good prices (fallback when orderbook is empty)
 	lastMid     float64
@@ -53,10 +54,23 @@ func (m *MarketDataCache) UpdateFromExchangeInfo(info *exchange.ExchangeInfo, sy
 						}
 					}
 				}
+				// Extract max order quantity from LOT_SIZE filter
+				if f.FilterType == "LOT_SIZE" {
+					if f.MaxQty != "" {
+						if val, err := strconv.ParseFloat(f.MaxQty, 64); err == nil {
+							m.maxOrderQty = val
+						}
+					}
+				}
 			}
 
 			if m.minNotional <= 0 {
 				m.minNotional = 5.0
+			}
+
+			// Default max order qty if not set
+			if m.maxOrderQty <= 0 {
+				m.maxOrderQty = 1000000 // Conservative default: 1M
 			}
 
 			m.lastUpdate = time.Now()
@@ -153,6 +167,7 @@ func (m *MarketDataCache) BuildSnapshot(depth *exchange.Depth) (*Snapshot, error
 		TickSize:    m.tickSize,
 		StepSize:    m.stepSize,
 		MinNotional: m.minNotional,
+		MaxOrderQty: m.maxOrderQty,
 		Bids:        bids,
 		Asks:        asks,
 		Timestamp:   time.Now(),

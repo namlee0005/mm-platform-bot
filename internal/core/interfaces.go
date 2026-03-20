@@ -77,6 +77,7 @@ type Snapshot struct {
 	TickSize    float64
 	StepSize    float64
 	MinNotional float64
+	MaxOrderQty float64 // Maximum quantity per single order (exchange limit)
 	Timestamp   time.Time
 	// Full orderbook for sweep detection
 	Bids []PriceLevel // sorted best→worst

@@ -109,6 +109,7 @@ type Filter struct {
 	BidMultiplierUp   string `json:"bidMultiplierUp,omitempty"`
 	AskMultiplierDown string `json:"askMultiplierDown,omitempty"`
 	MinNotional       string `json:"minNotional,omitempty"`
+	MaxQty            string `json:"maxQty,omitempty"` // Maximum order quantity (LOT_SIZE filter)
 }
 
 type Depth struct {

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -45,6 +46,11 @@ func (c *Client) PlaceOrder(ctx context.Context, order *exchange.OrderRequest) (
 	if order.ClientOrderID != "" {
 		params["orderLinkId"] = order.ClientOrderID
 	}
+
+	// Debug: log order params
+	log.Printf("[Bybit] PlaceOrder: symbol=%s side=%s type=%s qty=%s price=%s clientId=%s",
+		params["symbol"], params["side"], params["orderType"], params["qty"],
+		params["price"], params["orderLinkId"])
 
 	body, err := c.doRequest(ctx, "POST", "/v5/order/create", params)
 	if err != nil {
@@ -88,8 +94,15 @@ func (c *Client) BatchPlaceOrders(ctx context.Context, orders []*exchange.OrderR
 		OrderLinkID string `json:"orderLinkId,omitempty"`
 	}
 
-	batchOrders := make([]batchOrderItem, len(orders))
-	for i, order := range orders {
+	batchOrders := make([]batchOrderItem, 0, len(orders))
+	for _, order := range orders {
+		// Skip invalid orders (Inf, NaN, zero)
+		if order.Quantity <= 0 || order.Quantity != order.Quantity || order.Price < 0 || order.Price != order.Price {
+			log.Printf("[Bybit] Skipping invalid order: qty=%.8f price=%.8f clientId=%s",
+				order.Quantity, order.Price, order.ClientOrderID)
+			continue
+		}
+
 		item := batchOrderItem{
 			Symbol:      order.Symbol,
 			Side:        toBybitSide(order.Side),
@@ -99,6 +112,10 @@ func (c *Client) BatchPlaceOrders(ctx context.Context, orders []*exchange.OrderR
 		}
 
 		if order.Type == "LIMIT" {
+			if order.Price <= 0 {
+				log.Printf("[Bybit] Skipping order with zero price: clientId=%s", order.ClientOrderID)
+				continue
+			}
 			item.Price = formatFloat(order.Price, 8)
 		}
 
@@ -106,7 +123,7 @@ func (c *Client) BatchPlaceOrders(ctx context.Context, orders []*exchange.OrderR
 			item.OrderLinkID = order.ClientOrderID
 		}
 
-		batchOrders[i] = item
+		batchOrders = append(batchOrders, item)
 	}
 
 	// Bybit batch order endpoint expects JSON body with "category" and "request" array
@@ -117,6 +134,9 @@ func (c *Client) BatchPlaceOrders(ctx context.Context, orders []*exchange.OrderR
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal batch orders: %w", err)
 	}
+
+	// Debug: log batch order request
+	log.Printf("[Bybit] BatchPlaceOrders: %d orders, JSON=%s", len(batchOrders), string(requestJSON))
 
 	// For batch orders, we need to send raw JSON
 	params := map[string]string{}

@@ -49,6 +49,10 @@ func (c *Client) GetExchangeInfo(ctx context.Context, symbol string) (*exchange.
 					FilterType:  "PRICE_FILTER",
 					MinNotional: inst.LotSizeFilter.MinOrderAmt,
 				},
+				{
+					FilterType: "LOT_SIZE",
+					MaxQty:     inst.LotSizeFilter.MaxOrderQty,
+				},
 			},
 		}
 	}

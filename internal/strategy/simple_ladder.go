@@ -87,6 +87,7 @@ type SimpleLadderStrategy struct {
 	tickSize    float64
 	stepSize    float64
 	minNotional float64
+	maxOrderQty float64 // Maximum quantity per order (exchange limit)
 
 	// Cached ladder state
 	mu             sync.RWMutex
@@ -215,13 +216,19 @@ func (s *SimpleLadderStrategy) Init(ctx context.Context, snap *core.Snapshot, ba
 	s.tickSize = snap.TickSize
 	s.stepSize = snap.StepSize
 	s.minNotional = snap.MinNotional
+	s.maxOrderQty = snap.MaxOrderQty
 
 	if s.minNotional <= 0 {
 		s.minNotional = 5.0
 	}
 
-	log.Printf("[%s] Initialized: tickSize=%.8f, stepSize=%.8f, minNotional=%.2f",
-		s.Name(), s.tickSize, s.stepSize, s.minNotional)
+	// Default max order qty if not set (Bybit default is 2M for most tokens)
+	if s.maxOrderQty <= 0 {
+		s.maxOrderQty = 1000000 // Conservative default: 1M
+	}
+
+	log.Printf("[%s] Initialized: tickSize=%.8f, stepSize=%.8f, minNotional=%.2f, maxOrderQty=%.0f",
+		s.Name(), s.tickSize, s.stepSize, s.minNotional, s.maxOrderQty)
 
 	return nil
 }
@@ -234,6 +241,14 @@ func (s *SimpleLadderStrategy) Tick(ctx context.Context, input *core.TickInput) 
 
 	// Calculate fair price using VWAP + inventory adjustment
 	fairPrice, isFreshVWAP := s.calculateFairPrice(input.RecentTrades, balance, orderBookMid)
+
+	// Safety check: if fair price is invalid, cancel all orders and wait
+	if fairPrice <= 0 || math.IsNaN(fairPrice) || math.IsInf(fairPrice, 0) {
+		return &core.TickOutput{
+			Action: core.TickActionCancelAll,
+			Reason: fmt.Sprintf("invalid fair price: %.8f (orderBookMid=%.8f)", fairPrice, orderBookMid),
+		}, nil
+	}
 
 	// Log if using fallback vs fresh VWAP
 	if !isFreshVWAP {
@@ -301,8 +316,7 @@ func (s *SimpleLadderStrategy) Tick(ctx context.Context, input *core.TickInput) 
 	sizeMult := s.calculateSizeMultiplier(drawdown, mode)
 
 	// Check if we should regenerate ladder
-	currentOrderCount := len(input.LiveOrders)
-	desired := s.getOrRegenerateLadder(mid, balance, currentOrderCount)
+	desired := s.getOrRegenerateLadder(mid, balance, input.LiveOrders)
 
 	if len(desired) == 0 {
 		return &core.TickOutput{
@@ -635,7 +649,8 @@ func (s *SimpleLadderStrategy) getAvailableBalance(balance *core.BalanceState, m
 }
 
 // shouldRegenerateLadder checks if we need to regenerate the ladder
-func (s *SimpleLadderStrategy) shouldRegenerateLadder(mid, balance float64, currentOrderCount int) (bool, string) {
+// Uses notional depth + minimum order count check + balance awareness
+func (s *SimpleLadderStrategy) shouldRegenerateLadder(mid float64, liveOrders []core.LiveOrder, balance *core.BalanceState) (bool, string) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -644,25 +659,86 @@ func (s *SimpleLadderStrategy) shouldRegenerateLadder(mid, balance float64, curr
 		return true, "initial"
 	}
 
-	// Check regeneration cooldown to prevent ping-pong
-	// Skip this check if orders are missing (fills happened)
-	expectedOrderCount := s.cfg.NumLevels * 2 // Both sides
-	ordersMissing := currentOrderCount < expectedOrderCount
+	// Calculate current notional depth per side and count orders
+	var bidNotional, askNotional float64
+	var bidCount, askCount int
+	for _, order := range liveOrders {
+		notional := order.Price * order.RemainingQty
+		if order.Side == "BUY" {
+			bidNotional += notional
+			bidCount++
+		} else {
+			askNotional += notional
+			askCount++
+		}
+	}
 
-	if !ordersMissing && s.lastRegenTime > 0 {
+	// Calculate max possible notional per side based on available balance
+	// Use 90% of available to leave some buffer
+	maxBidNotional := balance.QuoteFree * 0.9
+	maxAskNotional := balance.BaseFree * mid * 0.9
+
+	// Target per side (capped by available balance)
+	targetPerSide := s.cfg.TargetDepthNotional
+	bidTarget := targetPerSide
+	askTarget := targetPerSide
+	if maxBidNotional < bidTarget {
+		bidTarget = maxBidNotional
+	}
+	if maxAskNotional < askTarget {
+		askTarget = maxAskNotional
+	}
+
+	// Minimum orders per side = numLevels / 2
+	minOrdersPerSide := s.cfg.NumLevels / 2
+	if minOrdersPerSide < 1 {
+		minOrdersPerSide = 1
+	}
+	ordersTooFew := bidCount < minOrdersPerSide || askCount < minOrdersPerSide
+
+	// Check if notional is below 110% of target (capped by available balance)
+	bidThreshold := bidTarget * 1.1
+	askThreshold := askTarget * 1.1
+	// Don't exceed what's possible with available balance
+	if bidThreshold > maxBidNotional {
+		bidThreshold = maxBidNotional
+	}
+	if askThreshold > maxAskNotional {
+		askThreshold = maxAskNotional
+	}
+	notionalLow := bidNotional < bidThreshold || askNotional < askThreshold
+
+	// Skip regenerate if already at max possible (within 5% tolerance)
+	atMaxBid := bidNotional >= maxBidNotional*0.95
+	atMaxAsk := askNotional >= maxAskNotional*0.95
+	if atMaxBid && atMaxAsk && !ordersTooFew {
+		// Already at max possible given balance, don't regenerate
+		return false, ""
+	}
+
+	// Critical condition: orders too few OR notional critically low (< 50% of target)
+	criticalThreshold := targetPerSide * 0.5
+	notionalCritical := bidNotional < criticalThreshold || askNotional < criticalThreshold
+	isCritical := ordersTooFew || notionalCritical
+
+	// Check regeneration cooldown to prevent ping-pong
+	// Skip cooldown if critical
+	if !isCritical && s.lastRegenTime > 0 {
 		elapsed := time.Now().UnixMilli() - s.lastRegenTime
 		if elapsed < s.regenCooldownMs {
-			// Still in cooldown - don't regenerate
-			// This prevents rapid regenerations when mid ping-pongs
+			// Still in cooldown - don't regenerate unless critical
 			return false, ""
 		}
 	}
 
-	// Order count changed (fills happened) - regenerate immediately
-	// This is critical: when fills happen, orders are removed from book and mid changes
-	if ordersMissing {
-		missing := expectedOrderCount - currentOrderCount
-		return true, fmt.Sprintf("missing_%d_orders", missing)
+	// Orders too few - regenerate
+	if ordersTooFew {
+		return true, fmt.Sprintf("few_orders: bid=%d ask=%d min=%d", bidCount, askCount, minOrdersPerSide)
+	}
+
+	// Notional depth below threshold - regenerate to maintain buffer
+	if notionalLow {
+		return true, fmt.Sprintf("notional_low: bid=$%.0f/$%.0f ask=$%.0f/$%.0f", bidNotional, bidThreshold, askNotional, askThreshold)
 	}
 
 	// Mid moved significantly
@@ -675,9 +751,9 @@ func (s *SimpleLadderStrategy) shouldRegenerateLadder(mid, balance float64, curr
 }
 
 // getOrRegenerateLadder returns cached ladder or generates new one
-func (s *SimpleLadderStrategy) getOrRegenerateLadder(mid float64, balance *core.BalanceState, currentOrderCount int) []core.DesiredOrder {
+func (s *SimpleLadderStrategy) getOrRegenerateLadder(mid float64, balance *core.BalanceState, liveOrders []core.LiveOrder) []core.DesiredOrder {
 	totalBalance := s.getAvailableBalance(balance, mid)
-	shouldRegen, reason := s.shouldRegenerateLadder(mid, totalBalance, currentOrderCount)
+	shouldRegen, reason := s.shouldRegenerateLadder(mid, liveOrders, balance)
 
 	if shouldRegen {
 		s.mu.Lock()
@@ -900,6 +976,12 @@ func calculateSizeMultiplier() float64 {
 //
 // Returns: Slice of desired orders for both BID and ASK sides
 func (s *SimpleLadderStrategy) computeDesiredOrders(mid float64, balance *core.BalanceState) []core.DesiredOrder {
+	// Validate mid price to prevent division by zero and Inf quantities
+	if mid <= 0 || math.IsNaN(mid) || math.IsInf(mid, 0) {
+		log.Printf("[%s] Invalid mid price: %.8f, skipping order generation", s.Name(), mid)
+		return nil
+	}
+
 	// Calculate depth limit prices
 	depthBps := s.cfg.DepthBps
 	if depthBps <= 0 {
@@ -921,8 +1003,24 @@ func (s *SimpleLadderStrategy) computeDesiredOrders(mid float64, balance *core.B
 		numLevels = 5
 	}
 
-	// Target depth per side (config is per-side, not total)
+	// Target depth per side (capped by available balance)
 	targetDepthPerSide := s.cfg.TargetDepthNotional
+
+	// Calculate max possible per side based on available balance (use 90% to leave buffer)
+	maxBidDepth := balance.QuoteFree * 0.9
+	maxAskDepth := balance.BaseFree * mid * 0.9
+
+	// Cap targets by available balance
+	bidTargetDepth := targetDepthPerSide
+	askTargetDepth := targetDepthPerSide
+	if maxBidDepth < bidTargetDepth {
+		bidTargetDepth = maxBidDepth
+		log.Printf("[%s] BID target capped by balance: $%.0f -> $%.0f", s.Name(), targetDepthPerSide, bidTargetDepth)
+	}
+	if maxAskDepth < askTargetDepth {
+		askTargetDepth = maxAskDepth
+		log.Printf("[%s] ASK target capped by balance: $%.0f -> $%.0f", s.Name(), targetDepthPerSide, askTargetDepth)
+	}
 
 	// Calculate current inventory state
 	inv := calculateInventoryState(balance.BaseFree, balance.QuoteFree, mid)
@@ -943,11 +1041,11 @@ func (s *SimpleLadderStrategy) computeDesiredOrders(mid float64, balance *core.B
 	var orders []core.DesiredOrder
 
 	// Generate BID orders (first level at spread.bidBps, others spread to depthBps)
-	bidOrders := s.generateSideOrders(mid, spread.bidBps, depthBps, numLevels, targetDepthPerSide, "BUY", batchID)
+	bidOrders := s.generateSideOrders(mid, spread.bidBps, depthBps, numLevels, bidTargetDepth, "BUY", batchID)
 	orders = append(orders, bidOrders...)
 
 	// Generate ASK orders (first level at spread.askBps, others spread to depthBps)
-	askOrders := s.generateSideOrders(mid, spread.askBps, depthBps, numLevels, targetDepthPerSide, "SELL", batchID)
+	askOrders := s.generateSideOrders(mid, spread.askBps, depthBps, numLevels, askTargetDepth, "SELL", batchID)
 	orders = append(orders, askOrders...)
 
 	// Log first level spread for both sides
@@ -977,6 +1075,10 @@ func (s *SimpleLadderStrategy) generateSideOrders(mid, firstLevelSpreadBps, dept
 	if side == "BUY" {
 		firstPrice = mid * (1.0 - firstLevelSpreadBps/10000.0)
 		lastPrice = mid * (1.0 - depthBps/10000.0)
+		// Ensure lastPrice is at least tickSize (for depthBps >= 10000)
+		if lastPrice < s.tickSize {
+			lastPrice = s.tickSize
+		}
 	} else {
 		firstPrice = mid * (1.0 + firstLevelSpreadBps/10000.0)
 		lastPrice = mid * (1.0 + depthBps/10000.0)
@@ -1083,12 +1185,30 @@ func (s *SimpleLadderStrategy) generateSideOrders(mid, firstLevelSpreadBps, dept
 	for level := 0; level < actualLevels; level++ {
 		price := levelPrices[level]
 
+		// Validate price before calculating quantity
+		if price <= 0 || math.IsNaN(price) || math.IsInf(price, 0) {
+			log.Printf("[%s] Skipping invalid price at level %d: %.8f", s.Name(), level, price)
+			continue
+		}
+
 		// Apply size multiplier for unpredictable order sizes
 		sizeMultiplier := calculateSizeMultiplier()
 		sizeNotional := baseNotionalPerLevel * sizeMultiplier
 
 		qty := sizeNotional / price
 		qty = s.roundToStep(qty)
+
+		// Validate quantity (catch Inf, NaN, zero, negative)
+		if qty <= 0 || math.IsNaN(qty) || math.IsInf(qty, 0) {
+			log.Printf("[%s] Skipping invalid qty at level %d: price=%.8f qty=%.8f", s.Name(), level, price, qty)
+			continue
+		}
+
+		// Cap quantity to exchange max order limit
+		if s.maxOrderQty > 0 && qty > s.maxOrderQty {
+			log.Printf("[%s] Capping qty at level %d: %.0f -> %.0f (max limit)", s.Name(), level, qty, s.maxOrderQty)
+			qty = s.maxOrderQty
+		}
 
 		orderNotional := price * qty
 		if orderNotional < s.minNotional {
