@@ -14,6 +14,7 @@ import (
 	"mm-platform-engine/internal/config"
 	"mm-platform-engine/internal/core"
 	"mm-platform-engine/internal/exchange"
+	"mm-platform-engine/internal/exchange/bybit"
 	"mm-platform-engine/internal/exchange/gate"
 	"mm-platform-engine/internal/exchange/mexc"
 	"mm-platform-engine/internal/store"
@@ -54,6 +55,9 @@ func main() {
 		gateSymbol := convertToGateSymbol(cfg.TradingConfig.Symbol)
 		exch = gate.NewClient(cfg.ExchangeAPIKey, cfg.ExchangeAPISecret, cfg.ExchangeBaseURL, gateSymbol)
 		log.Printf("Using Gate.io exchange for %s", gateSymbol)
+	case "bybit":
+		exch = bybit.NewClient(cfg.ExchangeAPIKey, cfg.ExchangeAPISecret, cfg.ExchangeBaseURL)
+		log.Println("Using Bybit exchange")
 	default:
 		log.Fatalf("Unsupported exchange: %s", cfg.ExchangeName)
 	}

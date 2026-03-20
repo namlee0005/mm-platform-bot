@@ -715,12 +715,12 @@ func (b *BaseBot) getSnapshot() (*Snapshot, error) {
 
 // getBalanceState returns current balance state
 func (b *BaseBot) getBalanceState() (*BalanceState, error) {
-	// Try cached balance first
+	// Prefer WebSocket cached balance (has accurate locked values for Bybit)
 	if bal := b.balanceTracker.Get(); bal != nil {
 		return bal, nil
 	}
 
-	// Fetch from REST API
+	// Fallback to REST API if no cache
 	acct, err := b.exch.GetAccount(b.ctx)
 	if err != nil {
 		return nil, err
