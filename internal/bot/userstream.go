@@ -3,6 +3,7 @@ package bot
 import (
 	"context"
 	"log"
+	"strings"
 	"time"
 
 	"mm-platform-engine/internal/exchange"
@@ -77,6 +78,7 @@ func (b *Bot) handleOrderUpdate(event *types.OrderEvent) {
 	orderInfo := &store.OrderInfo{
 		OrderID:       event.OrderID,
 		ClientOrderID: event.ClientOrderID,
+		Exchange:      strings.ToLower(b.cfg.ExchangeName),
 		Symbol:        event.Symbol,
 		Side:          event.Side,
 		Price:         event.Price,
@@ -111,7 +113,7 @@ func (b *Bot) handleFill(event *types.FillEvent) {
 		b.metricsAgg.RecordFill(side, event.Price, event.Quantity, fillTimestamp)
 
 		// Calculate TTF (time-to-fill) if we have order creation time
-		orderInfo, err := b.redis.GetOrder(b.ctx, event.Symbol, event.OrderID)
+		orderInfo, err := b.redis.GetOrder(b.ctx, strings.ToLower(b.cfg.ExchangeName), event.Symbol, event.OrderID)
 		if err == nil && orderInfo != nil && orderInfo.CreatedAt > 0 {
 			ttfMs := fillTimestamp - orderInfo.CreatedAt
 			ttfSec := float64(ttfMs) / 1000.0

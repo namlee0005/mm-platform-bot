@@ -3,6 +3,7 @@ package bot
 import (
 	"context"
 	"log"
+	"strings"
 	"time"
 )
 
@@ -25,7 +26,7 @@ func (b *Bot) shutdown(ctx context.Context) error {
 
 	// Clear all orders from Redis
 	log.Printf("Clearing orders from Redis...")
-	if err := b.redis.ClearAllOrders(shutdownCtx, symbol); err != nil {
+	if err := b.redis.ClearAllOrders(shutdownCtx, strings.ToLower(b.cfg.ExchangeName), symbol); err != nil {
 		log.Printf("Warning: Failed to clear orders from Redis: %v", err)
 	} else {
 		log.Printf("Successfully cleared orders from Redis")

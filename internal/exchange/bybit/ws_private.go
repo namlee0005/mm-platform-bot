@@ -306,8 +306,6 @@ func (ws *WSConnection) handleExecutionUpdate(message []byte) error {
 
 // handleWalletUpdate processes wallet balance updates
 func (ws *WSConnection) handleWalletUpdate(message []byte) error {
-	log.Printf("[Bybit WS] Received wallet update: %s", string(message))
-
 	if ws.handlers.OnAccountUpdate == nil {
 		return nil
 	}
@@ -327,8 +325,6 @@ func (ws *WSConnection) handleWalletUpdate(message []byte) error {
 			if free == 0 && walletBal > 0 {
 				free = walletBal - locked
 			}
-			log.Printf("[Bybit WS] Wallet %s: free=%.8f, locked=%.8f, wallet=%.8f",
-				coin.Coin, free, locked, walletBal)
 			balances = append(balances, types.Balance{
 				Asset:  coin.Coin,
 				Free:   free,

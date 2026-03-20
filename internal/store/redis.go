@@ -354,6 +354,7 @@ func (s *RedisStore) Close() error {
 type OrderInfo struct {
 	OrderID       string  `json:"orderId"`
 	ClientOrderID string  `json:"clientOrderId"`
+	Exchange      string  `json:"exchange"`
 	Symbol        string  `json:"symbol"`
 	Side          string  `json:"side"`
 	Price         float64 `json:"price"`
@@ -364,9 +365,9 @@ type OrderInfo struct {
 }
 
 // SaveOrder saves order information to Redis List
-// Key format: order:{symbol}
+// Key format: order:{exchange}:{symbol}
 func (s *RedisStore) SaveOrder(ctx context.Context, order *OrderInfo) error {
-	key := fmt.Sprintf("order:%s", order.Symbol)
+	key := fmt.Sprintf("order:%s:%s", order.Exchange, order.Symbol)
 
 	data, err := json.Marshal(order)
 	if err != nil {
@@ -385,8 +386,8 @@ func (s *RedisStore) SaveOrder(ctx context.Context, order *OrderInfo) error {
 }
 
 // GetOrder retrieves order information from Redis List by orderId
-func (s *RedisStore) GetOrder(ctx context.Context, symbol, orderID string) (*OrderInfo, error) {
-	key := fmt.Sprintf("order:%s", symbol)
+func (s *RedisStore) GetOrder(ctx context.Context, exchange, symbol, orderID string) (*OrderInfo, error) {
+	key := fmt.Sprintf("order:%s:%s", exchange, symbol)
 
 	// Get all items from list
 	items, err := s.client.LRange(ctx, key, 0, -1).Result()
@@ -409,8 +410,8 @@ func (s *RedisStore) GetOrder(ctx context.Context, symbol, orderID string) (*Ord
 }
 
 // DeleteOrder removes order from Redis List by orderId
-func (s *RedisStore) DeleteOrder(ctx context.Context, symbol, orderID string) error {
-	key := fmt.Sprintf("order:%s", symbol)
+func (s *RedisStore) DeleteOrder(ctx context.Context, exchange, symbol, orderID string) error {
+	key := fmt.Sprintf("order:%s:%s", exchange, symbol)
 
 	// Get all items to find the one to remove
 	items, err := s.client.LRange(ctx, key, 0, -1).Result()
@@ -446,8 +447,8 @@ func (s *RedisStore) DeleteOrder(ctx context.Context, symbol, orderID string) er
 }
 
 // GetAllOrders retrieves all orders for a symbol from Redis List
-func (s *RedisStore) GetAllOrders(ctx context.Context, symbol string) ([]*OrderInfo, error) {
-	key := fmt.Sprintf("order:%s", symbol)
+func (s *RedisStore) GetAllOrders(ctx context.Context, exchange, symbol string) ([]*OrderInfo, error) {
+	key := fmt.Sprintf("order:%s:%s", exchange, symbol)
 
 	items, err := s.client.LRange(ctx, key, 0, -1).Result()
 	if err != nil {
@@ -467,8 +468,8 @@ func (s *RedisStore) GetAllOrders(ctx context.Context, symbol string) ([]*OrderI
 }
 
 // ClearAllOrders deletes all orders for a symbol from Redis (deletes the list)
-func (s *RedisStore) ClearAllOrders(ctx context.Context, symbol string) error {
-	key := fmt.Sprintf("order:%s", symbol)
+func (s *RedisStore) ClearAllOrders(ctx context.Context, exchange, symbol string) error {
+	key := fmt.Sprintf("order:%s:%s", exchange, symbol)
 
 	if err := s.client.Del(ctx, key).Err(); err != nil {
 		return fmt.Errorf("failed to delete orders list: %w", err)
@@ -479,8 +480,8 @@ func (s *RedisStore) ClearAllOrders(ctx context.Context, symbol string) error {
 
 // ClearOrdersByBotID removes only orders belonging to a specific bot
 // This is safer than ClearAllOrders when multiple bots share the same symbol
-func (s *RedisStore) ClearOrdersByBotID(ctx context.Context, symbol, botID string) (int, error) {
-	key := fmt.Sprintf("order:%s", symbol)
+func (s *RedisStore) ClearOrdersByBotID(ctx context.Context, exchange, symbol, botID string) (int, error) {
+	key := fmt.Sprintf("order:%s:%s", exchange, symbol)
 
 	// Get all items from list
 	items, err := s.client.LRange(ctx, key, 0, -1).Result()

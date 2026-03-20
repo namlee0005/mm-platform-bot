@@ -235,7 +235,7 @@ func (b *BaseBot) Stop(ctx context.Context) error {
 
 	// 5. Clear orders from Redis
 	if b.redis != nil && b.cfg.BotID != "" {
-		removed, err := b.redis.ClearOrdersByBotID(shutdownCtx, b.cfg.Symbol, b.cfg.BotID)
+		removed, err := b.redis.ClearOrdersByBotID(shutdownCtx, b.cfg.Exchange, b.cfg.Symbol, b.cfg.BotID)
 		if err != nil {
 			log.Printf("[%s] WARNING: Failed to clear orders from Redis: %v", b.strategy.Name(), err)
 		} else {
@@ -542,6 +542,7 @@ func (b *BaseBot) handleOrderUpdate(event *types.OrderEvent) {
 		b.redis.SaveOrder(b.ctx, &store.OrderInfo{
 			OrderID:       event.OrderID,
 			ClientOrderID: event.ClientOrderID,
+			Exchange:      b.cfg.Exchange,
 			Symbol:        event.Symbol,
 			Side:          event.Side,
 			Price:         event.Price,
@@ -555,7 +556,7 @@ func (b *BaseBot) handleOrderUpdate(event *types.OrderEvent) {
 	// Delete from Redis on cancel/fill
 	if event.Status == "CANCELED" || event.Status == "FILLED" {
 		if b.redis != nil {
-			b.redis.DeleteOrder(b.ctx, b.cfg.Symbol, event.OrderID)
+			b.redis.DeleteOrder(b.ctx, b.cfg.Exchange, b.cfg.Symbol, event.OrderID)
 		}
 	}
 
@@ -741,7 +742,7 @@ func (b *BaseBot) cancelAllOrders(reason string) error {
 
 	// Clear from Redis
 	if b.redis != nil && b.cfg.BotID != "" {
-		b.redis.ClearOrdersByBotID(b.ctx, b.cfg.Symbol, b.cfg.BotID)
+		b.redis.ClearOrdersByBotID(b.ctx, b.cfg.Exchange, b.cfg.Symbol, b.cfg.BotID)
 	}
 
 	return nil
@@ -784,7 +785,7 @@ func (b *BaseBot) replaceOrders(desired []DesiredOrder, reason string) error {
 
 	// Clear from Redis
 	if b.redis != nil && b.cfg.BotID != "" {
-		b.redis.ClearOrdersByBotID(b.ctx, b.cfg.Symbol, b.cfg.BotID)
+		b.redis.ClearOrdersByBotID(b.ctx, b.cfg.Exchange, b.cfg.Symbol, b.cfg.BotID)
 	}
 
 	if len(desired) == 0 {
