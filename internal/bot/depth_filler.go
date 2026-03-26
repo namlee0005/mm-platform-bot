@@ -44,14 +44,15 @@ func NewDepthFiller(
 ) *core.BaseBot {
 	// Create base bot config
 	baseCfg := &core.BaseBotConfig{
-		Symbol:         cfg.Symbol,
-		BaseAsset:      cfg.BaseAsset,
-		QuoteAsset:     cfg.QuoteAsset,
-		Exchange:       cfg.Exchange,
-		ExchangeID:     cfg.ExchangeID,
-		BotID:          cfg.BotID,
-		BotType:        cfg.BotType,
-		TickIntervalMs: cfg.TickIntervalMs,
+		Symbol:               cfg.Symbol,
+		BaseAsset:            cfg.BaseAsset,
+		QuoteAsset:           cfg.QuoteAsset,
+		Exchange:             cfg.Exchange,
+		ExchangeID:           cfg.ExchangeID,
+		BotID:                cfg.BotID,
+		BotType:              cfg.BotType,
+		TickIntervalMs:       cfg.TickIntervalMs,
+		SyncOrdersIntervalMs: 300000, // Sync every 5 min (many orders ~50)
 	}
 
 	// Create strategy config

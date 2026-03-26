@@ -76,6 +76,7 @@ type EngineState struct {
 	LastMode         Mode    // Last operating mode
 	OldestOrderAgeMs int64   // Age of oldest order in milliseconds
 	LastRefreshMs    int64   // Last refresh timestamp in milliseconds
+	PeakNAV          float64 // Peak Net Asset Value for drawdown calculation
 }
 
 // SimpleConfigUpdate represents simple_config from MongoDB for hot reload
@@ -89,7 +90,9 @@ type SimpleConfigUpdate struct {
 	SpreadMaxBps        float64 `bson:"spread_max_bps"`
 	NumLevels           int     `bson:"num_levels"`
 	TargetDepthNotional float64 `bson:"target_depth_notional"`
-	TargetRatio         float64 `bson:"target_ratio"`
+	InitBase            float64 `bson:"init_base"`
+	InitQuote           float64 `bson:"init_quote"`
+	PyramidFactor       float64 `bson:"pyramid_factor"`
 
 	// Optional params
 	DrawdownLimitPct   float64 `bson:"drawdown_limit_pct,omitempty"`

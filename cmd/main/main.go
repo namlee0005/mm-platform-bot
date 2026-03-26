@@ -14,9 +14,7 @@ import (
 	"mm-platform-engine/internal/config"
 	"mm-platform-engine/internal/core"
 	"mm-platform-engine/internal/exchange"
-	"mm-platform-engine/internal/exchange/bybit"
-	"mm-platform-engine/internal/exchange/gate"
-	"mm-platform-engine/internal/exchange/mexc"
+	"mm-platform-engine/internal/notify"
 	"mm-platform-engine/internal/store"
 )
 
@@ -43,24 +41,21 @@ func main() {
 	log.Printf("Loaded config for %s on %s, bot_type=%s",
 		cfg.TradingConfig.Symbol, cfg.ExchangeName, botType)
 
-	// Create exchange client
-	var exch exchange.Exchange
+	// Create exchange client using CCXT
 	exchangeName := strings.ToLower(cfg.ExchangeName)
+	sandbox := cfg.ExchangeBaseURL != "" && strings.Contains(cfg.ExchangeBaseURL, "testnet")
 
-	switch exchangeName {
-	case "mexc":
-		exch = mexc.NewClient(cfg.ExchangeAPIKey, cfg.ExchangeAPISecret, cfg.ExchangeBaseURL)
-		log.Println("Using MEXC exchange")
-	case "gate":
-		gateSymbol := convertToGateSymbol(cfg.TradingConfig.Symbol)
-		exch = gate.NewClient(cfg.ExchangeAPIKey, cfg.ExchangeAPISecret, cfg.ExchangeBaseURL, gateSymbol)
-		log.Printf("Using Gate.io exchange for %s", gateSymbol)
-	case "bybit":
-		exch = bybit.NewClient(cfg.ExchangeAPIKey, cfg.ExchangeAPISecret, cfg.ExchangeBaseURL)
-		log.Println("Using Bybit exchange")
-	default:
-		log.Fatalf("Unsupported exchange: %s", cfg.ExchangeName)
+	exch, err := exchange.NewCCXTExchange(
+		exchangeName,
+		cfg.ExchangeAPIKey,
+		cfg.ExchangeAPISecret,
+		cfg.TradingConfig.Symbol,
+		sandbox,
+	)
+	if err != nil {
+		log.Fatalf("Failed to create exchange client: %v", err)
 	}
+	log.Printf("Using CCXT adapter for %s exchange", exchangeName)
 
 	// Create Redis store
 	redis, err := store.NewRedisStore(cfg.RedisAddr, cfg.RedisPassword, cfg.RedisDB)
@@ -81,13 +76,22 @@ func main() {
 	// Bot ID
 	botID := cfg.UserExchangeKeyID
 
+	// Create Telegram notifier
+	telegram := notify.NewTelegramNotifier(notify.TelegramConfig{
+		BotToken: cfg.TelegramBotToken,
+		ChatID:   cfg.TelegramChatID,
+		Exchange: exchangeName,
+		Symbol:   cfg.TradingConfig.Symbol,
+		BotID:    botID,
+	})
+
 	// Create bot based on type
 	var maker *core.BaseBot
 
 	switch strings.ToLower(botType) {
 	case "simple-maker":
 		// All simple/one-sided types now use 2-sided simple-maker
-		maker = createSimpleMaker(cfg, exch, redis, mongo, exchangeName, botID)
+		maker = createSimpleMaker(cfg, exch, redis, mongo, exchangeName, botID, telegram)
 		log.Println("Mode: SIMPLE-MAKER (2-sided market maker)")
 
 	case "depth-filler":
@@ -125,6 +129,12 @@ func main() {
 		log.Fatalf("Failed to start bot: %v", err)
 	}
 
+	// Send Telegram notification for bot start
+	startTime := time.Now()
+	telegram.NotifyBotStarted(botType, map[string]interface{}{
+		"symbol": cfg.SimpleConfig.Symbol,
+	})
+
 	// Update status in Redis
 	statusKey := fmt.Sprintf("%s:%s", cfg.SimpleConfig.Symbol, botType)
 	if err := redis.SetStatus(ctx, statusKey, "running"); err != nil {
@@ -158,6 +168,10 @@ func main() {
 		log.Printf("Error during shutdown: %v", err)
 	}
 
+	// Send Telegram notification for bot stop
+	runtime := time.Since(startTime)
+	telegram.NotifyBotStopped("graceful shutdown", runtime)
+
 	log.Println("Bot stopped successfully")
 }
 
@@ -169,6 +183,7 @@ func createSimpleMaker(
 	mongo *store.MongoStore,
 	exchangeName string,
 	botID string,
+	telegram *notify.TelegramNotifier,
 ) *core.BaseBot {
 	simpleConfig := &cfg.SimpleConfig
 
@@ -214,6 +229,25 @@ func createSimpleMaker(
 		DrawdownReducePct:   simpleConfig.DrawdownLimitPct * 0.4,
 		RecoveryHours:       48,
 		MaxRecoverySizeMult: 0.3,
+		// Telegram notifications for mode changes
+		OnModeChange: func(oldMode, newMode string, nav, peakNAV, drawdownPct float64) {
+			// Determine reason for mode change
+			reason := fmt.Sprintf("Drawdown: %.2f%%", drawdownPct*100)
+
+			// Send mode change notification
+			telegram.NotifyModeChange(oldMode, newMode, reason)
+
+			// Send specific drawdown alerts based on severity
+			if newMode == "WARNING" {
+				telegram.NotifyDrawdownWarning(drawdownPct, nav, peakNAV)
+			} else if newMode == "PAUSED" {
+				telegram.NotifyDrawdownCritical(drawdownPct, nav, peakNAV)
+			}
+		},
+		// Telegram notification for low balance
+		OnBalanceLow: func(available, required float64) {
+			telegram.NotifyBalanceLow("Total Notional", available, required)
+		},
 	}
 
 	log.Printf("SimpleMaker config: spread=%.0fbps, levels=%d, depth=$%.0f, cooldown=%dms",
@@ -295,19 +329,4 @@ func createDepthFiller(
 	}
 
 	return bot.NewDepthFiller(fillerCfg, exch, redis, mongo)
-}
-
-// convertToGateSymbol converts symbol from "BTCUSDT" to "BTC_USDT" format
-func convertToGateSymbol(symbol string) string {
-	if strings.Contains(symbol, "_") {
-		return symbol
-	}
-	quotes := []string{"USDT", "USDC", "BTC", "ETH", "USD"}
-	for _, quote := range quotes {
-		if strings.HasSuffix(symbol, quote) {
-			base := strings.TrimSuffix(symbol, quote)
-			return base + "_" + quote
-		}
-	}
-	return symbol
 }

@@ -83,6 +83,10 @@ type Config struct {
 
 	// Operational settings
 	LogLevel string
+
+	// Telegram settings (optional)
+	TelegramBotToken string
+	TelegramChatID   string
 }
 
 // Load reads configuration from environment variables and MongoDB
@@ -200,6 +204,10 @@ func Load() (*Config, error) {
 
 		// Operational settings
 		LogLevel: getEnv("LOG_LEVEL", "info"),
+
+		// Telegram settings (optional)
+		TelegramBotToken: getEnv("TELEGRAM_BOT_TOKEN", ""),
+		TelegramChatID:   getEnv("TELEGRAM_CHAT_ID", ""),
 	}
 
 	return cfg, nil
@@ -384,7 +392,9 @@ type SimpleConfig struct {
 	SpreadMaxBps        float64 `json:"spread_max_bps" bson:"spread_max_bps"`
 	NumLevels           int     `json:"num_levels" bson:"num_levels"`
 	TargetDepthNotional float64 `json:"target_depth_notional" bson:"target_depth_notional"`
-	TargetRatio         float64 `json:"target_ratio" bson:"target_ratio"`
+	InitBase            float64 `json:"init_base" bson:"init_base"`           // Initial base amount (absolute, e.g. 10000 HMSTR)
+	InitQuote           float64 `json:"init_quote" bson:"init_quote"`         // Initial quote amount (absolute, e.g. 50 USDT)
+	PyramidFactor       float64 `json:"pyramid_factor" bson:"pyramid_factor"` // Size ratio outer/inner (1=flat, 3=outer 3x inner). Default 3.0
 
 	// Optional params
 	DrawdownLimitPct   float64 `json:"drawdown_limit_pct,omitempty" bson:"drawdown_limit_pct,omitempty"`
@@ -424,10 +434,7 @@ func (s *SimpleConfig) ToTradingConfig() TradingConfig {
 	if spreadMaxBps == 0 {
 		spreadMaxBps = 100
 	}
-	targetRatio := s.TargetRatio
-	if targetRatio == 0 {
-		targetRatio = 0.5
-	}
+
 	skewK := s.SkewK
 	if skewK == 0 {
 		skewK = 2.0
@@ -461,7 +468,7 @@ func (s *SimpleConfig) ToTradingConfig() TradingConfig {
 		Symbol:        s.Symbol,
 		BaseAsset:     s.BaseAsset,
 		QuoteAsset:    s.QuoteAsset,
-		TargetRatio:   targetRatio,
+		TargetRatio:   0.5,
 		OffsetsBps:    offsets,
 		SizeMult:      sizes,
 		QuotePerOrder: quotePerOrder,

@@ -27,6 +27,14 @@ type DepthFillerConfig struct {
 	MinOrderSizePct float64 `json:"min_order_size_pct"` // Min % of balance per order (default: 1%)
 }
 
+// pendingShiftOrder represents an order to add after a fill
+type depthFillerShift struct {
+	side      string  // BUY or SELL
+	fillPrice float64 // Price where fill happened
+	fillQty   float64 // Quantity filled
+	timestamp int64   // When fill happened
+}
+
 // DepthFillerStrategy places orders far from mid (5%-50%) to fill order book depth
 // Removes orders when price approaches to avoid getting filled
 type DepthFillerStrategy struct {
@@ -46,6 +54,9 @@ type DepthFillerStrategy struct {
 	// Pending orders to place (for rate limiting)
 	pendingOrders []core.DesiredOrder
 	lastPlaceTime time.Time
+
+	// Shift ladder tracking - orders to add after fill
+	pendingShifts []depthFillerShift
 }
 
 // NewDepthFillerStrategy creates a new DepthFillerStrategy
@@ -111,6 +122,16 @@ func (s *DepthFillerStrategy) Tick(ctx context.Context, input *core.TickInput) (
 	snap := input.Snapshot
 	balance := input.Balance
 	mid := snap.Mid
+
+	// Process pending shifts first (orders to add after fills)
+	shiftOrders := s.processPendingShifts(mid, input.LiveOrders, balance)
+	if len(shiftOrders) > 0 {
+		return &core.TickOutput{
+			Action:      core.TickActionAmend,
+			OrdersToAdd: shiftOrders,
+			Reason:      fmt.Sprintf("shift_ladder: adding %d orders after fill", len(shiftOrders)),
+		}, nil
+	}
 
 	// Check if any live orders are too close to mid - need to remove them
 	ordersToRemove := s.checkOrdersToRemove(input.LiveOrders, mid)
@@ -409,13 +430,22 @@ func (s *DepthFillerStrategy) computeFixedLevelOrders(mid float64, balance *core
 
 // OnFill handles fill events
 func (s *DepthFillerStrategy) OnFill(event *core.FillEvent) {
-	log.Printf("[%s] UNEXPECTED FILL at %.8f - order was too close to mid!",
-		s.Name(), event.Price)
-
-	// Clear cached ladder to force regeneration
 	s.mu.Lock()
-	s.cachedLadder = nil
-	s.mu.Unlock()
+	defer s.mu.Unlock()
+
+	now := time.Now().UnixMilli()
+	fillPrice := s.roundToTick(event.Price)
+
+	log.Printf("[%s] Fill at %.8f, adding pending shift (side=%s, qty=%.4f)",
+		s.Name(), fillPrice, event.Side, event.Quantity)
+
+	// Add pending shift order - will be processed on next tick
+	s.pendingShifts = append(s.pendingShifts, depthFillerShift{
+		side:      event.Side,
+		fillPrice: fillPrice,
+		fillQty:   event.Quantity,
+		timestamp: now,
+	})
 }
 
 // OnOrderUpdate handles order status updates
@@ -446,4 +476,177 @@ func (s *DepthFillerStrategy) roundToStep(qty float64) float64 {
 		return qty
 	}
 	return math.Floor(qty/s.stepSize) * s.stepSize
+}
+
+// processPendingShifts processes pending shift orders after fills
+// Returns orders to add at deeper levels in the ladder
+func (s *DepthFillerStrategy) processPendingShifts(mid float64, liveOrders []core.LiveOrder, balance *core.BalanceState) []core.DesiredOrder {
+	s.mu.Lock()
+	pendingShifts := s.pendingShifts
+	s.pendingShifts = nil // Clear pending
+	s.mu.Unlock()
+
+	if len(pendingShifts) == 0 {
+		return nil
+	}
+
+	// Max shifts per tick to prevent overload
+	const maxShiftsPerSide = 3
+
+	// Group shifts by side
+	var bidShifts, askShifts []depthFillerShift
+	for _, shift := range pendingShifts {
+		if shift.side == "BUY" {
+			bidShifts = append(bidShifts, shift)
+		} else {
+			askShifts = append(askShifts, shift)
+		}
+	}
+
+	// Limit shifts per side
+	if len(bidShifts) > maxShiftsPerSide {
+		log.Printf("[%s] Limiting BID shifts: %d -> %d", s.Name(), len(bidShifts), maxShiftsPerSide)
+		bidShifts = bidShifts[:maxShiftsPerSide]
+	}
+	if len(askShifts) > maxShiftsPerSide {
+		log.Printf("[%s] Limiting ASK shifts: %d -> %d", s.Name(), len(askShifts), maxShiftsPerSide)
+		askShifts = askShifts[:maxShiftsPerSide]
+	}
+
+	// Find current deepest orders
+	var lowestBid, highestAsk float64
+	for _, order := range liveOrders {
+		if order.Side == "BUY" {
+			if lowestBid == 0 || order.Price < lowestBid {
+				lowestBid = order.Price
+			}
+		} else {
+			if highestAsk == 0 || order.Price > highestAsk {
+				highestAsk = order.Price
+			}
+		}
+	}
+
+	// If no live orders, calculate from mid
+	minDepth := s.cfg.MinDepthPct / 100.0
+	maxDepth := s.cfg.MaxDepthPct / 100.0
+	if lowestBid == 0 {
+		lowestBid = mid * (1.0 - minDepth)
+	}
+	if highestAsk == 0 {
+		highestAsk = mid * (1.0 + minDepth)
+	}
+
+	// Calculate step for new orders (move deeper by ~2-5% of current depth range)
+	depthRange := maxDepth - minDepth
+	stepPct := depthRange / float64(s.cfg.NumLevels) * 2 // Double the normal step
+
+	var ordersToAdd []core.DesiredOrder
+	timestamp := time.Now().UnixMilli() % 100000000
+	batchID := fmt.Sprintf("%d%03d", timestamp, rand.Intn(1000))
+
+	// Process BID shifts - add order below lowest bid (deeper)
+	for i, shift := range bidShifts {
+		// Calculate new price - step below lowest bid
+		newPrice := lowestBid * (1.0 - stepPct)
+		newPrice = s.roundToTick(newPrice)
+
+		// Check max depth limit
+		depthFromMid := (mid - newPrice) / mid
+		if depthFromMid > maxDepth {
+			log.Printf("[%s] Shift BID skipped: depth %.2f%% exceeds max %.2f%%",
+				s.Name(), depthFromMid*100, maxDepth*100)
+			continue
+		}
+
+		// Check min depth (don't place too close to mid)
+		if depthFromMid < minDepth {
+			newPrice = mid * (1.0 - minDepth)
+			newPrice = s.roundToTick(newPrice)
+		}
+
+		// Calculate qty similar to fill qty with jitter
+		qty := shift.fillQty * (0.9 + rand.Float64()*0.2) // 90%-110% of fill qty
+		qty = s.roundToStep(qty)
+
+		notional := newPrice * qty
+		if notional < s.minNotional {
+			qty = s.minNotional / newPrice * 1.1
+			qty = s.roundToStep(qty)
+			notional = newPrice * qty
+		}
+
+		// Check balance
+		if notional > balance.QuoteFree*0.95 {
+			log.Printf("[%s] Shift BID skipped: insufficient quote balance", s.Name())
+			continue
+		}
+
+		ordersToAdd = append(ordersToAdd, core.DesiredOrder{
+			Side:       "BUY",
+			Price:      newPrice,
+			Qty:        qty,
+			LevelIndex: 0,
+			Tag:        fmt.Sprintf("DFS_%s_B%d", batchID, i),
+		})
+
+		// Update lowest for next iteration
+		lowestBid = newPrice
+
+		log.Printf("[%s] Shift BID: adding order at %.8f x %.4f (depth=%.2f%%, after fill at %.8f)",
+			s.Name(), newPrice, qty, depthFromMid*100, shift.fillPrice)
+	}
+
+	// Process ASK shifts - add order above highest ask (deeper)
+	for i, shift := range askShifts {
+		// Calculate new price - step above highest ask
+		newPrice := highestAsk * (1.0 + stepPct)
+		newPrice = s.roundToTick(newPrice)
+
+		// Check max depth limit
+		depthFromMid := (newPrice - mid) / mid
+		if depthFromMid > maxDepth {
+			log.Printf("[%s] Shift ASK skipped: depth %.2f%% exceeds max %.2f%%",
+				s.Name(), depthFromMid*100, maxDepth*100)
+			continue
+		}
+
+		// Check min depth (don't place too close to mid)
+		if depthFromMid < minDepth {
+			newPrice = mid * (1.0 + minDepth)
+			newPrice = s.roundToTick(newPrice)
+		}
+
+		// Calculate qty similar to fill qty with jitter
+		qty := shift.fillQty * (0.9 + rand.Float64()*0.2) // 90%-110% of fill qty
+		qty = s.roundToStep(qty)
+
+		notional := newPrice * qty
+		if notional < s.minNotional {
+			qty = s.minNotional / newPrice * 1.1
+			qty = s.roundToStep(qty)
+		}
+
+		// Check balance
+		if qty > balance.BaseFree*0.95 {
+			log.Printf("[%s] Shift ASK skipped: insufficient base balance", s.Name())
+			continue
+		}
+
+		ordersToAdd = append(ordersToAdd, core.DesiredOrder{
+			Side:       "SELL",
+			Price:      newPrice,
+			Qty:        qty,
+			LevelIndex: 0,
+			Tag:        fmt.Sprintf("DFS_%s_A%d", batchID, i),
+		})
+
+		// Update highest for next iteration
+		highestAsk = newPrice
+
+		log.Printf("[%s] Shift ASK: adding order at %.8f x %.4f (depth=%.2f%%, after fill at %.8f)",
+			s.Name(), newPrice, qty, depthFromMid*100, shift.fillPrice)
+	}
+
+	return ordersToAdd
 }

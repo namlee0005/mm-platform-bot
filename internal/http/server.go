@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"mm-platform-engine/internal/exchange"
+
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 // Server represents the HTTP server for health checks and metrics
@@ -34,7 +36,8 @@ func (s *Server) Start(ctx context.Context) error {
 	// Register handlers
 	mux.HandleFunc("/healthz", s.handleHealth)
 	mux.HandleFunc("/readyz", s.handleReady)
-	mux.HandleFunc("/metrics", s.handleMetrics)
+	mux.HandleFunc("/metrics", s.handleMetrics)          // Prometheus format
+	mux.HandleFunc("/metrics-json", s.handleMetricsJSON) // JSON format (legacy)
 	mux.HandleFunc("/orders", s.handleOrders)
 
 	s.server = &http.Server{
@@ -105,10 +108,14 @@ func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// handleMetrics handles metrics requests
+// handleMetrics handles Prometheus metrics requests
 func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
-	// Return basic metrics
-	// In a real implementation, this would return Prometheus-style metrics
+	// Serve Prometheus metrics
+	promhttp.Handler().ServeHTTP(w, r)
+}
+
+// handleMetricsJSON handles JSON metrics requests (legacy endpoint)
+func (s *Server) handleMetricsJSON(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	if err := json.NewEncoder(w).Encode(map[string]interface{}{

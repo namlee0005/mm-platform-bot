@@ -27,8 +27,9 @@ type SimpleMakerConfig struct {
 	RecoveryHours       float64 `json:"recovery_hours"`         // Target recovery time (default 48h)
 	MaxRecoverySizeMult float64 `json:"max_recovery_size_mult"` // Min size during recovery (default 30%)
 
-	// Debug settings
-	DebugCancelSleep bool `json:"debug_cancel_sleep"` // Sleep 30s after cancel for WebSocket debug
+	// Callbacks
+	OnModeChange strategy.ModeChangeCallback `json:"-"` // Called when drawdown mode changes
+	OnBalanceLow strategy.BalanceLowCallback `json:"-"` // Called when balance is too low
 }
 
 // NewSimpleMaker creates a new SimpleMaker bot using BaseBot + SimpleLadderStrategy.
@@ -41,14 +42,15 @@ func NewSimpleMaker(
 ) *core.BaseBot {
 	// Create base bot config
 	baseCfg := &core.BaseBotConfig{
-		Symbol:         cfg.Symbol,
-		BaseAsset:      cfg.BaseAsset,
-		QuoteAsset:     cfg.QuoteAsset,
-		Exchange:       cfg.Exchange,
-		ExchangeID:     cfg.ExchangeID,
-		BotID:          cfg.BotID,
-		BotType:        cfg.BotType,
-		TickIntervalMs: cfg.TickIntervalMs,
+		Symbol:               cfg.Symbol,
+		BaseAsset:            cfg.BaseAsset,
+		QuoteAsset:           cfg.QuoteAsset,
+		Exchange:             cfg.Exchange,
+		ExchangeID:           cfg.ExchangeID,
+		BotID:                cfg.BotID,
+		BotType:              cfg.BotType,
+		TickIntervalMs:       cfg.TickIntervalMs,
+		SyncOrdersIntervalMs: 0, // Sync every tick (few orders ~6)
 	}
 
 	// Create strategy config - just pass embedded config + strategy-specific fields
@@ -60,7 +62,8 @@ func NewSimpleMaker(
 		DrawdownReducePct:   cfg.DrawdownReducePct,
 		RecoveryHours:       cfg.RecoveryHours,
 		MaxRecoverySizeMult: cfg.MaxRecoverySizeMult,
-		DebugCancelSleep:    cfg.DebugCancelSleep,
+		OnModeChange:        cfg.OnModeChange, // Pass through for notifications
+		OnBalanceLow:        cfg.OnBalanceLow, // Pass through for balance alerts
 	}
 
 	// Create strategy

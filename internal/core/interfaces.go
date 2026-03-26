@@ -220,6 +220,11 @@ type BaseBotConfig struct {
 
 	// Price source
 	UseLastTradePrice bool // Use last trade price instead of mid (bid+ask)/2
+
+	// Order sync interval (ms). 0 = sync every tick, >0 = sync every N ms
+	// Use 0 for strategies with few orders (simple_ladder ~6 orders)
+	// Use 300000 (5min) for strategies with many orders (depth_filler ~50 orders)
+	SyncOrdersIntervalMs int
 }
 
 // ComputeInventory computes inventory metrics based on balance and mid price

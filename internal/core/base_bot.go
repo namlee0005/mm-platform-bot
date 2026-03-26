@@ -45,6 +45,7 @@ type BaseBot struct {
 	tickCount           int
 	configCheckInterval int
 	lastTickTime        int64
+	lastSyncTime        int64 // Last order sync timestamp (ms)
 
 	// Track recently filled orders (to ignore late NEW events)
 	filledOrders map[string]int64 // orderID -> fill timestamp
@@ -328,7 +329,32 @@ func (b *BaseBot) tick() error {
 		return fmt.Errorf("balance failed: %w", err)
 	}
 
-	// 3. Get live orders
+	// 3. Get live orders (sync with exchange based on interval)
+	// SyncOrdersIntervalMs: 0 = every tick, >0 = every N ms
+	shouldSync := false
+	if b.cfg.SyncOrdersIntervalMs == 0 {
+		// Sync every tick
+		shouldSync = true
+	} else if b.cfg.SyncOrdersIntervalMs > 0 {
+		// Sync based on interval
+		elapsed := now - b.lastSyncTime
+		if elapsed >= int64(b.cfg.SyncOrdersIntervalMs) {
+			shouldSync = true
+		}
+	}
+	// Also sync if tracker is empty (first tick or after clear)
+	if b.orderTracker.Count() == 0 {
+		shouldSync = true
+	}
+
+	if shouldSync {
+		if err := b.syncLiveOrders(); err != nil {
+			log.Printf("[%s] WARNING: Failed to sync live orders: %v", b.strategy.Name(), err)
+			// Continue with cached tracker data
+		} else {
+			b.lastSyncTime = now
+		}
+	}
 	liveOrders := b.orderTracker.GetAll()
 
 	// 4. Get recent trades (for VWAP fair price calculation)
@@ -792,9 +818,15 @@ func (b *BaseBot) replaceOrders(desired []DesiredOrder, reason string) error {
 		return nil
 	}
 
-	// Build order requests and track requested prices
+	// Build order requests and track requested values
+	// (CCXT may not return price/qty in response for some exchanges like Bybit)
+	type reqInfo struct {
+		price float64
+		qty   float64
+		side  string
+	}
 	reqs := make([]*exchange.OrderRequest, len(desired))
-	reqPrices := make(map[string]float64) // clientOrderID -> requested price
+	reqInfos := make(map[string]reqInfo) // clientOrderID -> requested info
 	for i, d := range desired {
 		reqs[i] = &exchange.OrderRequest{
 			Symbol:        b.cfg.Symbol,
@@ -804,7 +836,7 @@ func (b *BaseBot) replaceOrders(desired []DesiredOrder, reason string) error {
 			Quantity:      d.Qty,
 			ClientOrderID: d.Tag,
 		}
-		reqPrices[d.Tag] = d.Price
+		reqInfos[d.Tag] = reqInfo{price: d.Price, qty: d.Qty, side: d.Side}
 	}
 
 	// Place orders in batches of 5 to avoid rate limits
@@ -840,14 +872,26 @@ func (b *BaseBot) replaceOrders(desired []DesiredOrder, reason string) error {
 					log.Printf("[%s] Place order failed: %v", b.strategy.Name(), err)
 					continue
 				}
-				b.logOrderPlaced(order, req.ClientOrderID, req.Price)
+				info := reqInfos[req.ClientOrderID]
+				b.logOrderPlaced(order, req.ClientOrderID, info.price, info.qty, info.side)
 			}
 			continue
 		}
 
-		// Log results
+		// Log results — Bybit batch API may not echo ClientOrderID, fallback to price+side lookup
+		priceSideTag := make(map[string]string, len(batch))
+		for _, req := range batch {
+			key := fmt.Sprintf("%.8f_%s", req.Price, req.Side)
+			priceSideTag[key] = req.ClientOrderID
+		}
 		for _, order := range resp.Orders {
-			b.logOrderPlaced(order, order.ClientOrderID, reqPrices[order.ClientOrderID])
+			tag := order.ClientOrderID
+			if tag == "" {
+				key := fmt.Sprintf("%.8f_%s", order.Price, order.Side)
+				tag = priceSideTag[key]
+			}
+			info := reqInfos[tag]
+			b.logOrderPlaced(order, tag, info.price, info.qty, info.side)
 		}
 		for _, errMsg := range resp.Errors {
 			log.Printf("[%s] Order error: %s", b.strategy.Name(), errMsg)
@@ -878,9 +922,15 @@ func (b *BaseBot) amendOrders(toCancel []string, toAdd []DesiredOrder, reason st
 		return nil
 	}
 
-	// Build order requests and track requested prices
+	// Build order requests and track requested values
+	// (CCXT may not return price/qty in response for some exchanges like Bybit)
+	type reqInfo struct {
+		price float64
+		qty   float64
+		side  string
+	}
 	reqs := make([]*exchange.OrderRequest, len(toAdd))
-	reqPrices := make(map[string]float64) // clientOrderID -> requested price
+	reqInfos := make(map[string]reqInfo) // clientOrderID -> requested info
 	for i, d := range toAdd {
 		reqs[i] = &exchange.OrderRequest{
 			Symbol:        b.cfg.Symbol,
@@ -890,7 +940,7 @@ func (b *BaseBot) amendOrders(toCancel []string, toAdd []DesiredOrder, reason st
 			Quantity:      d.Qty,
 			ClientOrderID: d.Tag,
 		}
-		reqPrices[d.Tag] = d.Price
+		reqInfos[d.Tag] = reqInfo{price: d.Price, qty: d.Qty, side: d.Side}
 	}
 
 	// Place orders in batches of 5 to avoid rate limits
@@ -926,14 +976,26 @@ func (b *BaseBot) amendOrders(toCancel []string, toAdd []DesiredOrder, reason st
 					log.Printf("[%s] Place order failed: %v", b.strategy.Name(), err)
 					continue
 				}
-				b.logOrderPlaced(order, req.ClientOrderID, req.Price)
+				info := reqInfos[req.ClientOrderID]
+				b.logOrderPlaced(order, req.ClientOrderID, info.price, info.qty, info.side)
 			}
 			continue
 		}
 
-		// Log results
+		// Log results — Bybit batch API may not echo ClientOrderID, fallback to price+side lookup
+		priceSideTag := make(map[string]string, len(batch))
+		for _, req := range batch {
+			key := fmt.Sprintf("%.8f_%s", req.Price, req.Side)
+			priceSideTag[key] = req.ClientOrderID
+		}
 		for _, order := range resp.Orders {
-			b.logOrderPlaced(order, order.ClientOrderID, reqPrices[order.ClientOrderID])
+			tag := order.ClientOrderID
+			if tag == "" {
+				key := fmt.Sprintf("%.8f_%s", order.Price, order.Side)
+				tag = priceSideTag[key]
+			}
+			info := reqInfos[tag]
+			b.logOrderPlaced(order, tag, info.price, info.qty, info.side)
 		}
 		for _, errMsg := range resp.Errors {
 			log.Printf("[%s] Order error: %s", b.strategy.Name(), errMsg)
@@ -943,26 +1005,34 @@ func (b *BaseBot) amendOrders(toCancel []string, toAdd []DesiredOrder, reason st
 	return nil
 }
 
-func (b *BaseBot) logOrderPlaced(order *exchange.Order, tag string, requestedPrice float64) {
+func (b *BaseBot) logOrderPlaced(order *exchange.Order, tag string, requestedPrice, requestedQty float64, requestedSide string) {
 	level := parseLevelFromTag(tag)
-	log.Printf("[%s] Placed %s L%d @ %.8f x %.6f (id=%s)",
-		b.strategy.Name(), order.Side, level, order.Price, order.Quantity, order.OrderID)
 
-	// Use requestedPrice for orderTracker (matches cached ladder for diffing)
-	// If requestedPrice is 0, fall back to exchange price
-	priceForTracker := requestedPrice
-	if priceForTracker == 0 {
-		priceForTracker = order.Price
+	// Use requested values for logging (CCXT may not return these in response for some exchanges)
+	logPrice := requestedPrice
+	logQty := requestedQty
+	logSide := requestedSide
+	if logPrice == 0 {
+		logPrice = order.Price
 	}
+	if logQty == 0 {
+		logQty = order.Quantity
+	}
+	if logSide == "" {
+		logSide = order.Side
+	}
+
+	log.Printf("[%s] Placed %s L%d @ %.8f x %.6f (id=%s)",
+		b.strategy.Name(), logSide, level, logPrice, logQty, order.OrderID)
 
 	// Add to orderTracker immediately (don't wait for WebSocket NEW event)
 	b.orderTracker.Add(&LiveOrder{
 		OrderID:       order.OrderID,
 		ClientOrderID: tag,
-		Side:          order.Side,
-		Price:         priceForTracker,
-		Qty:           order.Quantity,
-		RemainingQty:  order.Quantity,
+		Side:          logSide,
+		Price:         logPrice,
+		Qty:           logQty,
+		RemainingQty:  logQty,
 		LevelIndex:    level,
 		PlacedAt:      time.Now(),
 	})

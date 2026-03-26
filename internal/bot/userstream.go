@@ -2,6 +2,7 @@ package bot
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"strings"
 	"time"
@@ -103,6 +104,8 @@ func (b *Bot) handleFill(event *types.FillEvent) {
 	log.Printf("✅ [USER STREAM] FILL: %s %s %.8f @ %.8f (TradeID: %s, OrderID: %s)",
 		event.Symbol, event.Side, event.Quantity, event.Price, event.TradeID, event.OrderID)
 
+	notional := event.Price * event.Quantity
+
 	// Record fill in metrics aggregator
 	if b.metricsAgg != nil {
 		side := types.OrderSideBuy
@@ -120,8 +123,24 @@ func (b *Bot) handleFill(event *types.FillEvent) {
 			if ttfSec > 0 && ttfSec < 3600 { // Sanity check: TTF < 1 hour
 				b.metricsAgg.RecordTimeToFill(ttfSec)
 				log.Printf("   ⏱️  TTF: %.2f seconds", ttfSec)
+
+				// Record TTF in Prometheus
+				if b.promMetrics != nil {
+					b.promMetrics.TimeToFillSecs.Observe(ttfSec)
+				}
 			}
 		}
+	}
+
+	// Record fill in Prometheus metrics
+	if b.promMetrics != nil {
+		b.promMetrics.RecordFill(event.Side, event.Price, event.Quantity)
+	}
+
+	// Send Telegram notification for fills
+	if b.telegram != nil {
+		isFull := true // Assume full fill for now (could check event.IsMaker or remaining qty)
+		b.telegram.NotifyFill(event.Side, event.Price, event.Quantity, notional, isFull)
 	}
 
 	// Set bot metadata before saving
@@ -147,6 +166,16 @@ func (b *Bot) handleStreamError(err error) {
 	log.Printf("❌ [USER STREAM] WebSocket ERROR: %v", err)
 	log.Println("⚠️  User stream connection lost - attempting to reconnect...")
 
+	// Record error in Prometheus
+	if b.promMetrics != nil {
+		b.promMetrics.RecordError("websocket_disconnect")
+	}
+
+	// Send Telegram notification
+	if b.telegram != nil {
+		b.telegram.NotifyConnectionLost("UserStream WebSocket", err)
+	}
+
 	// Attempt to reconnect
 	go b.reconnectUserStream()
 }
@@ -161,6 +190,7 @@ func (b *Bot) reconnectUserStream() {
 		return
 	}
 	b.reconnecting = true
+	disconnectTime := time.Now()
 	b.reconnectMu.Unlock()
 
 	defer func() {
@@ -202,12 +232,24 @@ func (b *Bot) reconnectUserStream() {
 		log.Println("✅ User stream reconnected successfully!")
 		b.streamConnected = true
 		b.lastMessageTime = time.Now()
+
+		// Send Telegram notification for successful reconnection
+		if b.telegram != nil {
+			downtime := time.Since(disconnectTime)
+			b.telegram.NotifyConnectionRestored("UserStream WebSocket", downtime)
+		}
+
 		return
 	}
 
 	log.Printf("❌ Failed to reconnect user stream after %d attempts", maxRetries)
 	log.Println("⚠️  Bot will continue without real-time updates")
 	b.streamConnected = false
+
+	// Send critical error notification
+	if b.telegram != nil {
+		b.telegram.NotifyError("reconnect_failed", fmt.Errorf("failed after %d attempts", maxRetries), "UserStream WebSocket")
+	}
 }
 
 // checkForCompletedDeals checks if a fill completes a grid deal

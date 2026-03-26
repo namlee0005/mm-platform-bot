@@ -11,7 +11,6 @@ import (
 	"mm-platform-engine/internal/utils"
 	"strconv"
 	"strings"
-	"sync"
 )
 
 // OrderResult represents the result of placing an order
@@ -97,6 +96,37 @@ func (b *Bot) run(ctx context.Context) error {
 			i, o.Side, o.Price, o.Qty, o.Price*o.Qty, o.Tag)
 	}
 	fmt.Printf("=================================\n\n")
+
+	// Update Prometheus metrics
+	if b.promMetrics != nil {
+		// Market data metrics
+		b.promMetrics.UpdateMarketData(mid, marketData.BestBid, marketData.BestAsk)
+
+		// NAV metrics
+		peakNAV := totalValue // Simplified - in production, track actual peak
+		if b.state != nil && b.state.PeakNAV > peakNAV {
+			peakNAV = b.state.PeakNAV
+		} else if b.state != nil {
+			b.state.PeakNAV = peakNAV
+		}
+		drawdownPct := 0.0
+		if peakNAV > 0 {
+			drawdownPct = (peakNAV - totalValue) / peakNAV
+		}
+		b.promMetrics.UpdateNAV(totalValue, peakNAV, drawdownPct, currentInvRatio)
+
+		// Live orders count
+		bidCount := 0
+		askCount := 0
+		for _, o := range plan.Orders {
+			if o.Side == types.OrderSideBuy {
+				bidCount++
+			} else {
+				askCount++
+			}
+		}
+		b.promMetrics.UpdateLiveOrders(bidCount, askCount)
+	}
 
 	// Execute the plan
 	if err := b.executePlan(ctx, plan, marketData); err != nil {
@@ -663,58 +693,4 @@ func (b *Bot) executePlan(ctx context.Context, plan types.ReplacePlan, marketDat
 	default:
 		return fmt.Errorf("unknown action: %v", plan.Action)
 	}
-}
-
-// placeOrdersConcurrently places multiple orders concurrently using goroutines
-func (b *Bot) placeOrdersConcurrently(ctx context.Context, symbol string, orders []types.OrderIntent) []OrderResult {
-	results := make([]OrderResult, len(orders))
-	var wg sync.WaitGroup
-
-	for i, orderIntent := range orders {
-		wg.Add(1)
-		go func(idx int, intent types.OrderIntent) {
-			defer wg.Done()
-
-			// Convert OrderIntent to OrderRequest
-			side := "BUY"
-			if intent.Side == types.OrderSideSell {
-				side = "SELL"
-			}
-
-			orderReq := &exchange.OrderRequest{
-				Symbol:        symbol,
-				Side:          side,
-				Type:          "LIMIT",
-				Price:         intent.Price,
-				Quantity:      intent.Qty,
-				ClientOrderID: intent.Tag,
-			}
-
-			// Place order
-			order, err := b.exchange.PlaceOrder(ctx, orderReq)
-			if err != nil {
-				results[idx] = OrderResult{
-					Tag:   intent.Tag,
-					Side:  side,
-					Price: intent.Price,
-					Qty:   intent.Qty,
-					Error: err,
-				}
-				return
-			}
-
-			results[idx] = OrderResult{
-				OrderID: order.OrderID,
-				Tag:     intent.Tag,
-				Side:    side,
-				Price:   intent.Price,
-				Qty:     intent.Qty,
-				Error:   nil,
-			}
-		}(i, orderIntent)
-	}
-
-	// Wait for all goroutines to complete
-	wg.Wait()
-	return results
 }

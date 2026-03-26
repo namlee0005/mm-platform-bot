@@ -10,9 +10,9 @@ import (
 
 	"mm-platform-engine/internal/config"
 	"mm-platform-engine/internal/exchange"
-	"mm-platform-engine/internal/exchange/gate"
-	"mm-platform-engine/internal/exchange/mexc"
 	"mm-platform-engine/internal/http"
+	"mm-platform-engine/internal/metrics"
+	"mm-platform-engine/internal/notify"
 	"mm-platform-engine/internal/store"
 	"mm-platform-engine/internal/types"
 )
@@ -25,6 +25,11 @@ type Bot struct {
 	redis             *store.RedisStore
 	mongo             *store.MongoStore
 	http              *http.Server
+
+	// Observability
+	promMetrics *metrics.Metrics
+	telegram    *notify.TelegramNotifier
+	startTime   time.Time
 
 	// State
 	mu         sync.RWMutex
@@ -47,22 +52,21 @@ type Bot struct {
 
 // NewBot New creates a new Bot instance
 func NewBot(cfg *config.Config) (*Bot, error) {
-	// Create exchange client based on exchange name
-	var exchangeClient exchange.Exchange
+	// Create exchange client using CCXT adapter
 	exchangeName := strings.ToLower(cfg.ExchangeName)
+	sandbox := cfg.ExchangeBaseURL != "" && strings.Contains(cfg.ExchangeBaseURL, "testnet")
 
-	switch exchangeName {
-	case "mexc":
-		exchangeClient = mexc.NewClient(cfg.ExchangeAPIKey, cfg.ExchangeAPISecret, cfg.ExchangeBaseURL)
-		log.Printf("Using MEXC exchange client")
-	case "gate":
-		// Convert symbol to Gate.io format (e.g., "BTCUSDT" -> "BTC_USDT")
-		gateSymbol := convertToGateSymbol(cfg.TradingConfig.Symbol)
-		exchangeClient = gate.NewClient(cfg.ExchangeAPIKey, cfg.ExchangeAPISecret, cfg.ExchangeBaseURL, gateSymbol)
-		log.Printf("Using Gate.io exchange client for %s", gateSymbol)
-	default:
-		return nil, fmt.Errorf("unsupported exchange: %s (supported: mexc, gate)", cfg.ExchangeName)
+	exchangeClient, err := exchange.NewCCXTExchange(
+		exchangeName,
+		cfg.ExchangeAPIKey,
+		cfg.ExchangeAPISecret,
+		cfg.TradingConfig.Symbol,
+		sandbox,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create exchange client: %w", err)
 	}
+	log.Printf("Using CCXT adapter for %s exchange", exchangeName)
 
 	// Create Redis store
 	redisStore, err := store.NewRedisStore(cfg.RedisAddr, cfg.RedisPassword, cfg.RedisDB)
@@ -80,6 +84,23 @@ func NewBot(cfg *config.Config) (*Bot, error) {
 	// Create HTTP server
 	httpServer := http.NewServer(cfg.HTTPPort, exchangeClient)
 
+	// Initialize Prometheus metrics
+	promMetrics := metrics.NewMetrics(
+		"mmbot",
+		exchangeName,
+		cfg.TradingConfig.Symbol,
+		cfg.UserExchangeKeyID,
+	)
+
+	// Initialize Telegram notifier
+	telegramNotifier := notify.NewTelegramNotifier(notify.TelegramConfig{
+		BotToken: cfg.TelegramBotToken,
+		ChatID:   cfg.TelegramChatID,
+		Exchange: exchangeName,
+		Symbol:   cfg.TradingConfig.Symbol,
+		BotID:    cfg.UserExchangeKeyID,
+	})
+
 	return &Bot{
 		cfg:               cfg,
 		userExchangeKeyID: cfg.UserExchangeKeyID,
@@ -87,6 +108,8 @@ func NewBot(cfg *config.Config) (*Bot, error) {
 		redis:             redisStore,
 		mongo:             mongoStore,
 		http:              httpServer,
+		promMetrics:       promMetrics,
+		telegram:          telegramNotifier,
 		running:           false,
 		cachedBalance:     make(map[string]*types.Balance),
 	}, nil
@@ -102,6 +125,7 @@ func (b *Bot) Start(ctx context.Context) error {
 
 	b.ctx, b.cancel = context.WithCancel(ctx)
 	b.running = true
+	b.startTime = time.Now()
 	b.mu.Unlock()
 
 	log.Println("Starting bot...")
@@ -160,6 +184,12 @@ func (b *Bot) Start(ctx context.Context) error {
 	}
 
 	log.Println("Bot started successfully")
+
+	// Send Telegram notification
+	b.telegram.NotifyBotStarted("simple-maker", map[string]interface{}{
+		"symbol": b.cfg.TradingConfig.Symbol,
+	})
+
 	return nil
 }
 
@@ -191,7 +221,11 @@ func (b *Bot) Stop(ctx context.Context) error {
 
 	b.mu.Lock()
 	b.running = false
+	runtime := time.Since(b.startTime)
 	b.mu.Unlock()
+
+	// Send Telegram notification
+	b.telegram.NotifyBotStopped("graceful shutdown", runtime)
 
 	log.Println("Bot stopped successfully")
 	return nil
@@ -294,7 +328,9 @@ func (b *Bot) checkAndReloadConfig() {
 		SpreadMaxBps:        configUpdate.SimpleConfig.SpreadMaxBps,
 		NumLevels:           configUpdate.SimpleConfig.NumLevels,
 		TargetDepthNotional: configUpdate.SimpleConfig.TargetDepthNotional,
-		TargetRatio:         configUpdate.SimpleConfig.TargetRatio,
+		InitBase:            configUpdate.SimpleConfig.InitBase,
+		InitQuote:           configUpdate.SimpleConfig.InitQuote,
+		PyramidFactor:       configUpdate.SimpleConfig.PyramidFactor,
 		DrawdownLimitPct:    configUpdate.SimpleConfig.DrawdownLimitPct,
 		MaxFillsPerMin:      configUpdate.SimpleConfig.MaxFillsPerMin,
 		SkewK:               configUpdate.SimpleConfig.SkewK,
@@ -326,26 +362,8 @@ func (b *Bot) checkAndReloadConfig() {
 	// Reset engine state to force immediate order placement
 	b.state = &types.EngineState{}
 
-	log.Printf("Config reloaded successfully: TargetRatio=%.2f, QuotePerOrder=%.2f, K=%.2f, Levels=%d",
-		newTradingConfig.TargetRatio,
+	log.Printf("Config reloaded successfully: QuotePerOrder=%.2f, K=%.2f, Levels=%d",
 		newTradingConfig.QuotePerOrder,
 		newTradingConfig.K,
 		len(newTradingConfig.OffsetsBps))
-}
-
-// convertToGateSymbol converts symbol from "BTCUSDT" to "BTC_USDT" format
-func convertToGateSymbol(symbol string) string {
-	// If already contains underscore, return as is
-	if strings.Contains(symbol, "_") {
-		return symbol
-	}
-	// Common quote currencies
-	quotes := []string{"USDT", "USDC", "BTC", "ETH", "USD"}
-	for _, quote := range quotes {
-		if strings.HasSuffix(symbol, quote) {
-			base := strings.TrimSuffix(symbol, quote)
-			return base + "_" + quote
-		}
-	}
-	return symbol
 }

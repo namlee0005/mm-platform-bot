@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"time"
 
 	"mm-platform-engine/internal/types"
@@ -114,28 +115,6 @@ func (s *RedisStore) PublishOrderUpdate(ctx context.Context, order *types.OrderE
 	return nil
 }
 
-// SetInventory stores current inventory (balances) in Redis
-func (s *RedisStore) SetInventory(ctx context.Context, symbol, asset string, quantity float64) error {
-	key := fmt.Sprintf("inventory:%s:%s", symbol, asset)
-	if err := s.client.Set(ctx, key, quantity, 0).Err(); err != nil {
-		return fmt.Errorf("failed to set inventory: %w", err)
-	}
-	return nil
-}
-
-// GetInventory retrieves inventory from Redis
-func (s *RedisStore) GetInventory(ctx context.Context, symbol, asset string) (float64, error) {
-	key := fmt.Sprintf("inventory:%s:%s", symbol, asset)
-	val, err := s.client.Get(ctx, key).Float64()
-	if err == redis.Nil {
-		return 0, nil
-	}
-	if err != nil {
-		return 0, fmt.Errorf("failed to get inventory: %w", err)
-	}
-	return val, nil
-}
-
 // SetBalance stores both free and locked balances in Redis using hash
 func (s *RedisStore) SetBalance(ctx context.Context, symbol, asset string, free, locked float64) error {
 	key := fmt.Sprintf("balance:%s:%s", symbol, asset)
@@ -151,30 +130,6 @@ func (s *RedisStore) SetBalance(ctx context.Context, symbol, asset string, free,
 	}
 
 	return nil
-}
-
-// GetBalance retrieves free and locked balances from Redis
-func (s *RedisStore) GetBalance(ctx context.Context, symbol, asset string) (free, locked float64, err error) {
-	key := fmt.Sprintf("balance:%s:%s", symbol, asset)
-
-	result, err := s.client.HGetAll(ctx, key).Result()
-	if err != nil {
-		return 0, 0, fmt.Errorf("failed to get balance: %w", err)
-	}
-
-	if len(result) == 0 {
-		return 0, 0, nil // No data found
-	}
-
-	// Parse free and locked from hash
-	if freeStr, ok := result["free"]; ok {
-		fmt.Sscanf(freeStr, "%f", &free)
-	}
-	if lockedStr, ok := result["locked"]; ok {
-		fmt.Sscanf(lockedStr, "%f", &locked)
-	}
-
-	return free, locked, nil
 }
 
 // MMBalance represents balance info for MM bot
@@ -207,27 +162,6 @@ func (s *RedisStore) SetMMBalance(ctx context.Context, exchange, symbol, botID s
 	}
 
 	return nil
-}
-
-// GetMMBalance retrieves MM bot balance from Redis
-// Key: balance:{exchange}:{symbol}, Field: {botId}
-func (s *RedisStore) GetMMBalance(ctx context.Context, exchange, symbol, botID string) (*MMBalance, error) {
-	key := fmt.Sprintf("balance:%s:%s", exchange, symbol)
-
-	jsonData, err := s.client.HGet(ctx, key, botID).Result()
-	if err != nil {
-		if err == redis.Nil {
-			return nil, nil // No balance found
-		}
-		return nil, fmt.Errorf("failed to get MM balance: %w", err)
-	}
-
-	var balance MMBalance
-	if err := json.Unmarshal([]byte(jsonData), &balance); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal balance: %w", err)
-	}
-
-	return &balance, nil
 }
 
 // AssetBalance represents balance for a single asset
@@ -293,49 +227,6 @@ func (s *RedisStore) ClearMMBalances(ctx context.Context, exchange, symbol, botI
 	return nil
 }
 
-// GetMMBalances retrieves all bot balances for a symbol from Redis
-// Key: balance:{exchange}:{symbol}
-func (s *RedisStore) GetMMBalances(ctx context.Context, exchange, symbol string) (map[string]*BotBalances, error) {
-	key := fmt.Sprintf("balance:%s:%s", exchange, symbol)
-
-	result, err := s.client.HGetAll(ctx, key).Result()
-	if err != nil {
-		return nil, fmt.Errorf("failed to get MM balances: %w", err)
-	}
-
-	allBalances := make(map[string]*BotBalances)
-	for botID, jsonData := range result {
-		var botBalances BotBalances
-		if err := json.Unmarshal([]byte(jsonData), &botBalances); err != nil {
-			continue
-		}
-		allBalances[botID] = &botBalances
-	}
-
-	return allBalances, nil
-}
-
-// GetBotBalances retrieves balances for a specific bot
-// Key: balance:{exchange}:{symbol}, Field: {botId}
-func (s *RedisStore) GetBotBalances(ctx context.Context, exchange, symbol, botID string) (*BotBalances, error) {
-	key := fmt.Sprintf("balance:%s:%s", exchange, symbol)
-
-	jsonData, err := s.client.HGet(ctx, key, botID).Result()
-	if err != nil {
-		if err == redis.Nil {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("failed to get bot balances: %w", err)
-	}
-
-	var botBalances BotBalances
-	if err := json.Unmarshal([]byte(jsonData), &botBalances); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal balances: %w", err)
-	}
-
-	return &botBalances, nil
-}
-
 // SetStatus stores bot status in Redis
 func (s *RedisStore) SetStatus(ctx context.Context, symbol, status string) error {
 	key := fmt.Sprintf("status:%s", symbol)
@@ -364,6 +255,9 @@ type OrderInfo struct {
 	BotID         string  `json:"botId,omitempty"` // Bot instance ID
 }
 
+// Order list expiration time
+const OrderListExpiration = 6 * time.Hour
+
 // SaveOrder saves order information to Redis List
 // Key format: order:{exchange}:{symbol}
 func (s *RedisStore) SaveOrder(ctx context.Context, order *OrderInfo) error {
@@ -379,8 +273,10 @@ func (s *RedisStore) SaveOrder(ctx context.Context, order *OrderInfo) error {
 		return fmt.Errorf("failed to save order to list: %w", err)
 	}
 
-	// No expiration - orders should persist until explicitly deleted
-	// Active orders need to be visible to new users/clients
+	// Set expiration to prevent unbounded growth (6 hours)
+	if err := s.client.Expire(ctx, key, OrderListExpiration).Err(); err != nil {
+		log.Printf("WARNING: Failed to set order list expiration: %v", err)
+	}
 
 	return nil
 }

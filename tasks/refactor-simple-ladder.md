@@ -1,4 +1,4 @@
-# Refactor Plan: SimpleLadderStrategy
+job # Refactor Plan: SimpleLadderStrategy
 
 ## Issues Identified
 

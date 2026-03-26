@@ -1,0 +1,455 @@
+GOROOT=/Users/coinmaker/sdk/go1.25.5 #gosetup
+GOPATH=/Users/coinmaker/go #gosetup
+/Users/coinmaker/sdk/go1.25.5/bin/go build -o /Users/coinmaker/Library/Caches/JetBrains/GoLand2025.3/tmp/GoLand/___1go_build_mm_platform_engine_cmd_main -gcflags all=-N -l mm-platform-engine/cmd/main #gosetup
+/Applications/GoLand.app/Contents/plugins/go-plugin/lib/dlv/macarm/dlv --listen=127.0.0.1:54128 --headless=true --api-version=2 --check-go-version=false --only-same-user=false exec /Users/coinmaker/Library/Caches/JetBrains/GoLand2025.3/tmp/GoLand/___1go_build_mm_platform_engine_cmd_main -- #gosetup
+API server listening at: 127.0.0.1:54128
+2026/03/25 17:25:23 ========================================
+2026/03/25 17:25:23     Unified Market Making Bot
+2026/03/25 17:25:23 ========================================
+2026/03/25 17:25:23 Loaded configuration from .env file
+2026/03/25 17:25:23 mongoURI: mongodb://root:root32123@47.129.48.106:27017/market_maker?authSource=admin
+2026/03/25 17:25:24 Loaded user exchange key: 69bcba552e0dfda0a397ee13 (keyName: Namkx Test)
+2026/03/25 17:25:24 Loaded exchange: BYBIT (baseUrl: https://api.bybit.com)
+2026/03/25 17:25:24 REDIS_ADDR: 127.0.0.1:6379
+2026/03/25 17:25:24 Successfully decrypted API credentials for key: Namkx Test
+2026/03/25 17:25:24 Loaded simple_config from MongoDB: symbol=AMIUSDT, spread_min_bps=0, spread_max_bps=10, num_levels=5, target_depth=50
+2026/03/25 17:25:24 Converted to TradingConfig: symbol=AMIUSDT, levels=5, quote_per_order=6.00
+2026/03/25 17:25:24 Loaded config for AMIUSDT on BYBIT, bot_type=simple-maker
+2026/03/25 17:25:24 Using CCXT adapter for bybit exchange
+2026/03/25 17:25:24 Connected to Redis
+2026/03/25 17:25:24 Connected to MongoDB
+2026/03/25 17:25:24 [Telegram] Notifier enabled for chat -5073142107
+2026/03/25 17:25:24 SimpleMaker config: spread=40bps, levels=5, depth=$50, cooldown=5000ms
+2026/03/25 17:25:24 Mode: SIMPLE-MAKER (2-sided market maker)
+2026/03/25 17:25:24 [SimpleLadder] Starting simple-maker bot for AMIUSDT...
+2026/03/25 17:25:24 [CCXT:bybit] Starting exchange adapter for AMI/USDT
+2026/03/25 17:25:27 [CCXT:bybit] Markets loaded successfully
+2026/03/25 17:25:27 [CCXT:bybit] Starting WebSocket streams for AMI/USDT
+2026/03/25 17:25:29 [CCXT:bybit] Starting order watcher for AMI/USDT
+2026/03/25 17:25:29 [CCXT:bybit] DEBUG Precision raw - Price: 0x140050c99c0, Amount: 0x140050c99a0
+2026/03/25 17:25:29 [CCXT:bybit] DEBUG Price precision raw value: 1e-06 (type: float64, as int: 0)
+2026/03/25 17:25:29 [CCXT:bybit] TICK_SIZE mode detected: tickSize=1e-06 -> decimalPlaces=6
+2026/03/25 17:25:29 [CCXT:bybit] Starting balance watcher
+2026/03/25 17:25:29 [CCXT:bybit] Starting my trades watcher for symbol=AMI/USDT
+2026/03/25 17:25:29 [CCXT:bybit] Calling WatchMyTrades...
+2026/03/25 17:25:29 [CCXT:bybit] DEBUG Amount precision raw value: 0.1 (type: float64, as int: 0)
+2026/03/25 17:25:29 [CCXT:bybit] TICK_SIZE mode detected: stepSize=0.1 -> decimalPlaces=1
+2026/03/25 17:25:29 [CCXT:bybit] Final precision - Price: 6 decimals, Amount: 1 decimals
+2026/03/25 17:25:30 [SimpleLadder] Synced 0 live orders from exchange
+2026/03/25 17:25:30 [SimpleLadder] Initialized: tickSize=0.00000100, stepSize=0.10000000, minNotional=5.00, maxOrderQty=2000000
+2026/03/25 17:25:30 [SimpleLadder] Started successfully: symbol=AMIUSDT, tick=5000ms
+2026/03/25 17:25:31 [SimpleLadder] Synced 0 live orders from exchange
+2026/03/25 17:25:31 [FairPrice] VWAP: 0.00770774 (trades=25, age=9m49.450945s, volume=27357.80)
+2026/03/25 17:25:31 [FairPrice] Final: 0.00770774 (base=0.00770774, inv_adj=-0.00000000)
+2026/03/25 17:25:31 [SimpleLadder] Maintain BUY: had=0 expected=5 adding=5
+2026/03/25 17:25:31 [SimpleLadder] Maintain ASK: had=0 expected=5 adding=4
+2026/03/25 17:25:31 [SimpleLadder] mid=0.00771600, inv=68.42% (dev=18.42%), orders=0, action=AMEND
+2026/03/25 17:25:31 [SimpleLadder] Amending orders (cancel=0, add=9): maintain: bid=0/5 ask=0/5 cancel=0 add=9
+2026/03/25 17:25:31 [CCXT:bybit] WatchOrders update: order=2178507500754921728 status=open filled=0.000000 price=0.00770400
+2026/03/25 17:25:31 [SimpleLadder] Order 2178507500754921728: BUY @ 0.00770400 status=NEW
+2026/03/25 17:25:31 Bot [simple-maker] is running. Press Ctrl+C to stop.
+2026/03/25 17:25:31 [CCXT:bybit] WatchOrders update: order=2178507500754921728 status=open filled=0.000000 price=0.00770400
+2026/03/25 17:25:31 [CCXT:bybit] WatchOrders update: order=2178507502071933184 status=open filled=0.000000 price=0.00766200
+2026/03/25 17:25:31 [SimpleLadder] Order 2178507502071933184: BUY @ 0.00766200 status=NEW
+2026/03/25 17:25:31 [CCXT:bybit] WatchOrders update: order=2178507500754921728 status=open filled=0.000000 price=0.00770400
+2026/03/25 17:25:31 [CCXT:bybit] WatchOrders update: order=2178507502071933184 status=open filled=0.000000 price=0.00766200
+2026/03/25 17:25:31 [CCXT:bybit] WatchOrders update: order=2178507503237949696 status=open filled=0.000000 price=0.00763700
+2026/03/25 17:25:31 [SimpleLadder] Order 2178507503237949696: BUY @ 0.00763700 status=NEW
+2026/03/25 17:25:31 [CCXT:bybit] WatchOrders update: order=2178507500754921728 status=open filled=0.000000 price=0.00770400
+2026/03/25 17:25:31 [CCXT:bybit] WatchOrders update: order=2178507502071933184 status=open filled=0.000000 price=0.00766200
+2026/03/25 17:25:31 [CCXT:bybit] WatchOrders update: order=2178507503237949696 status=open filled=0.000000 price=0.00763700
+2026/03/25 17:25:31 [CCXT:bybit] WatchOrders update: order=2178507504504629504 status=open filled=0.000000 price=0.00759000
+2026/03/25 17:25:31 [SimpleLadder] Order 2178507504504629504: BUY @ 0.00759000 status=NEW
+2026/03/25 17:25:32 [CCXT:bybit] WatchOrders update: order=2178507500754921728 status=open filled=0.000000 price=0.00770400
+2026/03/25 17:25:32 [CCXT:bybit] WatchOrders update: order=2178507502071933184 status=open filled=0.000000 price=0.00766200
+2026/03/25 17:25:32 [CCXT:bybit] WatchOrders update: order=2178507503237949696 status=open filled=0.000000 price=0.00763700
+2026/03/25 17:25:32 [CCXT:bybit] WatchOrders update: order=2178507504504629504 status=open filled=0.000000 price=0.00759000
+2026/03/25 17:25:32 [CCXT:bybit] WatchOrders update: order=2178507505779697920 status=open filled=0.000000 price=0.00755400
+2026/03/25 17:25:32 [SimpleLadder] Order 2178507505779697920: BUY @ 0.00755400 status=NEW
+2026/03/25 17:25:32 [CCXT:bybit] WatchOrders update: order=2178507500754921728 status=open filled=0.000000 price=0.00770400
+2026/03/25 17:25:32 [CCXT:bybit] WatchOrders update: order=2178507502071933184 status=open filled=0.000000 price=0.00766200
+2026/03/25 17:25:32 [CCXT:bybit] WatchOrders update: order=2178507503237949696 status=open filled=0.000000 price=0.00763700
+2026/03/25 17:25:32 [CCXT:bybit] WatchOrders update: order=2178507504504629504 status=open filled=0.000000 price=0.00759000
+2026/03/25 17:25:32 [CCXT:bybit] WatchOrders update: order=2178507505779697920 status=open filled=0.000000 price=0.00755400
+2026/03/25 17:25:32 [CCXT:bybit] WatchOrders update: order=2178507507088320768 status=open filled=0.000000 price=0.00771200
+2026/03/25 17:25:32 [SimpleLadder] Order 2178507507088320768: SELL @ 0.00771200 status=NEW
+2026/03/25 17:25:32 [CCXT:bybit] WatchOrders update: order=2178507500754921728 status=open filled=0.000000 price=0.00770400
+2026/03/25 17:25:32 [CCXT:bybit] WatchOrders update: order=2178507502071933184 status=open filled=0.000000 price=0.00766200
+2026/03/25 17:25:32 [CCXT:bybit] WatchOrders update: order=2178507503237949696 status=open filled=0.000000 price=0.00763700
+2026/03/25 17:25:32 [CCXT:bybit] WatchOrders update: order=2178507504504629504 status=open filled=0.000000 price=0.00759000
+2026/03/25 17:25:32 [CCXT:bybit] WatchOrders update: order=2178507505779697920 status=open filled=0.000000 price=0.00755400
+2026/03/25 17:25:32 [CCXT:bybit] WatchOrders update: order=2178507507088320768 status=open filled=0.000000 price=0.00771200
+2026/03/25 17:25:32 [CCXT:bybit] WatchOrders update: order=2178507508908648704 status=open filled=0.000000 price=0.00779700
+2026/03/25 17:25:32 [SimpleLadder] Order 2178507508908648704: SELL @ 0.00779700 status=NEW
+2026/03/25 17:25:32 [CCXT:bybit] WatchOrders update: order=2178507500754921728 status=open filled=0.000000 price=0.00770400
+2026/03/25 17:25:32 [CCXT:bybit] WatchOrders update: order=2178507502071933184 status=open filled=0.000000 price=0.00766200
+2026/03/25 17:25:32 [CCXT:bybit] WatchOrders update: order=2178507503237949696 status=open filled=0.000000 price=0.00763700
+2026/03/25 17:25:32 [CCXT:bybit] WatchOrders update: order=2178507504504629504 status=open filled=0.000000 price=0.00759000
+2026/03/25 17:25:32 [CCXT:bybit] WatchOrders update: order=2178507505779697920 status=open filled=0.000000 price=0.00755400
+2026/03/25 17:25:32 [CCXT:bybit] WatchOrders update: order=2178507507088320768 status=open filled=0.000000 price=0.00771200
+2026/03/25 17:25:32 [CCXT:bybit] WatchOrders update: order=2178507508908648704 status=open filled=0.000000 price=0.00779700
+2026/03/25 17:25:32 [CCXT:bybit] WatchOrders update: order=2178507510166939904 status=open filled=0.000000 price=0.00781500
+2026/03/25 17:25:32 [SimpleLadder] Order 2178507510166939904: SELL @ 0.00781500 status=NEW
+2026/03/25 17:25:32 [SimpleLadder] Placed BUY L0 @ 0.00770400 x 748.900000 (id=2178507500754921728)
+2026/03/25 17:25:32 [SimpleLadder] Placed BUY L0 @ 0.00766200 x 1060.000000 (id=2178507502071933184)
+2026/03/25 17:25:32 [SimpleLadder] Placed BUY L0 @ 0.00763700 x 1824.700000 (id=2178507503237949696)
+2026/03/25 17:25:32 [SimpleLadder] Placed BUY L0 @ 0.00759000 x 1034.800000 (id=2178507504504629504)
+2026/03/25 17:25:32 [SimpleLadder] Placed BUY L0 @ 0.00755400 x 2469.300000 (id=2178507505779697920)
+2026/03/25 17:25:32 [SimpleLadder] Placed SELL L0 @ 0.00771200 x 1042.400000 (id=2178507507088320768)
+2026/03/25 17:25:32 [SimpleLadder] Placed SELL L0 @ 0.00779700 x 854.200000 (id=2178507508908648704)
+2026/03/25 17:25:32 [SimpleLadder] Placed SELL L0 @ 0.00781500 x 1839.200000 (id=2178507510166939904)
+2026/03/25 17:25:32 [SimpleLadder] Placed SELL L0 @ 0.00786100 x 2400.100000 (id=2178507511425231104)
+2026/03/25 17:25:32 [CCXT:bybit] WatchOrders update: order=2178507500754921728 status=open filled=0.000000 price=0.00770400
+2026/03/25 17:25:32 [CCXT:bybit] WatchOrders update: order=2178507502071933184 status=open filled=0.000000 price=0.00766200
+2026/03/25 17:25:32 [CCXT:bybit] WatchOrders update: order=2178507503237949696 status=open filled=0.000000 price=0.00763700
+2026/03/25 17:25:32 [CCXT:bybit] WatchOrders update: order=2178507504504629504 status=open filled=0.000000 price=0.00759000
+2026/03/25 17:25:32 [CCXT:bybit] WatchOrders update: order=2178507505779697920 status=open filled=0.000000 price=0.00755400
+2026/03/25 17:25:32 [CCXT:bybit] WatchOrders update: order=2178507507088320768 status=open filled=0.000000 price=0.00771200
+2026/03/25 17:25:32 [CCXT:bybit] WatchOrders update: order=2178507508908648704 status=open filled=0.000000 price=0.00779700
+2026/03/25 17:25:32 [CCXT:bybit] WatchOrders update: order=2178507510166939904 status=open filled=0.000000 price=0.00781500
+2026/03/25 17:25:32 [CCXT:bybit] WatchOrders update: order=2178507511425231104 status=open filled=0.000000 price=0.00786100
+2026/03/25 17:25:32 [SimpleLadder] Order 2178507511425231104: SELL @ 0.00786100 status=NEW
+2026/03/25 17:25:36 [SimpleLadder] Synced 9 live orders from exchange
+2026/03/25 17:25:36 [FairPrice] VWAP: 0.00770774 (trades=25, age=9m54.408788s, volume=27357.80)
+2026/03/25 17:25:36 [FairPrice] Final: 0.00770774 (base=0.00770774, inv_adj=-0.00000000)
+2026/03/25 17:25:36 [SimpleLadder] Maintain ASK: had=4 expected=5 adding=1
+2026/03/25 17:25:36 [SimpleLadder] mid=0.00771600, inv=68.42% (dev=18.42%), orders=9, action=AMEND
+2026/03/25 17:25:36 [SimpleLadder] Amending orders (cancel=0, add=1): maintain: bid=5/5 ask=4/5 cancel=0 add=1
+2026/03/25 17:25:36 [SimpleLadder] Placed SELL L0 @ 0.00786200 x 2312.700000 (id=2178507542278531328)
+2026/03/25 17:25:36 [CCXT:bybit] WatchOrders update: order=2178507500754921728 status=open filled=0.000000 price=0.00770400
+2026/03/25 17:25:36 [CCXT:bybit] WatchOrders update: order=2178507502071933184 status=open filled=0.000000 price=0.00766200
+2026/03/25 17:25:36 [CCXT:bybit] WatchOrders update: order=2178507503237949696 status=open filled=0.000000 price=0.00763700
+2026/03/25 17:25:36 [CCXT:bybit] WatchOrders update: order=2178507504504629504 status=open filled=0.000000 price=0.00759000
+2026/03/25 17:25:36 [CCXT:bybit] WatchOrders update: order=2178507505779697920 status=open filled=0.000000 price=0.00755400
+2026/03/25 17:25:36 [CCXT:bybit] WatchOrders update: order=2178507507088320768 status=open filled=0.000000 price=0.00771200
+2026/03/25 17:25:36 [CCXT:bybit] WatchOrders update: order=2178507508908648704 status=open filled=0.000000 price=0.00779700
+2026/03/25 17:25:36 [CCXT:bybit] WatchOrders update: order=2178507510166939904 status=open filled=0.000000 price=0.00781500
+2026/03/25 17:25:36 [CCXT:bybit] WatchOrders update: order=2178507511425231104 status=open filled=0.000000 price=0.00786100
+2026/03/25 17:25:36 [CCXT:bybit] WatchOrders update: order=2178507542278531328 status=open filled=0.000000 price=0.00786200
+2026/03/25 17:25:36 [SimpleLadder] Order 2178507542278531328: SELL @ 0.00786200 status=NEW
+2026/03/25 17:25:41 [SimpleLadder] Synced 10 live orders from exchange
+2026/03/25 17:25:41 [FairPrice] VWAP: 0.00770774 (trades=25, age=9m59.422743s, volume=27357.80)
+2026/03/25 17:25:41 [FairPrice] Final: 0.00770774 (base=0.00770774, inv_adj=-0.00000000)
+2026/03/25 17:25:41 [SimpleLadder] mid=0.00771600, inv=68.42% (dev=18.42%), orders=10, action=KEEP
+2026/03/25 17:27:21 [FairPrice] VWAP: 0.00770829 (trades=27, age=9m20.806356s, volume=29006.90)
+2026/03/25 17:27:21 [FairPrice] Final: 0.00770829 (base=0.00770829, inv_adj=-0.00000000)
+2026/03/25 17:27:21 [SimpleLadder] mid=0.00770600, inv=68.40% (dev=18.40%), orders=10, action=KEEP
+2026/03/25 17:27:22 [CCXT:bybit] WatchOrders update: order=2178507502071933184 status=open filled=0.000000 price=0.00766200
+2026/03/25 17:27:22 [CCXT:bybit] WatchOrders update: order=2178507503237949696 status=open filled=0.000000 price=0.00763700
+2026/03/25 17:27:22 [CCXT:bybit] WatchOrders update: order=2178507504504629504 status=open filled=0.000000 price=0.00759000
+2026/03/25 17:27:22 [CCXT:bybit] WatchOrders update: order=2178507505779697920 status=open filled=0.000000 price=0.00755400
+2026/03/25 17:27:22 [CCXT:bybit] WatchOrders update: order=2178507507088320768 status=open filled=0.000000 price=0.00771200
+2026/03/25 17:27:22 [CCXT:bybit] WatchOrders update: order=2178507508908648704 status=open filled=0.000000 price=0.00779700
+2026/03/25 17:27:22 [CCXT:bybit] WatchOrders update: order=2178507510166939904 status=open filled=0.000000 price=0.00781500
+2026/03/25 17:27:22 [CCXT:bybit] WatchOrders update: order=2178507511425231104 status=open filled=0.000000 price=0.00786100
+2026/03/25 17:27:22 [CCXT:bybit] WatchOrders update: order=2178507542278531328 status=open filled=0.000000 price=0.00786200
+2026/03/25 17:27:22 [CCXT:bybit] WatchOrders update: order=2178507500754921728 status=closed filled=748.900000 price=0.00770400
+2026/03/25 17:27:22 [FILL] BUY AMIUSDT @ 0.00770400 x 748.900000 (order=2178507500754921728) [FULL]
+2026/03/25 17:27:22 [DEBUG][Fill] order=2178507500754921728 | event_time=17:25:31.446 recv_time=17:27:22.018 latency=1m50.572979s
+2026/03/25 17:27:22 [DEBUG][Fill] FULL - Order removed from tracker: 2178507500754921728
+2026/03/25 17:27:22 [SimpleLadder] 💰 FILL BUY @ 0.00770400 x 748.9000 ($5.77) order=2178507500754921728
+2026/03/25 17:27:22 [WS_EMIT_FILL] side=BUY order=2178507500754921728 price=0.00770400 qty=748.90
+2026/03/25 17:27:26 [SimpleLadder] Synced 9 live orders from exchange
+2026/03/25 17:27:26 [FairPrice] VWAP: 0.00770727 (trades=34, age=9m25.806542s, volume=37299.80)
+2026/03/25 17:27:26 [FairPrice] Final: 0.00770727 (base=0.00770727, inv_adj=-0.00000000)
+2026/03/25 17:27:26 [SimpleLadder] Maintain BUY: had=4 expected=5 adding=1
+2026/03/25 17:27:26 [SimpleLadder] mid=0.00770000, inv=70.45% (dev=20.45%), orders=9, action=AMEND
+2026/03/25 17:27:26 [SimpleLadder] Amending orders (cancel=0, add=1): maintain: bid=4/5 ask=5/5 cancel=0 add=1
+2026/03/25 17:27:26 [SimpleLadder] Placed BUY L0 @ 0.00755300 x 2163.300000 (id=2178508465545505024)
+2026/03/25 17:27:26 [CCXT:bybit] WatchOrders update: order=2178507502071933184 status=open filled=0.000000 price=0.00766200
+2026/03/25 17:27:26 [CCXT:bybit] WatchOrders update: order=2178507503237949696 status=open filled=0.000000 price=0.00763700
+2026/03/25 17:27:26 [CCXT:bybit] WatchOrders update: order=2178507504504629504 status=open filled=0.000000 price=0.00759000
+2026/03/25 17:27:26 [CCXT:bybit] WatchOrders update: order=2178507505779697920 status=open filled=0.000000 price=0.00755400
+2026/03/25 17:27:26 [CCXT:bybit] WatchOrders update: order=2178507507088320768 status=open filled=0.000000 price=0.00771200
+2026/03/25 17:27:26 [CCXT:bybit] WatchOrders update: order=2178507508908648704 status=open filled=0.000000 price=0.00779700
+2026/03/25 17:27:26 [CCXT:bybit] WatchOrders update: order=2178507510166939904 status=open filled=0.000000 price=0.00781500
+2026/03/25 17:27:26 [CCXT:bybit] WatchOrders update: order=2178507511425231104 status=open filled=0.000000 price=0.00786100
+2026/03/25 17:27:26 [CCXT:bybit] WatchOrders update: order=2178507542278531328 status=open filled=0.000000 price=0.00786200
+2026/03/25 17:27:26 [CCXT:bybit] WatchOrders update: order=2178507500754921728 status=closed filled=748.900000 price=0.00770400
+2026/03/25 17:27:26 [CCXT:bybit] WatchOrders update: order=2178508465545505024 status=open filled=0.000000 price=0.00755300
+2026/03/25 17:27:26 [SimpleLadder] Order 2178508465545505024: BUY @ 0.00755300 status=NEW
+2026/03/25 17:27:31 [SimpleLadder] Synced 10 live orders from exchange
+2026/03/25 17:27:31 [FairPrice] VWAP: 0.00770695 (trades=35, age=9m30.755072s, volume=38620.40)
+2026/03/25 17:27:31 [FairPrice] Final: 0.00770695 (base=0.00770695, inv_adj=-0.00000000)
+2026/03/25 17:27:31 [SimpleLadder] mid=0.00769800, inv=70.45% (dev=20.45%), orders=10, action=KEEP
+2026/03/25 17:29:46 [FairPrice] VWAP: 0.00770553 (trades=33, age=9m46.190756s, volume=41379.00)
+2026/03/25 17:29:46 [FairPrice] Final: 0.00770553 (base=0.00770553, inv_adj=-0.00000000)
+2026/03/25 17:29:46 [SimpleLadder] Maintain ASK: had=3 expected=5 adding=2
+2026/03/25 17:29:46 [SimpleLadder] mid=0.00770200, inv=70.46% (dev=20.46%), orders=10, action=AMEND
+2026/03/25 17:29:46 [SimpleLadder] Amending orders (cancel=2, add=2): maintain: bid=5/5 ask=3/5 cancel=2 add=2
+2026/03/25 17:29:46 [SimpleLadder] Cancelled order 2178507511425231104
+2026/03/25 17:29:46 [CCXT:bybit] WatchOrders update: order=2178507502071933184 status=open filled=0.000000 price=0.00766200
+2026/03/25 17:29:46 [CCXT:bybit] WatchOrders update: order=2178507503237949696 status=open filled=0.000000 price=0.00763700
+2026/03/25 17:29:46 [CCXT:bybit] WatchOrders update: order=2178507504504629504 status=open filled=0.000000 price=0.00759000
+2026/03/25 17:29:46 [CCXT:bybit] WatchOrders update: order=2178507505779697920 status=open filled=0.000000 price=0.00755400
+2026/03/25 17:29:46 [CCXT:bybit] WatchOrders update: order=2178507507088320768 status=open filled=0.000000 price=0.00771200
+2026/03/25 17:29:46 [CCXT:bybit] WatchOrders update: order=2178507508908648704 status=open filled=0.000000 price=0.00779700
+2026/03/25 17:29:46 [CCXT:bybit] WatchOrders update: order=2178507510166939904 status=open filled=0.000000 price=0.00781500
+2026/03/25 17:29:46 [CCXT:bybit] WatchOrders update: order=2178507542278531328 status=open filled=0.000000 price=0.00786200
+2026/03/25 17:29:46 [CCXT:bybit] WatchOrders update: order=2178507500754921728 status=closed filled=748.900000 price=0.00770400
+2026/03/25 17:29:46 [CCXT:bybit] WatchOrders update: order=2178508465545505024 status=open filled=0.000000 price=0.00755300
+2026/03/25 17:29:46 [CCXT:bybit] WatchOrders update: order=2178507511425231104 status=canceled filled=0.000000 price=0.00786100
+2026/03/25 17:29:46 [SimpleLadder] Cancelled order 2178507542278531328
+2026/03/25 17:29:46 [CCXT:bybit] WatchOrders update: order=2178507502071933184 status=open filled=0.000000 price=0.00766200
+2026/03/25 17:29:46 [CCXT:bybit] WatchOrders update: order=2178507503237949696 status=open filled=0.000000 price=0.00763700
+2026/03/25 17:29:46 [CCXT:bybit] WatchOrders update: order=2178507504504629504 status=open filled=0.000000 price=0.00759000
+2026/03/25 17:29:46 [CCXT:bybit] WatchOrders update: order=2178507505779697920 status=open filled=0.000000 price=0.00755400
+2026/03/25 17:29:46 [CCXT:bybit] WatchOrders update: order=2178507507088320768 status=open filled=0.000000 price=0.00771200
+2026/03/25 17:29:46 [CCXT:bybit] WatchOrders update: order=2178507508908648704 status=open filled=0.000000 price=0.00779700
+2026/03/25 17:29:46 [CCXT:bybit] WatchOrders update: order=2178507510166939904 status=open filled=0.000000 price=0.00781500
+2026/03/25 17:29:46 [CCXT:bybit] WatchOrders update: order=2178507500754921728 status=closed filled=748.900000 price=0.00770400
+2026/03/25 17:29:46 [CCXT:bybit] WatchOrders update: order=2178508465545505024 status=open filled=0.000000 price=0.00755300
+2026/03/25 17:29:46 [CCXT:bybit] WatchOrders update: order=2178507511425231104 status=canceled filled=0.000000 price=0.00786100
+2026/03/25 17:29:46 [CCXT:bybit] WatchOrders update: order=2178507542278531328 status=canceled filled=0.000000 price=0.00786200
+2026/03/25 17:29:46 [CCXT:bybit] WatchOrders update: order=2178507502071933184 status=open filled=0.000000 price=0.00766200
+2026/03/25 17:29:46 [CCXT:bybit] WatchOrders update: order=2178507503237949696 status=open filled=0.000000 price=0.00763700
+2026/03/25 17:29:46 [CCXT:bybit] WatchOrders update: order=2178507504504629504 status=open filled=0.000000 price=0.00759000
+2026/03/25 17:29:46 [CCXT:bybit] WatchOrders update: order=2178507505779697920 status=open filled=0.000000 price=0.00755400
+2026/03/25 17:29:46 [CCXT:bybit] WatchOrders update: order=2178507507088320768 status=open filled=0.000000 price=0.00771200
+2026/03/25 17:29:46 [CCXT:bybit] WatchOrders update: order=2178507508908648704 status=open filled=0.000000 price=0.00779700
+2026/03/25 17:29:46 [CCXT:bybit] WatchOrders update: order=2178507510166939904 status=open filled=0.000000 price=0.00781500
+2026/03/25 17:29:46 [CCXT:bybit] WatchOrders update: order=2178507500754921728 status=closed filled=748.900000 price=0.00770400
+2026/03/25 17:29:46 [CCXT:bybit] WatchOrders update: order=2178508465545505024 status=open filled=0.000000 price=0.00755300
+2026/03/25 17:29:46 [CCXT:bybit] WatchOrders update: order=2178507511425231104 status=canceled filled=0.000000 price=0.00786100
+2026/03/25 17:29:46 [CCXT:bybit] WatchOrders update: order=2178507542278531328 status=canceled filled=0.000000 price=0.00786200
+2026/03/25 17:29:46 [CCXT:bybit] WatchOrders update: order=2178509642181994752 status=open filled=0.000000 price=0.00786000
+2026/03/25 17:29:46 [SimpleLadder] Order 2178509642181994752: SELL @ 0.00786000 status=NEW
+2026/03/25 17:29:46 [SimpleLadder] Placed SELL L0 @ 0.00786000 x 1787.200000 (id=2178509642181994752)
+2026/03/25 17:29:46 [SimpleLadder] Placed SELL L0 @ 0.00786000 x 1515.900000 (id=2178509643448674560)
+2026/03/25 17:29:46 [CCXT:bybit] WatchOrders update: order=2178507502071933184 status=open filled=0.000000 price=0.00766200
+2026/03/25 17:29:46 [CCXT:bybit] WatchOrders update: order=2178507503237949696 status=open filled=0.000000 price=0.00763700
+2026/03/25 17:29:46 [CCXT:bybit] WatchOrders update: order=2178507504504629504 status=open filled=0.000000 price=0.00759000
+2026/03/25 17:29:46 [CCXT:bybit] WatchOrders update: order=2178507505779697920 status=open filled=0.000000 price=0.00755400
+2026/03/25 17:29:46 [CCXT:bybit] WatchOrders update: order=2178507507088320768 status=open filled=0.000000 price=0.00771200
+2026/03/25 17:29:46 [CCXT:bybit] WatchOrders update: order=2178507508908648704 status=open filled=0.000000 price=0.00779700
+2026/03/25 17:29:46 [CCXT:bybit] WatchOrders update: order=2178507510166939904 status=open filled=0.000000 price=0.00781500
+2026/03/25 17:29:46 [CCXT:bybit] WatchOrders update: order=2178507500754921728 status=closed filled=748.900000 price=0.00770400
+2026/03/25 17:29:46 [CCXT:bybit] WatchOrders update: order=2178508465545505024 status=open filled=0.000000 price=0.00755300
+2026/03/25 17:29:46 [CCXT:bybit] WatchOrders update: order=2178507511425231104 status=canceled filled=0.000000 price=0.00786100
+2026/03/25 17:29:46 [CCXT:bybit] WatchOrders update: order=2178507542278531328 status=canceled filled=0.000000 price=0.00786200
+2026/03/25 17:29:46 [CCXT:bybit] WatchOrders update: order=2178509642181994752 status=open filled=0.000000 price=0.00786000
+2026/03/25 17:29:46 [CCXT:bybit] WatchOrders update: order=2178509643448674560 status=open filled=0.000000 price=0.00786000
+2026/03/25 17:29:46 [SimpleLadder] Order 2178509643448674560: SELL @ 0.00786000 status=NEW
+2026/03/25 17:29:51 [SimpleLadder] Synced 10 live orders from exchange
+2026/03/25 17:29:51 [FairPrice] VWAP: 0.00770553 (trades=33, age=9m51.148479s, volume=41379.00)
+2026/03/25 17:29:51 [FairPrice] Final: 0.00770553 (base=0.00770553, inv_adj=-0.00000000)
+2026/03/25 17:29:51 [SimpleLadder] mid=0.00770200, inv=70.46% (dev=20.46%), orders=10, action=KEEP
+2026/03/25 17:29:56 [SimpleLadder] Synced 10 live orders from exchange
+2026/03/25 17:29:56 [FairPrice] VWAP: 0.00770553 (trades=33, age=9m56.200998s, volume=41379.00)
+2026/03/25 17:29:56 [FairPrice] Final: 0.00770553 (base=0.00770553, inv_adj=-0.00000000)
+2026/03/25 17:29:56 [SimpleLadder] mid=0.00770200, inv=70.46% (dev=20.46%), orders=10, action=KEEP
+2026/03/25 17:30:01 [SimpleLadder] Synced 10 live orders from exchange
+2026/03/25 17:30:01 [FairPrice] VWAP: 0.00770533 (trades=31, age=9m36.29327s, volume=38910.00)
+2026/03/25 17:30:01 [FairPrice] Final: 0.00770533 (base=0.00770533, inv_adj=-0.00000000)
+2026/03/25 17:30:01 [SimpleLadder] Maintain ASK: had=3 expected=5 adding=2
+2026/03/25 17:30:01 [SimpleLadder] mid=0.00770200, inv=70.46% (dev=20.46%), orders=10, action=AMEND
+2026/03/25 17:30:01 [SimpleLadder] Amending orders (cancel=2, add=2): maintain: bid=5/5 ask=3/5 cancel=2 add=2
+2026/03/25 17:30:01 [SimpleLadder] Cancelled order 2178509643448674560
+2026/03/25 17:30:01 [CCXT:bybit] WatchOrders update: order=2178507502071933184 status=open filled=0.000000 price=0.00766200
+2026/03/25 17:30:01 [CCXT:bybit] WatchOrders update: order=2178507503237949696 status=open filled=0.000000 price=0.00763700
+2026/03/25 17:30:01 [CCXT:bybit] WatchOrders update: order=2178507504504629504 status=open filled=0.000000 price=0.00759000
+2026/03/25 17:30:01 [CCXT:bybit] WatchOrders update: order=2178507505779697920 status=open filled=0.000000 price=0.00755400
+2026/03/25 17:30:01 [CCXT:bybit] WatchOrders update: order=2178507507088320768 status=open filled=0.000000 price=0.00771200
+2026/03/25 17:30:01 [CCXT:bybit] WatchOrders update: order=2178507508908648704 status=open filled=0.000000 price=0.00779700
+2026/03/25 17:30:01 [CCXT:bybit] WatchOrders update: order=2178507510166939904 status=open filled=0.000000 price=0.00781500
+2026/03/25 17:30:01 [CCXT:bybit] WatchOrders update: order=2178507500754921728 status=closed filled=748.900000 price=0.00770400
+2026/03/25 17:30:01 [CCXT:bybit] WatchOrders update: order=2178508465545505024 status=open filled=0.000000 price=0.00755300
+2026/03/25 17:30:01 [CCXT:bybit] WatchOrders update: order=2178507511425231104 status=canceled filled=0.000000 price=0.00786100
+2026/03/25 17:30:01 [CCXT:bybit] WatchOrders update: order=2178507542278531328 status=canceled filled=0.000000 price=0.00786200
+2026/03/25 17:30:01 [CCXT:bybit] WatchOrders update: order=2178509642181994752 status=open filled=0.000000 price=0.00786000
+2026/03/25 17:30:01 [CCXT:bybit] WatchOrders update: order=2178509643448674560 status=canceled filled=0.000000 price=0.00786000
+2026/03/25 17:30:01 [SimpleLadder] Cancelled order 2178509642181994752
+2026/03/25 17:30:01 [CCXT:bybit] WatchOrders update: order=2178507502071933184 status=open filled=0.000000 price=0.00766200
+2026/03/25 17:30:01 [CCXT:bybit] WatchOrders update: order=2178507503237949696 status=open filled=0.000000 price=0.00763700
+2026/03/25 17:30:01 [CCXT:bybit] WatchOrders update: order=2178507504504629504 status=open filled=0.000000 price=0.00759000
+2026/03/25 17:30:01 [CCXT:bybit] WatchOrders update: order=2178507505779697920 status=open filled=0.000000 price=0.00755400
+2026/03/25 17:30:01 [CCXT:bybit] WatchOrders update: order=2178507507088320768 status=open filled=0.000000 price=0.00771200
+2026/03/25 17:30:01 [CCXT:bybit] WatchOrders update: order=2178507508908648704 status=open filled=0.000000 price=0.00779700
+2026/03/25 17:30:01 [CCXT:bybit] WatchOrders update: order=2178507510166939904 status=open filled=0.000000 price=0.00781500
+2026/03/25 17:30:01 [CCXT:bybit] WatchOrders update: order=2178507500754921728 status=closed filled=748.900000 price=0.00770400
+2026/03/25 17:30:01 [CCXT:bybit] WatchOrders update: order=2178508465545505024 status=open filled=0.000000 price=0.00755300
+2026/03/25 17:30:01 [CCXT:bybit] WatchOrders update: order=2178507511425231104 status=canceled filled=0.000000 price=0.00786100
+2026/03/25 17:30:01 [CCXT:bybit] WatchOrders update: order=2178507542278531328 status=canceled filled=0.000000 price=0.00786200
+2026/03/25 17:30:01 [CCXT:bybit] WatchOrders update: order=2178509643448674560 status=canceled filled=0.000000 price=0.00786000
+2026/03/25 17:30:01 [CCXT:bybit] WatchOrders update: order=2178509642181994752 status=canceled filled=0.000000 price=0.00786000
+2026/03/25 17:30:01 [CCXT:bybit] WatchOrders update: order=2178507502071933184 status=open filled=0.000000 price=0.00766200
+2026/03/25 17:30:01 [CCXT:bybit] WatchOrders update: order=2178507503237949696 status=open filled=0.000000 price=0.00763700
+2026/03/25 17:30:01 [CCXT:bybit] WatchOrders update: order=2178507504504629504 status=open filled=0.000000 price=0.00759000
+2026/03/25 17:30:01 [CCXT:bybit] WatchOrders update: order=2178507505779697920 status=open filled=0.000000 price=0.00755400
+2026/03/25 17:30:01 [CCXT:bybit] WatchOrders update: order=2178507507088320768 status=open filled=0.000000 price=0.00771200
+2026/03/25 17:30:01 [CCXT:bybit] WatchOrders update: order=2178507508908648704 status=open filled=0.000000 price=0.00779700
+2026/03/25 17:30:01 [CCXT:bybit] WatchOrders update: order=2178507510166939904 status=open filled=0.000000 price=0.00781500
+2026/03/25 17:30:01 [CCXT:bybit] WatchOrders update: order=2178507500754921728 status=closed filled=748.900000 price=0.00770400
+2026/03/25 17:30:01 [CCXT:bybit] WatchOrders update: order=2178508465545505024 status=open filled=0.000000 price=0.00755300
+2026/03/25 17:30:01 [CCXT:bybit] WatchOrders update: order=2178507511425231104 status=canceled filled=0.000000 price=0.00786100
+2026/03/25 17:30:01 [CCXT:bybit] WatchOrders update: order=2178507542278531328 status=canceled filled=0.000000 price=0.00786200
+2026/03/25 17:30:01 [CCXT:bybit] WatchOrders update: order=2178509643448674560 status=canceled filled=0.000000 price=0.00786000
+2026/03/25 17:30:01 [CCXT:bybit] WatchOrders update: order=2178509642181994752 status=canceled filled=0.000000 price=0.00786000
+2026/03/25 17:30:01 [CCXT:bybit] WatchOrders update: order=2178509767348414720 status=open filled=0.000000 price=0.00785900
+2026/03/25 17:30:01 [SimpleLadder] Order 2178509767348414720: SELL @ 0.00785900 status=NEW
+2026/03/25 17:30:01 [SimpleLadder] Placed SELL L0 @ 0.00785900 x 1353.900000 (id=2178509767348414720)
+2026/03/25 17:30:01 [SimpleLadder] Placed SELL L0 @ 0.00785900 x 1528.000000 (id=2178509768606705920)
+2026/03/25 17:30:01 [CCXT:bybit] WatchOrders update: order=2178507502071933184 status=open filled=0.000000 price=0.00766200
+2026/03/25 17:30:01 [CCXT:bybit] WatchOrders update: order=2178507503237949696 status=open filled=0.000000 price=0.00763700
+2026/03/25 17:30:01 [CCXT:bybit] WatchOrders update: order=2178507504504629504 status=open filled=0.000000 price=0.00759000
+2026/03/25 17:30:01 [CCXT:bybit] WatchOrders update: order=2178507505779697920 status=open filled=0.000000 price=0.00755400
+2026/03/25 17:30:01 [CCXT:bybit] WatchOrders update: order=2178507507088320768 status=open filled=0.000000 price=0.00771200
+2026/03/25 17:30:01 [CCXT:bybit] WatchOrders update: order=2178507508908648704 status=open filled=0.000000 price=0.00779700
+2026/03/25 17:30:01 [CCXT:bybit] WatchOrders update: order=2178507510166939904 status=open filled=0.000000 price=0.00781500
+2026/03/25 17:30:01 [CCXT:bybit] WatchOrders update: order=2178507500754921728 status=closed filled=748.900000 price=0.00770400
+2026/03/25 17:30:01 [CCXT:bybit] WatchOrders update: order=2178508465545505024 status=open filled=0.000000 price=0.00755300
+2026/03/25 17:30:01 [CCXT:bybit] WatchOrders update: order=2178507511425231104 status=canceled filled=0.000000 price=0.00786100
+2026/03/25 17:30:01 [CCXT:bybit] WatchOrders update: order=2178507542278531328 status=canceled filled=0.000000 price=0.00786200
+2026/03/25 17:30:01 [CCXT:bybit] WatchOrders update: order=2178509643448674560 status=canceled filled=0.000000 price=0.00786000
+2026/03/25 17:30:01 [CCXT:bybit] WatchOrders update: order=2178509642181994752 status=canceled filled=0.000000 price=0.00786000
+2026/03/25 17:30:01 [CCXT:bybit] WatchOrders update: order=2178509767348414720 status=open filled=0.000000 price=0.00785900
+2026/03/25 17:30:01 [CCXT:bybit] WatchOrders update: order=2178509768606705920 status=open filled=0.000000 price=0.00785900
+2026/03/25 17:30:01 [SimpleLadder] Order 2178509768606705920: SELL @ 0.00785900 status=NEW
+2026/03/25 17:37:06 [SimpleLadder] Synced 10 live orders from exchange
+2026/03/25 17:37:06 [FairPrice] VWAP: 0.00770375 (trades=27, age=9m56.257562s, volume=40792.30)
+2026/03/25 17:37:06 [FairPrice] Final: 0.00770375 (base=0.00770375, inv_adj=-0.00000000)
+2026/03/25 17:37:06 [SimpleLadder] mid=0.00770200, inv=70.46% (dev=20.46%), orders=10, action=KEEP
+2026/03/25 17:37:08 [CCXT:bybit] WatchOrders update: order=2178507502071933184 status=open filled=0.000000 price=0.00766200
+2026/03/25 17:37:08 [CCXT:bybit] WatchOrders update: order=2178507503237949696 status=open filled=0.000000 price=0.00763700
+2026/03/25 17:37:08 [CCXT:bybit] WatchOrders update: order=2178507504504629504 status=open filled=0.000000 price=0.00759000
+2026/03/25 17:37:08 [CCXT:bybit] WatchOrders update: order=2178507505779697920 status=open filled=0.000000 price=0.00755400
+2026/03/25 17:37:08 [CCXT:bybit] WatchOrders update: order=2178507508908648704 status=open filled=0.000000 price=0.00779700
+2026/03/25 17:37:08 [CCXT:bybit] WatchOrders update: order=2178507510166939904 status=open filled=0.000000 price=0.00781500
+2026/03/25 17:37:08 [CCXT:bybit] WatchOrders update: order=2178507500754921728 status=closed filled=748.900000 price=0.00770400
+2026/03/25 17:37:08 [CCXT:bybit] WatchOrders update: order=2178508465545505024 status=open filled=0.000000 price=0.00755300
+2026/03/25 17:37:08 [CCXT:bybit] WatchOrders update: order=2178507511425231104 status=canceled filled=0.000000 price=0.00786100
+2026/03/25 17:37:08 [CCXT:bybit] WatchOrders update: order=2178507542278531328 status=canceled filled=0.000000 price=0.00786200
+2026/03/25 17:37:09 [CCXT:bybit] WatchOrders update: order=2178509643448674560 status=canceled filled=0.000000 price=0.00786000
+2026/03/25 17:37:09 [CCXT:bybit] WatchOrders update: order=2178509642181994752 status=canceled filled=0.000000 price=0.00786000
+2026/03/25 17:37:09 [CCXT:bybit] WatchOrders update: order=2178509767348414720 status=open filled=0.000000 price=0.00785900
+2026/03/25 17:37:09 [CCXT:bybit] WatchOrders update: order=2178509768606705920 status=open filled=0.000000 price=0.00785900
+2026/03/25 17:37:09 [CCXT:bybit] WatchOrders update: order=2178507507088320768 status=closed filled=1042.400000 price=0.00771200
+2026/03/25 17:37:09 [FILL] SELL AMIUSDT @ 0.00771200 x 1042.400000 (order=2178507507088320768) [FULL]
+2026/03/25 17:37:09 [DEBUG][Fill] order=2178507507088320768 | event_time=17:25:32.202 recv_time=17:37:09.023 latency=11m36.821698s
+2026/03/25 17:37:09 [DEBUG][Fill] FULL - Order removed from tracker: 2178507507088320768
+2026/03/25 17:37:09 [SimpleLadder] 💰 FILL SELL @ 0.00771200 x 1042.4000 ($8.04) order=2178507507088320768
+2026/03/25 17:37:09 [WS_EMIT_FILL] side=SELL order=2178507507088320768 price=0.00771200 qty=1042.40
+2026/03/25 17:37:11 [SimpleLadder] Synced 9 live orders from exchange
+2026/03/25 17:37:11 [FairPrice] VWAP: 0.00770415 (trades=30, age=9m49.251899s, volume=44515.10)
+2026/03/25 17:37:11 [FairPrice] Final: 0.00770415 (base=0.00770415, inv_adj=-0.00000000)
+2026/03/25 17:37:11 [SimpleLadder] Maintain ASK: had=4 expected=5 adding=1
+2026/03/25 17:37:11 [SimpleLadder] mid=0.00771200, inv=67.60% (dev=17.60%), orders=9, action=AMEND
+2026/03/25 17:37:11 [SimpleLadder] Amending orders (cancel=0, add=1): maintain: bid=5/5 ask=4/5 cancel=0 add=1
+2026/03/25 17:37:11 [SimpleLadder] Placed SELL L0 @ 0.00785800 x 1904.600000 (id=2178513372864407808)
+2026/03/25 17:37:11 [CCXT:bybit] WatchOrders update: order=2178507502071933184 status=open filled=0.000000 price=0.00766200
+2026/03/25 17:37:11 [CCXT:bybit] WatchOrders update: order=2178507503237949696 status=open filled=0.000000 price=0.00763700
+2026/03/25 17:37:11 [CCXT:bybit] WatchOrders update: order=2178507504504629504 status=open filled=0.000000 price=0.00759000
+2026/03/25 17:37:11 [CCXT:bybit] WatchOrders update: order=2178507505779697920 status=open filled=0.000000 price=0.00755400
+2026/03/25 17:37:11 [CCXT:bybit] WatchOrders update: order=2178507508908648704 status=open filled=0.000000 price=0.00779700
+2026/03/25 17:37:11 [CCXT:bybit] WatchOrders update: order=2178507510166939904 status=open filled=0.000000 price=0.00781500
+2026/03/25 17:37:11 [CCXT:bybit] WatchOrders update: order=2178507500754921728 status=closed filled=748.900000 price=0.00770400
+2026/03/25 17:37:11 [CCXT:bybit] WatchOrders update: order=2178508465545505024 status=open filled=0.000000 price=0.00755300
+2026/03/25 17:37:11 [CCXT:bybit] WatchOrders update: order=2178507511425231104 status=canceled filled=0.000000 price=0.00786100
+2026/03/25 17:37:11 [CCXT:bybit] WatchOrders update: order=2178507542278531328 status=canceled filled=0.000000 price=0.00786200
+2026/03/25 17:37:11 [CCXT:bybit] WatchOrders update: order=2178509643448674560 status=canceled filled=0.000000 price=0.00786000
+2026/03/25 17:37:11 [CCXT:bybit] WatchOrders update: order=2178509642181994752 status=canceled filled=0.000000 price=0.00786000
+2026/03/25 17:37:11 [CCXT:bybit] WatchOrders update: order=2178509767348414720 status=open filled=0.000000 price=0.00785900
+2026/03/25 17:37:11 [CCXT:bybit] WatchOrders update: order=2178509768606705920 status=open filled=0.000000 price=0.00785900
+2026/03/25 17:37:11 [CCXT:bybit] WatchOrders update: order=2178507507088320768 status=closed filled=1042.400000 price=0.00771200
+2026/03/25 17:37:11 [CCXT:bybit] WatchOrders update: order=2178513372864407808 status=open filled=0.000000 price=0.00785800
+2026/03/25 17:37:11 [SimpleLadder] Order 2178513372864407808: SELL @ 0.00785800 status=NEW
+2026/03/25 17:37:16 [SimpleLadder] Synced 10 live orders from exchange
+2026/03/25 17:37:16 [FairPrice] VWAP: 0.00770415 (trades=30, age=9m54.192404s, volume=44515.10)
+2026/03/25 17:37:16 [FairPrice] Final: 0.00770415 (base=0.00770415, inv_adj=-0.00000000)
+2026/03/25 17:37:16 [SimpleLadder] mid=0.00771200, inv=67.60% (dev=17.60%), orders=10, action=KEEP
+2026/03/25 17:46:21 [SimpleLadder] Synced 10 live orders from exchange
+2026/03/25 17:46:21 [FairPrice] VWAP: 0.00770869 (trades=25, age=9m39.207232s, volume=29634.30)
+2026/03/25 17:46:21 [FairPrice] Final: 0.00770869 (base=0.00770869, inv_adj=-0.00000000)
+2026/03/25 17:46:21 [SimpleLadder] Maintain BUY: had=4 expected=5 adding=1
+2026/03/25 17:46:21 [SimpleLadder] mid=0.00771000, inv=67.59% (dev=17.59%), orders=10, action=AMEND
+2026/03/25 17:46:21 [SimpleLadder] Amending orders (cancel=1, add=2): maintain: bid=4/5 ask=5/5 cancel=1 add=2
+2026/03/25 17:46:21 [SimpleLadder] Cancelled order 2178508465545505024
+2026/03/25 17:46:21 [CCXT:bybit] WatchOrders update: order=2178507502071933184 status=open filled=0.000000 price=0.00766200
+2026/03/25 17:46:21 [CCXT:bybit] WatchOrders update: order=2178507503237949696 status=open filled=0.000000 price=0.00763700
+2026/03/25 17:46:21 [CCXT:bybit] WatchOrders update: order=2178507504504629504 status=open filled=0.000000 price=0.00759000
+2026/03/25 17:46:21 [CCXT:bybit] WatchOrders update: order=2178507505779697920 status=open filled=0.000000 price=0.00755400
+2026/03/25 17:46:21 [CCXT:bybit] WatchOrders update: order=2178507508908648704 status=open filled=0.000000 price=0.00779700
+2026/03/25 17:46:21 [CCXT:bybit] WatchOrders update: order=2178507510166939904 status=open filled=0.000000 price=0.00781500
+2026/03/25 17:46:21 [CCXT:bybit] WatchOrders update: order=2178507500754921728 status=closed filled=748.900000 price=0.00770400
+2026/03/25 17:46:21 [CCXT:bybit] WatchOrders update: order=2178507511425231104 status=canceled filled=0.000000 price=0.00786100
+2026/03/25 17:46:21 [CCXT:bybit] WatchOrders update: order=2178507542278531328 status=canceled filled=0.000000 price=0.00786200
+2026/03/25 17:46:21 [CCXT:bybit] WatchOrders update: order=2178509643448674560 status=canceled filled=0.000000 price=0.00786000
+2026/03/25 17:46:21 [CCXT:bybit] WatchOrders update: order=2178509642181994752 status=canceled filled=0.000000 price=0.00786000
+2026/03/25 17:46:21 [CCXT:bybit] WatchOrders update: order=2178509767348414720 status=open filled=0.000000 price=0.00785900
+2026/03/25 17:46:21 [CCXT:bybit] WatchOrders update: order=2178509768606705920 status=open filled=0.000000 price=0.00785900
+2026/03/25 17:46:21 [CCXT:bybit] WatchOrders update: order=2178507507088320768 status=closed filled=1042.400000 price=0.00771200
+2026/03/25 17:46:21 [CCXT:bybit] WatchOrders update: order=2178513372864407808 status=open filled=0.000000 price=0.00785800
+2026/03/25 17:46:21 [CCXT:bybit] WatchOrders update: order=2178508465545505024 status=canceled filled=0.000000 price=0.00755300
+2026/03/25 17:46:21 [SimpleLadder] Placed BUY L0 @ 0.00755500 x 2237.000000 (id=2178517987378948352)
+2026/03/25 17:46:21 [SimpleLadder] Placed SELL L0 @ 0.00772400 x 763.500000 (id=2178517988788234496)
+2026/03/25 17:46:21 [CCXT:bybit] WatchOrders update: order=2178507502071933184 status=open filled=0.000000 price=0.00766200
+2026/03/25 17:46:21 [CCXT:bybit] WatchOrders update: order=2178507503237949696 status=open filled=0.000000 price=0.00763700
+2026/03/25 17:46:21 [CCXT:bybit] WatchOrders update: order=2178507504504629504 status=open filled=0.000000 price=0.00759000
+2026/03/25 17:46:21 [CCXT:bybit] WatchOrders update: order=2178507505779697920 status=open filled=0.000000 price=0.00755400
+2026/03/25 17:46:21 [CCXT:bybit] WatchOrders update: order=2178507508908648704 status=open filled=0.000000 price=0.00779700
+2026/03/25 17:46:21 [CCXT:bybit] WatchOrders update: order=2178507510166939904 status=open filled=0.000000 price=0.00781500
+2026/03/25 17:46:21 [CCXT:bybit] WatchOrders update: order=2178507500754921728 status=closed filled=748.900000 price=0.00770400
+2026/03/25 17:46:21 [CCXT:bybit] WatchOrders update: order=2178507511425231104 status=canceled filled=0.000000 price=0.00786100
+2026/03/25 17:46:21 [CCXT:bybit] WatchOrders update: order=2178507542278531328 status=canceled filled=0.000000 price=0.00786200
+2026/03/25 17:46:21 [CCXT:bybit] WatchOrders update: order=2178509643448674560 status=canceled filled=0.000000 price=0.00786000
+2026/03/25 17:46:21 [CCXT:bybit] WatchOrders update: order=2178509642181994752 status=canceled filled=0.000000 price=0.00786000
+2026/03/25 17:46:21 [CCXT:bybit] WatchOrders update: order=2178509767348414720 status=open filled=0.000000 price=0.00785900
+2026/03/25 17:46:21 [CCXT:bybit] WatchOrders update: order=2178509768606705920 status=open filled=0.000000 price=0.00785900
+2026/03/25 17:46:21 [CCXT:bybit] WatchOrders update: order=2178507507088320768 status=closed filled=1042.400000 price=0.00771200
+2026/03/25 17:46:21 [CCXT:bybit] WatchOrders update: order=2178513372864407808 status=open filled=0.000000 price=0.00785800
+2026/03/25 17:46:21 [CCXT:bybit] WatchOrders update: order=2178508465545505024 status=canceled filled=0.000000 price=0.00755300
+2026/03/25 17:46:21 [CCXT:bybit] WatchOrders update: order=2178517987378948352 status=open filled=0.000000 price=0.00755500
+2026/03/25 17:46:21 [SimpleLadder] Order 2178517987378948352: BUY @ 0.00755500 status=NEW
+2026/03/25 17:46:21 [CCXT:bybit] WatchOrders update: order=2178517988788234496 status=open filled=0.000000 price=0.00772400
+2026/03/25 17:46:21 [SimpleLadder] Order 2178517988788234496: SELL @ 0.00772400 status=NEW
+2026/03/25 17:46:26 [SimpleLadder] Synced 11 live orders from exchange
+2026/03/25 17:46:26 [FairPrice] VWAP: 0.00770876 (trades=26, age=9m44.152801s, volume=30611.70)
+2026/03/25 17:46:26 [FairPrice] Final: 0.00770876 (base=0.00770876, inv_adj=-0.00000000)
+2026/03/25 17:46:26 [SimpleLadder] mid=0.00771100, inv=67.60% (dev=17.60%), orders=11, action=KEEP
+2026/03/25 17:47:11 [FairPrice] VWAP: 0.00770974 (trades=21, age=9m14.156538s, volume=22658.20)
+2026/03/25 17:47:11 [FairPrice] Final: 0.00770974 (base=0.00770974, inv_adj=-0.00000000)
+2026/03/25 17:47:11 [SimpleLadder] Maintain BUY: had=4 expected=5 adding=1
+2026/03/25 17:47:11 [SimpleLadder] mid=0.00770700, inv=67.58% (dev=17.58%), orders=11, action=AMEND
+2026/03/25 17:47:11 [SimpleLadder] Amending orders (cancel=1, add=1): maintain: bid=4/5 ask=6/5 cancel=1 add=1
+2026/03/25 17:47:11 [SimpleLadder] Cancelled order 2178507505779697920
+2026/03/25 17:47:11 [CCXT:bybit] WatchOrders update: order=2178507502071933184 status=open filled=0.000000 price=0.00766200
+2026/03/25 17:47:11 [CCXT:bybit] WatchOrders update: order=2178507503237949696 status=open filled=0.000000 price=0.00763700
+2026/03/25 17:47:11 [CCXT:bybit] WatchOrders update: order=2178507504504629504 status=open filled=0.000000 price=0.00759000
+2026/03/25 17:47:11 [CCXT:bybit] WatchOrders update: order=2178507508908648704 status=open filled=0.000000 price=0.00779700
+2026/03/25 17:47:11 [CCXT:bybit] WatchOrders update: order=2178507510166939904 status=open filled=0.000000 price=0.00781500
+2026/03/25 17:47:11 [CCXT:bybit] WatchOrders update: order=2178507500754921728 status=closed filled=748.900000 price=0.00770400
+2026/03/25 17:47:11 [CCXT:bybit] WatchOrders update: order=2178507511425231104 status=canceled filled=0.000000 price=0.00786100
+2026/03/25 17:47:11 [CCXT:bybit] WatchOrders update: order=2178507542278531328 status=canceled filled=0.000000 price=0.00786200
+2026/03/25 17:47:11 [CCXT:bybit] WatchOrders update: order=2178509643448674560 status=canceled filled=0.000000 price=0.00786000
+2026/03/25 17:47:11 [CCXT:bybit] WatchOrders update: order=2178509642181994752 status=canceled filled=0.000000 price=0.00786000
+2026/03/25 17:47:11 [CCXT:bybit] WatchOrders update: order=2178509767348414720 status=open filled=0.000000 price=0.00785900
+2026/03/25 17:47:11 [CCXT:bybit] WatchOrders update: order=2178509768606705920 status=open filled=0.000000 price=0.00785900
+2026/03/25 17:47:11 [CCXT:bybit] WatchOrders update: order=2178507507088320768 status=closed filled=1042.400000 price=0.00771200
+2026/03/25 17:47:11 [CCXT:bybit] WatchOrders update: order=2178513372864407808 status=open filled=0.000000 price=0.00785800
+2026/03/25 17:47:11 [CCXT:bybit] WatchOrders update: order=2178508465545505024 status=canceled filled=0.000000 price=0.00755300
+2026/03/25 17:47:11 [CCXT:bybit] WatchOrders update: order=2178517987378948352 status=open filled=0.000000 price=0.00755500
+2026/03/25 17:47:11 [CCXT:bybit] WatchOrders update: order=2178517988788234496 status=open filled=0.000000 price=0.00772400
+2026/03/25 17:47:11 [CCXT:bybit] WatchOrders update: order=2178507505779697920 status=canceled filled=0.000000 price=0.00755400
+2026/03/25 17:47:11 [SimpleLadder] Placed BUY L0 @ 0.00755600 x 1416.500000 (id=2178518406859680000)
+2026/03/25 17:47:11 [CCXT:bybit] WatchOrders update: order=2178507502071933184 status=open filled=0.000000 price=0.00766200
+2026/03/25 17:47:11 [CCXT:bybit] WatchOrders update: order=2178507503237949696 status=open filled=0.000000 price=0.00763700
+2026/03/25 17:47:11 [CCXT:bybit] WatchOrders update: order=2178507504504629504 status=open filled=0.000000 price=0.00759000
+2026/03/25 17:47:11 [CCXT:bybit] WatchOrders update: order=2178507508908648704 status=open filled=0.000000 price=0.00779700
+2026/03/25 17:47:11 [CCXT:bybit] WatchOrders update: order=2178507510166939904 status=open filled=0.000000 price=0.00781500
+2026/03/25 17:47:11 [CCXT:bybit] WatchOrders update: order=2178507500754921728 status=closed filled=748.900000 price=0.00770400
+2026/03/25 17:47:11 [CCXT:bybit] WatchOrders update: order=2178507511425231104 status=canceled filled=0.000000 price=0.00786100
+2026/03/25 17:47:11 [CCXT:bybit] WatchOrders update: order=2178507542278531328 status=canceled filled=0.000000 price=0.00786200
+2026/03/25 17:47:11 [CCXT:bybit] WatchOrders update: order=2178509643448674560 status=canceled filled=0.000000 price=0.00786000
+2026/03/25 17:47:11 [CCXT:bybit] WatchOrders update: order=2178509642181994752 status=canceled filled=0.000000 price=0.00786000
+2026/03/25 17:47:11 [CCXT:bybit] WatchOrders update: order=2178509767348414720 status=open filled=0.000000 price=0.00785900
+2026/03/25 17:47:11 [CCXT:bybit] WatchOrders update: order=2178509768606705920 status=open filled=0.000000 price=0.00785900
+2026/03/25 17:47:11 [CCXT:bybit] WatchOrders update: order=2178507507088320768 status=closed filled=1042.400000 price=0.00771200
+2026/03/25 17:47:11 [CCXT:bybit] WatchOrders update: order=2178513372864407808 status=open filled=0.000000 price=0.00785800
+2026/03/25 17:47:11 [CCXT:bybit] WatchOrders update: order=2178508465545505024 status=canceled filled=0.000000 price=0.00755300
+2026/03/25 17:47:11 [CCXT:bybit] WatchOrders update: order=2178517987378948352 status=open filled=0.000000 price=0.00755500
+2026/03/25 17:47:11 [CCXT:bybit] WatchOrders update: order=2178517988788234496 status=open filled=0.000000 price=0.00772400
+2026/03/25 17:47:11 [CCXT:bybit] WatchOrders update: order=2178507505779697920 status=canceled filled=0.000000 price=0.00755400
+2026/03/25 17:47:11 [CCXT:bybit] WatchOrders update: order=2178518406859680000 status=open filled=0.000000 price=0.00755600
+2026/03/25 17:47:11 [SimpleLadder] Order 2178518406859680000: BUY @ 0.00755600 status=NEW
+2026/03/25 17:47:16 [SimpleLadder] Synced 11 live orders from exchange
+

@@ -49,9 +49,15 @@ const (
 	minTradesForVWAP = 3
 
 	// Inventory adjustment strength: bps per 10% inventory skew
-	// Example: 10% skew → ±20 bps adjustment
-	inventoryAdjustmentBps = 20.0
+	// Example: 10% skew → ±50 bps adjustment
+	inventoryAdjustmentBps = 50.0
 )
+
+// ModeChangeCallback is called when the strategy mode changes
+type ModeChangeCallback func(oldMode, newMode string, nav, peakNAV, drawdownPct float64)
+
+// BalanceLowCallback is called when balance is too low to trade
+type BalanceLowCallback func(available, required float64)
 
 // SimpleLadderConfig is the configuration for SimpleLadderStrategy
 type SimpleLadderConfig struct {
@@ -65,8 +71,9 @@ type SimpleLadderConfig struct {
 	RecoveryHours       float64 `json:"recovery_hours"`         // Target recovery time in hours (24-72)
 	MaxRecoverySizeMult float64 `json:"max_recovery_size_mult"` // Max size multiplier during recovery (e.g., 0.3 = 30%)
 
-	// Debug settings
-	DebugCancelSleep bool `json:"debug_cancel_sleep"` // Enable 30s sleep after cancel (for debugging WebSocket)
+	// Callbacks
+	OnModeChange ModeChangeCallback `json:"-"` // Called when mode changes (for notifications)
+	OnBalanceLow BalanceLowCallback `json:"-"` // Called when balance is too low to trade
 }
 
 // vwapResult contains VWAP calculation result with metadata
@@ -89,26 +96,8 @@ type SimpleLadderStrategy struct {
 	minNotional float64
 	maxOrderQty float64 // Maximum quantity per order (exchange limit)
 
-	// Cached ladder state
-	mu             sync.RWMutex
-	cachedLadder   []core.DesiredOrder
-	cachedMid      float64
-	cachedBalance  float64
-	lastOrderCount int
-
-	// Fill cooldown tracking
-	fillCooldowns  map[float64]int64 // price -> fill timestamp
-	fillCooldownMs int64
-	lastFillTime   int64 // Last fill timestamp (ms) for global cooldown
-
-	// Regeneration cooldown tracking
-	lastRegenTime   int64 // Last regeneration timestamp (ms)
-	regenCooldownMs int64 // Cooldown after regeneration (default 30s)
-
-	// Cancel tracking (for debug)
-	lastCancelTime int64            // Last EXTERNAL cancel timestamp (ms)
-	pendingCancels map[string]bool  // Order IDs that bot is canceling (internal)
-	recentFills    map[string]int64 // Order IDs that were recently filled (orderID -> timestamp)
+	// State
+	mu sync.RWMutex
 
 	// Risk tracking
 	peakNAV        float64          // Peak NAV for drawdown calculation
@@ -164,6 +153,9 @@ func NewSimpleLadderStrategy(cfg *SimpleLadderConfig) *SimpleLadderStrategy {
 	if cfg.DepthBps == 0 {
 		cfg.DepthBps = 200 // 2% max depth
 	}
+	if cfg.PyramidFactor <= 0 {
+		cfg.PyramidFactor = 3.0 // outer orders are 3x the size of inner orders
+	}
 	if cfg.LevelGapTicksMax == 0 {
 		cfg.LevelGapTicksMax = 3
 	}
@@ -185,24 +177,10 @@ func NewSimpleLadderStrategy(cfg *SimpleLadderConfig) *SimpleLadderStrategy {
 		cfg.MaxRecoverySizeMult = 0.3 // 30% size during max recovery
 	}
 
-	// Set default fill cooldown if not configured
-	fillCooldownMs := int64(cfg.FillCooldownMs)
-	if fillCooldownMs == 0 {
-		fillCooldownMs = 5000 // Default 5 seconds
-	}
-
-	// Set default regeneration cooldown (30 seconds to prevent ping-pong)
-	regenCooldownMs := int64(30000) // 30 seconds default
-
 	return &SimpleLadderStrategy{
-		cfg:             cfg,
-		fillCooldowns:   make(map[float64]int64),
-		fillCooldownMs:  fillCooldownMs,
-		regenCooldownMs: regenCooldownMs,
-		pendingCancels:  make(map[string]bool),
-		recentFills:     make(map[string]int64),
-		navHistory:      make([]navSnapshot, 0, 1000),
-		currentMode:     ModeNormal,
+		cfg:         cfg,
+		navHistory:  make([]navSnapshot, 0, 1000),
+		currentMode: ModeNormal,
 	}
 }
 
@@ -217,6 +195,23 @@ func (s *SimpleLadderStrategy) Init(ctx context.Context, snap *core.Snapshot, ba
 	s.stepSize = snap.StepSize
 	s.minNotional = snap.MinNotional
 	s.maxOrderQty = snap.MaxOrderQty
+
+	// Validate tickSize - CRITICAL for price calculations
+	if s.tickSize <= 0 {
+		// Try to derive from mid price (8 decimal places default)
+		if snap.Mid > 0 {
+			s.tickSize = math.Pow(10, -8) // 0.00000001
+			log.Printf("[%s] WARNING: tickSize not set, using default %.8f", s.Name(), s.tickSize)
+		} else {
+			return fmt.Errorf("tickSize is 0 and cannot derive default")
+		}
+	}
+
+	// Validate stepSize
+	if s.stepSize <= 0 {
+		s.stepSize = math.Pow(10, -8) // 0.00000001
+		log.Printf("[%s] WARNING: stepSize not set, using default %.8f", s.Name(), s.stepSize)
+	}
 
 	if s.minNotional <= 0 {
 		s.minNotional = 5.0
@@ -279,26 +274,6 @@ func (s *SimpleLadderStrategy) Tick(ctx context.Context, input *core.TickInput) 
 		}, nil
 	}
 
-	// Check fill cooldown - we still regenerate after fills,
-	// but cooldown prevents placing orders at the SAME PRICE as fills
-	// The cooldown is applied later during order generation (in computeDesiredOrders)
-	s.mu.RLock()
-	lastCancel := s.lastCancelTime
-	s.mu.RUnlock()
-
-	// Debug: Sleep 30s after cancel to observe WebSocket events
-	if s.cfg.DebugCancelSleep && lastCancel > 0 {
-		const cancelSleepMs int64 = 30000 // 30 seconds
-		elapsed := time.Now().UnixMilli() - lastCancel
-		if elapsed < cancelSleepMs {
-			remaining := cancelSleepMs - elapsed
-			return &core.TickOutput{
-				Action: core.TickActionKeep,
-				Reason: fmt.Sprintf("DEBUG cancel_sleep: %dms remaining (observe WebSocket)", remaining),
-			}, nil
-		}
-	}
-
 	// Get total available balance (both sides)
 	availableBalance := s.getAvailableBalance(balance, mid)
 
@@ -306,6 +281,10 @@ func (s *SimpleLadderStrategy) Tick(ctx context.Context, input *core.TickInput) 
 	// Need TargetDepthNotional * 2 (one for each side)
 	minRequired := s.cfg.TargetDepthNotional * 2
 	if availableBalance < minRequired {
+		// Notify via callback
+		if s.cfg.OnBalanceLow != nil {
+			go s.cfg.OnBalanceLow(availableBalance, minRequired)
+		}
 		return &core.TickOutput{
 			Action: core.TickActionCancelAll,
 			Reason: fmt.Sprintf("insufficient balance: %.2f < %.2f (need %0.f per side)", availableBalance, minRequired, s.cfg.TargetDepthNotional),
@@ -315,75 +294,18 @@ func (s *SimpleLadderStrategy) Tick(ctx context.Context, input *core.TickInput) 
 	// Calculate size multiplier based on mode
 	sizeMult := s.calculateSizeMultiplier(drawdown, mode)
 
-	// Check if we should regenerate ladder
-	desired := s.getOrRegenerateLadder(mid, balance, input.LiveOrders)
-
-	if len(desired) == 0 {
-		return &core.TickOutput{
-			Action: core.TickActionKeep,
-			Reason: "no orders to place",
-		}, nil
-	}
-
-	// Apply size multiplier if in recovery mode
-	if sizeMult != 1.0 {
-		desired = s.applySizeMultiplier(desired, sizeMult)
-		log.Printf("[%s] Size adjusted: mult=%.2f", s.Name(), sizeMult)
-	}
-
-	// Compute order diff (incremental update)
-	diff := s.computeOrderDiff(input.LiveOrders, desired)
-
 	metrics := map[string]float64{
 		"nav":       nav,
 		"drawdown":  drawdown,
 		"size_mult": sizeMult,
 	}
 
-	switch diff.Action {
-	case core.TickActionKeep:
-		return &core.TickOutput{
-			Action:  core.TickActionKeep,
-			Reason:  diff.Reason,
-			Metrics: metrics,
-		}, nil
-
-	case core.TickActionReplace:
-		// Mark all live orders as pending internal cancel (so we don't trigger external cancel)
-		s.mu.Lock()
-		for _, order := range input.LiveOrders {
-			s.pendingCancels[order.OrderID] = true
-		}
-		s.mu.Unlock()
-
-		return &core.TickOutput{
-			Action:        core.TickActionReplace,
-			DesiredOrders: desired,
-			Reason:        diff.Reason,
-			Metrics:       metrics,
-		}, nil
-
-	case core.TickActionAmend:
-		// Mark orders as pending internal cancel (so we don't trigger debug sleep)
-		s.mu.Lock()
-		for _, orderID := range diff.OrdersToCancel {
-			s.pendingCancels[orderID] = true
-		}
-		s.mu.Unlock()
-
-		return &core.TickOutput{
-			Action:         core.TickActionAmend,
-			OrdersToCancel: diff.OrdersToCancel,
-			OrdersToAdd:    diff.OrdersToAdd,
-			Reason:         diff.Reason,
-			Metrics:        metrics,
-		}, nil
+	result := s.maintainLadder(mid, balance, input.LiveOrders, sizeMult)
+	if result == nil {
+		return &core.TickOutput{Action: core.TickActionKeep, Reason: "ladder_ok", Metrics: metrics}, nil
 	}
-
-	return &core.TickOutput{
-		Action: core.TickActionKeep,
-		Reason: "unknown_action",
-	}, nil
+	result.Metrics = metrics
+	return result, nil
 }
 
 // calculateNAV computes Net Asset Value
@@ -450,11 +372,16 @@ func (s *SimpleLadderStrategy) updateRiskState(nav float64) (drawdown float64, m
 		}
 	}
 
-	// Log mode changes
+	// Log mode changes and trigger callback
 	if s.currentMode != prevMode {
 		s.modeChangedAt = now
 		log.Printf("[%s] Mode changed: %s -> %s (drawdown=%.2f%%, NAV=$%.2f, peak=$%.2f)",
 			s.Name(), prevMode, s.currentMode, drawdown*100, nav, s.peakNAV)
+
+		// Call mode change callback (for notifications)
+		if s.cfg.OnModeChange != nil {
+			go s.cfg.OnModeChange(string(prevMode), string(s.currentMode), nav, s.peakNAV, drawdown)
+		}
 	}
 
 	return drawdown, s.currentMode
@@ -489,20 +416,6 @@ func (s *SimpleLadderStrategy) calculateSizeMultiplier(drawdown float64, mode Si
 	default:
 		return 1.0
 	}
-}
-
-// applySizeMultiplier applies size multiplier to all orders
-func (s *SimpleLadderStrategy) applySizeMultiplier(orders []core.DesiredOrder, mult float64) []core.DesiredOrder {
-	result := make([]core.DesiredOrder, 0, len(orders))
-	for _, o := range orders {
-		newQty := s.roundToStep(o.Qty * mult)
-		newNotional := o.Price * newQty
-		if newNotional >= s.minNotional {
-			o.Qty = newQty
-			result = append(result, o)
-		}
-	}
-	return result
 }
 
 // GetMode returns current operating mode
@@ -541,76 +454,22 @@ func (s *SimpleLadderStrategy) GetPeakNAV() float64 {
 }
 
 // OnFill handles fill events
+// Strategy only logs - BaseBot handles order tracker updates, Redis, and MongoDB
 func (s *SimpleLadderStrategy) OnFill(event *core.FillEvent) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	now := time.Now().UnixMilli()
-	fillPrice := s.roundToTick(event.Price)
-	s.fillCooldowns[fillPrice] = now
-	s.lastFillTime = now
-	// fillCooldownMs is set from config (no longer random)
-
-	// Track filled orders to ignore late CANCELED events
-	s.recentFills[event.OrderID] = now
-
-	// Cleanup old filled orders (older than 60 seconds)
-	cutoff := now - 60000
-	for id, ts := range s.recentFills {
-		if ts < cutoff {
-			delete(s.recentFills, id)
-		}
-	}
-
-	// Don't clear cached ladder - let normal logic handle regeneration
-	// Only regenerate if inventory changes significantly or mid moves
-	// s.cachedLadder = nil  // Removed: too aggressive
-
-	log.Printf("[%s] Fill at %.8f, cooldown %dms activated",
-		s.Name(), fillPrice, s.fillCooldownMs)
+	notional := event.Price * event.Quantity
+	log.Printf("[%s] 💰 FILL %s @ %.8f x %.4f ($%.2f) order=%s",
+		s.Name(), event.Side, event.Price, event.Quantity, notional, event.OrderID)
 }
 
 // OnOrderUpdate handles order status updates
+// Strategy only logs important events - BaseBot handles order tracker updates
 func (s *SimpleLadderStrategy) OnOrderUpdate(event *core.OrderEvent) {
-	log.Printf("[%s] Order %s: %s @ %.8f status=%s",
-		s.Name(), event.OrderID, event.Side, event.Price, event.Status)
-
-	// If order was canceled
-	if event.Status == "CANCELED" || event.Status == "EXPIRED" || event.Status == "REJECTED" {
-		s.mu.Lock()
-
-		// Check if this is an internal cancel (bot initiated) or external (user/UI)
-		isInternalCancel := s.pendingCancels[event.OrderID]
-		if isInternalCancel {
-			// Remove from pending - this was our own cancel
-			delete(s.pendingCancels, event.OrderID)
-			s.mu.Unlock()
-			log.Printf("[%s] Internal cancel confirmed: %s", s.Name(), event.OrderID)
-			return
-		}
-
-		// Check if this order was recently filled (partial or full)
-		// Late CANCELED events for filled orders should be ignored
-		_, wasFilled := s.recentFills[event.OrderID]
-		if wasFilled {
-			delete(s.recentFills, event.OrderID) // Clean up
-			s.mu.Unlock()
-			log.Printf("[%s] Filled order canceled (late event): %s", s.Name(), event.OrderID)
-			return
-		}
-
-		// External cancel - force ladder regeneration and maybe sleep
-		s.cachedLadder = nil
-		s.lastCancelTime = time.Now().UnixMilli()
-		s.mu.Unlock()
-
-		if s.cfg.DebugCancelSleep {
-			log.Printf("[%s] DEBUG: EXTERNAL cancel %s, will sleep 30s for WebSocket debug",
-				s.Name(), event.OrderID)
-		} else {
-			log.Printf("[%s] External cancel %s, will regenerate ladder", s.Name(), event.OrderID)
-		}
+	// Only log NEW events (CANCELED/FILLED handled elsewhere or silently)
+	if event.Status == "NEW" {
+		log.Printf("[%s] Order %s: %s @ %.8f status=%s",
+			s.Name(), event.OrderID, event.Side, event.Price, event.Status)
 	}
+	// No state tracking needed - BaseBot syncs from exchange every tick
 }
 
 // UpdateConfig updates strategy config at runtime
@@ -631,11 +490,6 @@ func (s *SimpleLadderStrategy) UpdateConfig(newCfg interface{}) error {
 	s.cfg.LevelGapTicksMax = cfg.LevelGapTicksMax
 	s.cfg.DepthBps = cfg.DepthBps
 
-	// Clear cached ladder to force regeneration
-	s.cachedLadder = nil
-	s.cachedMid = 0
-	s.cachedBalance = 0
-
 	log.Printf("[%s] Config updated: spread=%.0fbps, depthBps=%.0f, levels=%d, depth=$%.0f",
 		s.Name(), s.cfg.SpreadMinBps, s.cfg.DepthBps, s.cfg.NumLevels, s.cfg.TargetDepthNotional)
 
@@ -646,128 +500,6 @@ func (s *SimpleLadderStrategy) UpdateConfig(newCfg interface{}) error {
 func (s *SimpleLadderStrategy) getAvailableBalance(balance *core.BalanceState, mid float64) float64 {
 	// Total notional = base value + quote value
 	return (balance.BaseFree * mid) + balance.QuoteFree
-}
-
-// shouldRegenerateLadder checks if we need to regenerate the ladder
-// Uses notional depth + minimum order count check + balance awareness
-func (s *SimpleLadderStrategy) shouldRegenerateLadder(mid float64, liveOrders []core.LiveOrder, balance *core.BalanceState) (bool, string) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	// First time - always allow
-	if s.cachedMid == 0 || len(s.cachedLadder) == 0 {
-		return true, "initial"
-	}
-
-	// Calculate current notional depth per side and count orders
-	var bidNotional, askNotional float64
-	var bidCount, askCount int
-	for _, order := range liveOrders {
-		notional := order.Price * order.RemainingQty
-		if order.Side == "BUY" {
-			bidNotional += notional
-			bidCount++
-		} else {
-			askNotional += notional
-			askCount++
-		}
-	}
-
-	// Calculate max possible notional per side based on available balance
-	// Use 90% of available to leave some buffer
-	maxBidNotional := balance.QuoteFree * 0.9
-	maxAskNotional := balance.BaseFree * mid * 0.9
-
-	// Target per side (capped by available balance)
-	targetPerSide := s.cfg.TargetDepthNotional
-	bidTarget := targetPerSide
-	askTarget := targetPerSide
-	if maxBidNotional < bidTarget {
-		bidTarget = maxBidNotional
-	}
-	if maxAskNotional < askTarget {
-		askTarget = maxAskNotional
-	}
-
-	// Minimum orders per side = numLevels / 2
-	minOrdersPerSide := s.cfg.NumLevels / 2
-	if minOrdersPerSide < 1 {
-		minOrdersPerSide = 1
-	}
-	ordersTooFew := bidCount < minOrdersPerSide || askCount < minOrdersPerSide
-
-	// Check if notional is below 110% of target (capped by available balance)
-	bidThreshold := bidTarget * 1.1
-	askThreshold := askTarget * 1.1
-	// Don't exceed what's possible with available balance
-	if bidThreshold > maxBidNotional {
-		bidThreshold = maxBidNotional
-	}
-	if askThreshold > maxAskNotional {
-		askThreshold = maxAskNotional
-	}
-	notionalLow := bidNotional < bidThreshold || askNotional < askThreshold
-
-	// Skip regenerate if already at max possible (within 5% tolerance)
-	atMaxBid := bidNotional >= maxBidNotional*0.95
-	atMaxAsk := askNotional >= maxAskNotional*0.95
-	if atMaxBid && atMaxAsk && !ordersTooFew {
-		// Already at max possible given balance, don't regenerate
-		return false, ""
-	}
-
-	// Critical condition: orders too few OR notional critically low (< 50% of target)
-	criticalThreshold := targetPerSide * 0.5
-	notionalCritical := bidNotional < criticalThreshold || askNotional < criticalThreshold
-	isCritical := ordersTooFew || notionalCritical
-
-	// Check regeneration cooldown to prevent ping-pong
-	// Skip cooldown if critical
-	if !isCritical && s.lastRegenTime > 0 {
-		elapsed := time.Now().UnixMilli() - s.lastRegenTime
-		if elapsed < s.regenCooldownMs {
-			// Still in cooldown - don't regenerate unless critical
-			return false, ""
-		}
-	}
-
-	// Orders too few - regenerate
-	if ordersTooFew {
-		return true, fmt.Sprintf("few_orders: bid=%d ask=%d min=%d", bidCount, askCount, minOrdersPerSide)
-	}
-
-	// Notional depth below threshold - regenerate to maintain buffer
-	if notionalLow {
-		return true, fmt.Sprintf("notional_low: bid=$%.0f/$%.0f ask=$%.0f/$%.0f", bidNotional, bidThreshold, askNotional, askThreshold)
-	}
-
-	// Mid moved significantly
-	midChangeBps := math.Abs(mid-s.cachedMid) / s.cachedMid * 10000
-	if midChangeBps > s.cfg.LadderRegenBps {
-		return true, fmt.Sprintf("mid_moved_%.1fbps", midChangeBps)
-	}
-
-	return false, ""
-}
-
-// getOrRegenerateLadder returns cached ladder or generates new one
-func (s *SimpleLadderStrategy) getOrRegenerateLadder(mid float64, balance *core.BalanceState, liveOrders []core.LiveOrder) []core.DesiredOrder {
-	totalBalance := s.getAvailableBalance(balance, mid)
-	shouldRegen, reason := s.shouldRegenerateLadder(mid, liveOrders, balance)
-
-	if shouldRegen {
-		s.mu.Lock()
-		s.cachedLadder = s.computeDesiredOrders(mid, balance)
-		s.cachedMid = mid
-		s.cachedBalance = totalBalance
-		s.lastRegenTime = time.Now().UnixMilli() // Update regeneration timestamp
-		s.mu.Unlock()
-		log.Printf("[%s] Regenerated ladder: reason=%s, levels=%d", s.Name(), reason, len(s.cachedLadder))
-	}
-
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.cachedLadder
 }
 
 // calculateVWAP computes volume-weighted average price from recent trades
@@ -865,7 +597,7 @@ func (s *SimpleLadderStrategy) calculateFairPrice(trades []exchange.Trade, balan
 	}
 
 	// Calculate inventory state
-	inv := calculateInventoryState(balance.BaseFree, balance.QuoteFree, basePrice)
+	inv := calculateInventoryState(balance.BaseFree, balance.QuoteFree, basePrice, float64(s.cfg.InitBase), float64(s.cfg.InitQuote))
 
 	// Apply inventory adjustment
 	// Positive skew (too much base) → lower price to encourage selling
@@ -898,22 +630,36 @@ type inventoryState struct {
 }
 
 // calculateInventoryState computes current inventory position and skew
-// Returns inventory state for spread adjustment decisions
-func calculateInventoryState(baseFree, quoteFree, mid float64) inventoryState {
+// relative to the configured init_base / init_quote amounts.
+//
+// skew > 0: holding more base than init → tighten ASK, widen BID (sell more)
+// skew < 0: holding less base than init → tighten BID, widen ASK (buy more)
+func calculateInventoryState(baseFree, quoteFree, mid, initBase, initQuote float64) inventoryState {
 	baseValue := baseFree * mid
 	quoteValue := quoteFree
-	totalValue := baseValue + quoteValue
+	initNav := initBase*mid + initQuote
 
-	ratio := 0.5 // Default to balanced if no value
-	if totalValue > 0 {
-		ratio = baseValue / totalValue
+	skew := 0.0
+	if initNav > 0 {
+		skew = (baseFree - initBase) * mid / initNav
+	}
+	// Clamp to [-0.5, 0.5] to keep spread allocation well-behaved
+	if skew > 0.5 {
+		skew = 0.5
+	} else if skew < -0.5 {
+		skew = -0.5
+	}
+
+	ratio := 0.5
+	if baseValue+quoteValue > 0 {
+		ratio = baseValue / (baseValue + quoteValue)
 	}
 
 	return inventoryState{
 		baseValue:  baseValue,
 		quoteValue: quoteValue,
 		ratio:      ratio,
-		skew:       ratio - 0.5, // -0.5 (all quote) to +0.5 (all base)
+		skew:       skew,
 	}
 }
 
@@ -956,111 +702,22 @@ func calculateSizeMultiplier() float64 {
 	return sizeJitterMin + rand.Float64()*(sizeJitterMax-sizeJitterMin)
 }
 
-// computeDesiredOrders generates a two-sided order ladder with the following logic:
-//
-// 1. Spread Allocation:
-//   - Total spread (first BID to first ASK) is randomized within [spread_min_bps, spread_max_bps]
-//   - Spread is split between BID and ASK based on inventory skew
-//   - Balanced inventory (50/50): symmetric split
-//   - Excess base: BID gets more spread (further from mid) to encourage selling
-//   - Excess quote: ASK gets more spread (further from mid) to encourage buying
-//
-// 2. Order Generation:
-//   - First level: placed at calculated spread offset
-//   - Other levels: distributed from first level to depth_bps
-//   - Order sizes: randomized (70% to 130% of base) for variation while controlling total
-//
-// 3. Volume Distribution:
-//   - Total target volume per side: target_depth_notional
-//   - Distributed across num_levels with random size variation
-//
-// Returns: Slice of desired orders for both BID and ASK sides
-func (s *SimpleLadderStrategy) computeDesiredOrders(mid float64, balance *core.BalanceState) []core.DesiredOrder {
-	// Validate mid price to prevent division by zero and Inf quantities
-	if mid <= 0 || math.IsNaN(mid) || math.IsInf(mid, 0) {
-		log.Printf("[%s] Invalid mid price: %.8f, skipping order generation", s.Name(), mid)
-		return nil
+// pyramidNotional returns the target notional for a specific level using a pyramid size distribution.
+// level 0 = inner (closest to mid, smallest), level totalLevels-1 = outer (largest).
+// factor: ratio of outer to inner size (e.g. 3.0 means outer is 3x inner).
+// With factor=3, totalLevels=20: inner=$125, outer=$375 when targetDepth=$5000.
+func pyramidNotional(level, totalLevels int, targetDepth, factor float64) float64 {
+	if totalLevels <= 1 {
+		return targetDepth
 	}
-
-	// Calculate depth limit prices
-	depthBps := s.cfg.DepthBps
-	if depthBps <= 0 {
-		depthBps = 200
+	if factor <= 1 {
+		return targetDepth / float64(totalLevels)
 	}
-
-	spreadMinBps := s.cfg.SpreadMinBps
-	if spreadMinBps <= 0 {
-		spreadMinBps = 40
-	}
-
-	spreadMaxBps := s.cfg.SpreadMaxBps
-	if spreadMaxBps <= 0 {
-		spreadMaxBps = 100
-	}
-
-	numLevels := s.cfg.NumLevels
-	if numLevels <= 0 {
-		numLevels = 5
-	}
-
-	// Target depth per side (capped by available balance)
-	targetDepthPerSide := s.cfg.TargetDepthNotional
-
-	// Calculate max possible per side based on available balance (use 90% to leave buffer)
-	maxBidDepth := balance.QuoteFree * 0.9
-	maxAskDepth := balance.BaseFree * mid * 0.9
-
-	// Cap targets by available balance
-	bidTargetDepth := targetDepthPerSide
-	askTargetDepth := targetDepthPerSide
-	if maxBidDepth < bidTargetDepth {
-		bidTargetDepth = maxBidDepth
-		log.Printf("[%s] BID target capped by balance: $%.0f -> $%.0f", s.Name(), targetDepthPerSide, bidTargetDepth)
-	}
-	if maxAskDepth < askTargetDepth {
-		askTargetDepth = maxAskDepth
-		log.Printf("[%s] ASK target capped by balance: $%.0f -> $%.0f", s.Name(), targetDepthPerSide, askTargetDepth)
-	}
-
-	// Calculate current inventory state
-	inv := calculateInventoryState(balance.BaseFree, balance.QuoteFree, mid)
-
-	// Allocate spread between BID and ASK based on inventory
-	spread := calculateSpreadAllocation(spreadMinBps, spreadMaxBps, inv.skew)
-
-	// Log inventory adjustments when significant
-	if math.Abs(inv.skew) > inventorySkewThreshold {
-		log.Printf("[%s] Inventory skew: %.1f%% (base=$%.0f, quote=$%.0f) → total_spread=%.1fbps, BID=%.1fbps, ASK=%.1fbps",
-			s.Name(), inv.skew*100, inv.baseValue, inv.quoteValue, spread.totalBps, spread.bidBps, spread.askBps)
-	}
-
-	// Short batchID to fit Gate.io 30 char limit
-	timestamp := time.Now().UnixMilli() % 100000000
-	batchID := fmt.Sprintf("%d%03d", timestamp, rand.Intn(1000))
-
-	var orders []core.DesiredOrder
-
-	// Generate BID orders (first level at spread.bidBps, others spread to depthBps)
-	bidOrders := s.generateSideOrders(mid, spread.bidBps, depthBps, numLevels, bidTargetDepth, "BUY", batchID)
-	orders = append(orders, bidOrders...)
-
-	// Generate ASK orders (first level at spread.askBps, others spread to depthBps)
-	askOrders := s.generateSideOrders(mid, spread.askBps, depthBps, numLevels, askTargetDepth, "SELL", batchID)
-	orders = append(orders, askOrders...)
-
-	// Log first level spread for both sides
-	if len(bidOrders) > 0 && len(askOrders) > 0 {
-		bidFirstPrice := bidOrders[0].Price
-		askFirstPrice := askOrders[0].Price
-		bidSpreadBps := (mid - bidFirstPrice) / mid * 10000
-		askSpreadBps := (askFirstPrice - mid) / mid * 10000
-		bidSpreadPct := bidSpreadBps / 100.0
-		askSpreadPct := askSpreadBps / 100.0
-		log.Printf("[%s] First level spread: BID %.2f%% (%.1fbps), ASK %.2f%% (%.1fbps), mid=%.8f",
-			s.Name(), bidSpreadPct, bidSpreadBps, askSpreadPct, askSpreadBps, mid)
-	}
-
-	return orders
+	// weight[i] = 1 + (factor-1) × i/(n-1)
+	// totalWeight = n × (1+factor)/2
+	totalWeight := float64(totalLevels) * (1.0 + factor) / 2.0
+	weight := 1.0 + (factor-1.0)*float64(level)/float64(totalLevels-1)
+	return targetDepth * weight / totalWeight
 }
 
 // generateSideOrders generates orders for one side (BUY or SELL)
@@ -1173,9 +830,24 @@ func (s *SimpleLadderStrategy) generateSideOrders(mid, firstLevelSpreadBps, dept
 		return nil
 	}
 
+	// Pre-compute noisy pyramid weights for all levels, then normalize so
+	// sum(baseNotional) = targetDepth exactly → both sides always balanced.
+	// ±15% noise per level makes the shape organic without drifting total.
+	rawWeights := make([]float64, actualLevels)
+	totalRawWeight := 0.0
+	for i := 0; i < actualLevels; i++ {
+		factor := s.cfg.PyramidFactor
+		if factor <= 0 {
+			factor = 1
+		}
+		w := 1.0 + (factor-1.0)*float64(i)/float64(actualLevels-1)
+		w *= 0.50 + rand.Float64()*1.00 // ±50% noise
+		rawWeights[i] = w
+		totalRawWeight += w
+	}
+
 	// Generate orders with sizes
 	orders := make([]core.DesiredOrder, 0, actualLevels)
-	baseNotionalPerLevel := targetDepth / float64(actualLevels)
 
 	sideTag := "B"
 	if side == "SELL" {
@@ -1191,9 +863,9 @@ func (s *SimpleLadderStrategy) generateSideOrders(mid, firstLevelSpreadBps, dept
 			continue
 		}
 
-		// Apply size multiplier for unpredictable order sizes
-		sizeMultiplier := calculateSizeMultiplier()
-		sizeNotional := baseNotionalPerLevel * sizeMultiplier
+		// Normalized pyramid notional: noise applied but total = targetDepth
+		levelNotional := targetDepth * rawWeights[level] / totalRawWeight
+		sizeNotional := levelNotional * calculateSizeMultiplier()
 
 		qty := sizeNotional / price
 		qty = s.roundToStep(qty)
@@ -1227,145 +899,310 @@ func (s *SimpleLadderStrategy) generateSideOrders(mid, firstLevelSpreadBps, dept
 	return orders
 }
 
-// shouldReplaceOrders determines if we should replace orders
-func (s *SimpleLadderStrategy) shouldReplaceOrders(mid float64, currentCount int, live []core.LiveOrder, desired []core.DesiredOrder) (bool, string) {
-	// No live orders - need to place
-	if currentCount == 0 {
-		return true, "no_live_orders"
+// computeAvgStep returns the average price step between consecutive same-side orders.
+// Returns 0 if fewer than 2 orders.
+func (s *SimpleLadderStrategy) computeAvgStep(orders []core.LiveOrder, side string) float64 {
+	var prices []float64
+	for _, o := range orders {
+		if o.Side == side {
+			prices = append(prices, o.Price)
+		}
+	}
+	if len(prices) < 2 {
+		return 0
+	}
+	sort.Float64s(prices)
+	total := 0.0
+	for i := 1; i < len(prices); i++ {
+		total += prices[i] - prices[i-1]
+	}
+	return total / float64(len(prices)-1)
+}
+
+// maintainLadder performs incremental ladder maintenance without full regeneration.
+//   - Cancels orders that drifted outside the depth window
+//   - Adds outer orders when fills create gaps (BUY fill → new BUY at outer; SELL fill → new SELL at outer)
+//   - Corrects spread if it widened beyond SpreadMaxBps after the outer add
+//
+// Returns nil (KEEP) when no changes are needed.
+func (s *SimpleLadderStrategy) maintainLadder(mid float64, balance *core.BalanceState, liveOrders []core.LiveOrder, sizeMult float64) *core.TickOutput {
+	depthBps := s.cfg.DepthBps
+	if depthBps <= 0 {
+		depthBps = 200
+	}
+	spreadMinBps := s.cfg.SpreadMinBps
+	if spreadMinBps <= 0 {
+		spreadMinBps = 40
+	}
+	spreadMaxBps := s.cfg.SpreadMaxBps
+	if spreadMaxBps <= 0 {
+		spreadMaxBps = 100
+	}
+	expectedPerSide := s.cfg.NumLevels
+	if expectedPerSide <= 0 {
+		expectedPerSide = 5
+	}
+	targetDepthPerSide := s.cfg.TargetDepthNotional
+
+	priceTolerance := s.tickSize * float64(s.cfg.LevelGapTicksMax)
+	if priceTolerance <= 0 {
+		priceTolerance = s.tickSize * 3
 	}
 
-	// Different count
-	if currentCount != len(desired) {
-		return true, fmt.Sprintf("count_mismatch: %d vs %d", currentCount, len(desired))
+	depthFloor := s.roundToTick(mid * (1.0 - depthBps/10000.0))
+	depthCeil := s.roundToTick(mid * (1.0 + depthBps/10000.0))
+
+	// Step 1: partition live orders into valid and invalid (out-of-range)
+	var validBids, validAsks []core.LiveOrder
+	var toCancel []string
+	for _, o := range liveOrders {
+		var invalid bool
+		if o.Side == "BUY" {
+			invalid = o.Price >= mid || o.Price < depthFloor-s.tickSize
+		} else {
+			invalid = o.Price <= mid || o.Price > depthCeil+s.tickSize
+		}
+		if invalid {
+			toCancel = append(toCancel, o.OrderID)
+		} else if o.Side == "BUY" {
+			validBids = append(validBids, o)
+		} else {
+			validAsks = append(validAsks, o)
+		}
 	}
 
-	// Check price tolerance
-	maxGapTicks := s.cfg.LevelGapTicksMax
-	if maxGapTicks <= 0 {
-		maxGapTicks = 3
-	}
-	priceTolerance := s.tickSize * float64(maxGapTicks)
+	bidCount := len(validBids)
+	askCount := len(validAsks)
 
-	for _, d := range desired {
-		matched := false
-		for _, l := range live {
-			if l.Side == d.Side {
-				priceDiff := math.Abs(l.Price - d.Price)
-				if priceDiff <= priceTolerance {
-					matched = true
+	existingBidPrices := make([]float64, 0, len(validBids))
+	existingAskPrices := make([]float64, 0, len(validAsks))
+	for _, o := range validBids {
+		existingBidPrices = append(existingBidPrices, o.Price)
+	}
+	for _, o := range validAsks {
+		existingAskPrices = append(existingAskPrices, o.Price)
+	}
+
+	priceExists := func(price float64, existing []float64) bool {
+		for _, ep := range existing {
+			if math.Abs(ep-price) <= priceTolerance {
+				return true
+			}
+		}
+		return false
+	}
+
+	timestamp := time.Now().UnixMilli() % 100000000
+	batchID := fmt.Sprintf("%d%03d", timestamp, rand.Intn(1000))
+
+	makeOrder := func(side string, price float64, level int) *core.DesiredOrder {
+		sideTag := "B"
+		if side == "SELL" {
+			sideTag = "A"
+		}
+		price = s.roundToTick(price)
+		if price <= 0 {
+			return nil
+		}
+		notional := pyramidNotional(level, expectedPerSide, targetDepthPerSide, s.cfg.PyramidFactor)
+		qty := s.roundToStep((notional * calculateSizeMultiplier() * sizeMult) / price)
+		if qty <= 0 || price*qty < s.minNotional {
+			return nil
+		}
+		if s.maxOrderQty > 0 && qty > s.maxOrderQty {
+			qty = s.maxOrderQty
+		}
+		return &core.DesiredOrder{
+			Side:       side,
+			Price:      price,
+			Qty:        qty,
+			LevelIndex: level,
+			Tag:        fmt.Sprintf("SM_%s_L%d_%s", batchID, level, sideTag),
+		}
+	}
+
+	var toAdd []core.DesiredOrder
+
+	// Step 2: add missing BUY orders
+	if bidCount < expectedPerSide {
+		if bidCount == 0 {
+			// All BUYs missing → generate full side via spread allocation
+			inv := calculateInventoryState(balance.BaseFree, balance.QuoteFree, mid, float64(s.cfg.InitBase), float64(s.cfg.InitQuote))
+			spread := calculateSpreadAllocation(spreadMinBps, spreadMaxBps, inv.skew)
+			orders := s.generateSideOrders(mid, spread.bidBps, depthBps, expectedPerSide, targetDepthPerSide, "BUY", batchID)
+			for _, o := range orders {
+				if sizeMult != 1.0 {
+					o.Qty = s.roundToStep(o.Qty * sizeMult)
+				}
+				if o.Qty > 0 && o.Price*o.Qty >= s.minNotional {
+					toAdd = append(toAdd, o)
+					existingBidPrices = append(existingBidPrices, o.Price)
+				}
+			}
+		} else {
+			// Partial missing → add outer orders below existing lowest bid
+			avgStep := s.computeAvgStep(validBids, "BUY")
+			if avgStep < s.tickSize {
+				// fallback: spread remaining range across levels
+				innerBid := mid * (1.0 - spreadMinBps/2/10000.0)
+				avgStep = (innerBid - float64(depthFloor)) / float64(expectedPerSide)
+				if avgStep < s.tickSize {
+					avgStep = s.tickSize * 2
+				}
+			}
+
+			lowestBid := validBids[0].Price
+			for _, o := range validBids {
+				if o.Price < lowestBid {
+					lowestBid = o.Price
+				}
+			}
+
+			missing := expectedPerSide - bidCount
+			for added := 0; added < missing; added++ {
+				outerPrice := lowestBid - float64(added+1)*avgStep
+				clamped := outerPrice < depthFloor
+				if clamped {
+					outerPrice = depthFloor
+				}
+				outerPrice = s.roundToTick(outerPrice)
+				// When clamped to depthFloor, bypass priceExists to reach target notional
+				if outerPrice <= 0 || (!clamped && priceExists(outerPrice, existingBidPrices)) {
 					break
+				}
+				order := makeOrder("BUY", outerPrice, bidCount+added)
+				if order == nil {
+					break
+				}
+				toAdd = append(toAdd, *order)
+				existingBidPrices = append(existingBidPrices, outerPrice)
+			}
+		}
+		log.Printf("[%s] Maintain BUY: had=%d expected=%d adding=%d", s.Name(), bidCount, expectedPerSide, len(toAdd))
+	}
+
+	// Step 3: add missing SELL orders
+	addedAsks := 0
+	if askCount < expectedPerSide {
+		if askCount == 0 {
+			// All SELLs missing → generate full side
+			inv := calculateInventoryState(balance.BaseFree, balance.QuoteFree, mid, float64(s.cfg.InitBase), float64(s.cfg.InitQuote))
+			spread := calculateSpreadAllocation(spreadMinBps, spreadMaxBps, inv.skew)
+			orders := s.generateSideOrders(mid, spread.askBps, depthBps, expectedPerSide, targetDepthPerSide, "SELL", batchID)
+			for _, o := range orders {
+				if sizeMult != 1.0 {
+					o.Qty = s.roundToStep(o.Qty * sizeMult)
+				}
+				if o.Qty > 0 && o.Price*o.Qty >= s.minNotional {
+					toAdd = append(toAdd, o)
+					existingAskPrices = append(existingAskPrices, o.Price)
+					addedAsks++
+				}
+			}
+		} else {
+			// Partial missing → add outer orders above existing highest ask
+			avgStep := s.computeAvgStep(validAsks, "SELL")
+			if avgStep < s.tickSize {
+				innerAsk := mid * (1.0 + spreadMinBps/2/10000.0)
+				avgStep = (float64(depthCeil) - innerAsk) / float64(expectedPerSide)
+				if avgStep < s.tickSize {
+					avgStep = s.tickSize * 2
+				}
+			}
+
+			highestAsk := validAsks[0].Price
+			for _, o := range validAsks {
+				if o.Price > highestAsk {
+					highestAsk = o.Price
+				}
+			}
+
+			missing := expectedPerSide - askCount
+			for added := 0; added < missing; added++ {
+				outerPrice := highestAsk + float64(added+1)*avgStep
+				clamped := outerPrice > depthCeil
+				if clamped {
+					outerPrice = depthCeil
+				}
+				outerPrice = s.roundToTick(outerPrice)
+				// When clamped to depthCeil, bypass priceExists to reach target notional
+				if outerPrice <= 0 || (!clamped && priceExists(outerPrice, existingAskPrices)) {
+					break
+				}
+				order := makeOrder("SELL", outerPrice, askCount+added)
+				if order == nil {
+					break
+				}
+				toAdd = append(toAdd, *order)
+				existingAskPrices = append(existingAskPrices, outerPrice)
+				addedAsks++
+			}
+		}
+		log.Printf("[%s] Maintain ASK: had=%d expected=%d adding=%d", s.Name(), askCount, expectedPerSide, addedAsks)
+	}
+
+	// Step 4: spread correction — if spread between best bid and best ask exceeds SpreadMaxBps,
+	// add an inner order on the filled side to tighten the spread.
+	bestBid := 0.0
+	for _, o := range validBids {
+		if o.Price > bestBid {
+			bestBid = o.Price
+		}
+	}
+	for _, o := range toAdd {
+		if o.Side == "BUY" && o.Price > bestBid {
+			bestBid = o.Price
+		}
+	}
+	bestAsk := math.MaxFloat64
+	for _, o := range validAsks {
+		if o.Price < bestAsk {
+			bestAsk = o.Price
+		}
+	}
+	for _, o := range toAdd {
+		if o.Side == "SELL" && o.Price < bestAsk {
+			bestAsk = o.Price
+		}
+	}
+
+	if bestBid > 0 && bestAsk < math.MaxFloat64 {
+		currentSpreadBps := (bestAsk - bestBid) / mid * 10000
+		if currentSpreadBps > spreadMaxBps+0.5 { // +0.5bps buffer for floating point
+			// BUY side had fills → spread widened → add inner SELL just inside mid
+			// Must be > mid (otherwise Step 1 cancels it next tick as invalid)
+			if bidCount < expectedPerSide {
+				innerSellPrice := s.roundToTick(mid + spreadMinBps/2/10000.0*mid)
+				if innerSellPrice > mid && innerSellPrice < bestAsk {
+					order := makeOrder("SELL", innerSellPrice, 0)
+					if order != nil {
+						toAdd = append(toAdd, *order)
+					}
+				}
+			}
+			// SELL side had fills → spread widened → add inner BUY just inside mid
+			// Must be < mid (otherwise Step 1 cancels it next tick as invalid)
+			if askCount < expectedPerSide {
+				innerBuyPrice := s.roundToTick(mid - spreadMinBps/2/10000.0*mid)
+				if innerBuyPrice < mid && innerBuyPrice > bestBid {
+					order := makeOrder("BUY", innerBuyPrice, 0)
+					if order != nil {
+						toAdd = append(toAdd, *order)
+					}
 				}
 			}
 		}
-		if !matched {
-			return true, "price_drift"
-		}
 	}
 
-	return false, ""
-}
-
-// OrderDiff represents the incremental changes needed
-type OrderDiff struct {
-	Action         core.TickAction
-	OrdersToCancel []string            // Order IDs to cancel
-	OrdersToAdd    []core.DesiredOrder // Orders to add
-	Reason         string
-}
-
-// computeOrderDiff computes the minimal changes needed to reach desired state
-func (s *SimpleLadderStrategy) computeOrderDiff(live []core.LiveOrder, desired []core.DesiredOrder) *OrderDiff {
-	// No live orders - place all
-	if len(live) == 0 {
-		return &OrderDiff{
-			Action:      core.TickActionReplace,
-			OrdersToAdd: desired,
-			Reason:      "no_live_orders",
-		}
-	}
-
-	// Sort both lists by price (descending for BID, ascending for ASK)
-	// This ensures proper pairing and avoids cross-matching due to tolerance
-	sortedLive := make([]core.LiveOrder, len(live))
-	copy(sortedLive, live)
-	sort.Slice(sortedLive, func(i, j int) bool {
-		return sortedLive[i].Price > sortedLive[j].Price // descending
-	})
-
-	sortedDesired := make([]core.DesiredOrder, len(desired))
-	copy(sortedDesired, desired)
-	sort.Slice(sortedDesired, func(i, j int) bool {
-		return sortedDesired[i].Price > sortedDesired[j].Price // descending
-	})
-
-	maxGapTicks := s.cfg.LevelGapTicksMax
-	if maxGapTicks <= 0 {
-		maxGapTicks = 3
-	}
-	priceTolerance := s.tickSize * float64(maxGapTicks)
-
-	// Match sorted orders in parallel (1:1 matching by position)
-	var toCancel []string
-	var toAdd []core.DesiredOrder
-
-	maxLen := len(sortedLive)
-	if len(sortedDesired) > maxLen {
-		maxLen = len(sortedDesired)
-	}
-
-	for i := 0; i < maxLen; i++ {
-		var l *core.LiveOrder
-		var d *core.DesiredOrder
-
-		if i < len(sortedLive) {
-			l = &sortedLive[i]
-		}
-		if i < len(sortedDesired) {
-			d = &sortedDesired[i]
-		}
-
-		if l != nil && d != nil {
-			// Both exist at this position - check if they match
-			priceDiff := math.Abs(l.Price - d.Price)
-			if l.Side == d.Side && priceDiff <= priceTolerance {
-				// Matched - no action needed
-			} else {
-				// Not matched - cancel live, add desired
-				toCancel = append(toCancel, l.OrderID)
-				toAdd = append(toAdd, *d)
-			}
-		} else if l != nil && d == nil {
-			// Extra live order - cancel it
-			toCancel = append(toCancel, l.OrderID)
-		} else if l == nil && d != nil {
-			// Missing live order - add it
-			toAdd = append(toAdd, *d)
-		}
-	}
-
-	// Determine action
 	if len(toCancel) == 0 && len(toAdd) == 0 {
-		return &OrderDiff{
-			Action: core.TickActionKeep,
-			Reason: "orders_in_sync",
-		}
+		return nil
 	}
 
-	// If we need to cancel most orders, just do a full replace
-	if len(toCancel) > len(live)/2 {
-		return &OrderDiff{
-			Action:      core.TickActionReplace,
-			OrdersToAdd: desired,
-			Reason:      fmt.Sprintf("too_many_cancels: %d/%d", len(toCancel), len(live)),
-		}
-	}
-
-	// Incremental update
-	return &OrderDiff{
+	return &core.TickOutput{
 		Action:         core.TickActionAmend,
 		OrdersToCancel: toCancel,
 		OrdersToAdd:    toAdd,
-		Reason:         fmt.Sprintf("amend: cancel=%d, add=%d", len(toCancel), len(toAdd)),
+		Reason:         fmt.Sprintf("maintain: bid=%d/%d ask=%d/%d cancel=%d add=%d", bidCount, expectedPerSide, askCount, expectedPerSide, len(toCancel), len(toAdd)),
 	}
 }
 
@@ -1407,12 +1244,22 @@ func (s *SimpleLadderStrategy) removeDuplicatePrices(prices []float64) []float64
 		return prices
 	}
 
+	// Validate tickSize to prevent division by zero
+	tickSize := s.tickSize
+	if tickSize <= 0 {
+		tickSize = 1e-8 // Fallback to 8 decimal places
+	}
+
 	seen := make(map[float64]bool)
 	result := make([]float64, 0, len(prices))
 
 	for _, p := range prices {
+		// Skip invalid prices
+		if p <= 0 || math.IsNaN(p) || math.IsInf(p, 0) {
+			continue
+		}
 		// Round to avoid floating point comparison issues
-		key := math.Round(p/s.tickSize) * s.tickSize
+		key := math.Round(p/tickSize) * tickSize
 		if !seen[key] {
 			seen[key] = true
 			result = append(result, p)
