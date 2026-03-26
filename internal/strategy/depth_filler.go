@@ -462,6 +462,10 @@ func (s *DepthFillerStrategy) UpdateConfig(newCfg interface{}) error {
 	return nil
 }
 
+func (s *DepthFillerStrategy) UpdatePrevSnapshot(_ []core.LiveOrder, _ *core.BalanceState) {
+	// Not needed for DepthFiller
+}
+
 // roundToTick rounds price to tick size
 func (s *DepthFillerStrategy) roundToTick(price float64) float64 {
 	if s.tickSize <= 0 {

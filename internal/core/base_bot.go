@@ -389,8 +389,8 @@ func (b *BaseBot) tick() error {
 
 	// 7. Log tick summary (before action, so it always logs)
 	invRatio, invDev := balance.ComputeInventory(snap.Mid, 0.5) // TODO: get target ratio from strategy
-	log.Printf("[%s] mid=%.8f, inv=%.2f%% (dev=%.2f%%), orders=%d, action=%s",
-		b.strategy.Name(), snap.Mid, invRatio*100, invDev*100, len(liveOrders), output.Action)
+	log.Printf("[%s] mid=%.8f, inv=%.2f%% (dev=%.2f%%), bid=%.4f, ask=%.4f, orders=%d, action=%s",
+		b.strategy.Name(), snap.Mid, invRatio*100, invDev*100, balance.QuoteLocked, balance.BaseLocked, len(liveOrders), output.Action)
 
 	// 8. Execute the action
 	switch output.Action {
@@ -399,12 +399,33 @@ func (b *BaseBot) tick() error {
 	case TickActionKeep:
 		// Do nothing
 	case TickActionReplace:
-		return b.replaceOrders(output.DesiredOrders, output.Reason)
+		if err := b.replaceOrders(output.DesiredOrders, output.Reason); err != nil {
+			return err
+		}
+		b.updateStrategyPrevSnapshot()
 	case TickActionAmend:
-		return b.amendOrders(output.OrdersToCancel, output.OrdersToAdd, output.Reason)
+		if err := b.amendOrders(output.OrdersToCancel, output.OrdersToAdd, output.Reason); err != nil {
+			return err
+		}
+		b.updateStrategyPrevSnapshot()
 	}
 
 	return nil
+}
+
+// updateStrategyPrevSnapshot fetches fresh live orders and balance after order execution,
+// then updates the strategy's prev snapshot for accurate fill detection next cycle.
+func (b *BaseBot) updateStrategyPrevSnapshot() {
+	if err := b.syncLiveOrders(); err != nil {
+		log.Printf("[%s] WARNING: post-execute sync failed: %v", b.strategy.Name(), err)
+		return
+	}
+	bal, err := b.getBalanceState()
+	if err != nil {
+		log.Printf("[%s] WARNING: post-execute balance failed: %v", b.strategy.Name(), err)
+		return
+	}
+	b.strategy.UpdatePrevSnapshot(b.orderTracker.GetAll(), bal)
 }
 
 // subscribeUserStream sets up WebSocket event handlers
@@ -412,7 +433,6 @@ func (b *BaseBot) subscribeUserStream() error {
 	handlers := exchange.UserStreamHandlers{
 		OnAccountUpdate: b.handleAccountUpdate,
 		OnOrderUpdate:   b.handleOrderUpdate,
-		OnFill:          b.handleFill,
 		OnError: func(err error) {
 			log.Printf("[%s] WebSocket error: %v", b.strategy.Name(), err)
 		},
@@ -467,37 +487,24 @@ func (b *BaseBot) publishAllBalancesToRedis() {
 }
 
 func (b *BaseBot) handleOrderUpdate(event *types.OrderEvent) {
-	// Debug log with detailed timestamp (removed)
+	// WatchOrders is the single source of truth for all order state changes.
+	// Process all statuses — no early returns for FILLED.
 
-	// Skip FILLED - already handled completely by handleFill
-	if event.Status == "FILLED" {
-		return
-	}
-
-	// Update order tracker
 	switch event.Status {
 	case "NEW":
-		// Check if order was already filled (ignore late NEW events)
+		// Ignore late NEW for already-filled or already-confirmed orders
 		b.mu.RLock()
 		_, wasFilled := b.filledOrders[event.OrderID]
 		wasConfirmed := b.confirmedOrders[event.OrderID]
 		b.mu.RUnlock()
-
-		if wasFilled {
-			return // Exit immediately without emitting WS events
+		if wasFilled || wasConfirmed {
+			return
 		}
 
-		// Check if this is a duplicate NEW event from exchange
-		if wasConfirmed {
-			return // Exit immediately without emitting duplicate WS events
-		}
-
-		// Mark as confirmed (first NEW event received)
 		b.mu.Lock()
 		b.confirmedOrders[event.OrderID] = true
 		b.mu.Unlock()
 
-		// Only add if not already exists (logOrderPlaced already added with requestedPrice)
 		if existing := b.orderTracker.Get(event.OrderID); existing == nil {
 			b.orderTracker.Add(&LiveOrder{
 				OrderID:       event.OrderID,
@@ -509,16 +516,117 @@ func (b *BaseBot) handleOrderUpdate(event *types.OrderEvent) {
 				LevelIndex:    parseLevelFromTag(event.ClientOrderID),
 				PlacedAt:      event.Timestamp,
 			})
-		} else {
 		}
+
+		// Upsert into live orders hash
+		if b.redis != nil {
+			b.redis.UpsertLiveOrder(b.ctx, b.cfg.Exchange, b.cfg.Symbol, &store.LiveOrderInfo{
+				OrderID:   event.OrderID,
+				Side:      event.Side,
+				Price:     event.Price,
+				Qty:       event.Quantity,
+				FilledQty: 0,
+				Status:    event.Status,
+				UpdatedAt: event.Timestamp.UnixMilli(),
+			})
+			b.redis.SaveOrder(b.ctx, &store.OrderInfo{
+				OrderID:       event.OrderID,
+				ClientOrderID: event.ClientOrderID,
+				Exchange:      b.cfg.Exchange,
+				Symbol:        event.Symbol,
+				Side:          event.Side,
+				Price:         event.Price,
+				Quantity:      event.Quantity,
+				CreatedAt:     event.Timestamp.UnixMilli(),
+				Status:        "NEW",
+				BotID:         b.cfg.BotID,
+			})
+		}
+
 	case "PARTIALLY_FILLED":
 		b.orderTracker.UpdateRemaining(event.OrderID, event.Quantity-event.ExecutedQty)
-	case "CANCELED", "EXPIRED", "REJECTED":
+		if b.redis != nil {
+			b.redis.UpsertLiveOrder(b.ctx, b.cfg.Exchange, b.cfg.Symbol, &store.LiveOrderInfo{
+				OrderID:   event.OrderID,
+				Side:      event.Side,
+				Price:     event.Price,
+				Qty:       event.Quantity,
+				FilledQty: event.ExecutedQty,
+				Status:    event.Status,
+				UpdatedAt: event.Timestamp.UnixMilli(),
+			})
+		}
+
+	case "FILLED", "CANCELED", "EXPIRED", "REJECTED":
+		// Guard: Bybit WatchOrders sends full snapshots that repeat closed/canceled orders.
+		// Only process terminal state once — skip if already handled.
+		b.mu.RLock()
+		_, alreadyTerminal := b.filledOrders[event.OrderID]
+		b.mu.RUnlock()
+		if alreadyTerminal {
+			return
+		}
+
+		existingOrder := b.orderTracker.Get(event.OrderID) // capture before removal
 		b.orderTracker.Remove(event.OrderID)
-		// Clean up confirmedOrders map
 		b.mu.Lock()
 		delete(b.confirmedOrders, event.OrderID)
+		b.filledOrders[event.OrderID] = time.Now().UnixMilli()
+		cutoff := time.Now().UnixMilli() - 300000 // 5 minutes
+		for id, ts := range b.filledOrders {
+			if ts < cutoff {
+				delete(b.filledOrders, id)
+			}
+		}
 		b.mu.Unlock()
+
+		if b.redis != nil {
+			b.redis.RemoveLiveOrder(b.ctx, b.cfg.Exchange, b.cfg.Symbol, event.OrderID)
+			b.redis.DeleteOrder(b.ctx, b.cfg.Exchange, b.cfg.Symbol, event.OrderID)
+		}
+
+		// Fill-specific handling (FILLED only)
+		if event.Status == "FILLED" {
+			now := time.Now()
+			latency := now.Sub(event.Timestamp)
+			log.Printf("[FILL] %s %s @ %.8f x %.6f (order=%s) latency=%v",
+				event.Side, event.Symbol, event.Price, event.ExecutedQty, event.OrderID, latency)
+			b.marketData.SetLastTradePrice(event.Price)
+
+			clientOrderID := event.ClientOrderID
+			levelIndex := 0
+			if existingOrder != nil {
+				if existingOrder.ClientOrderID != "" {
+					clientOrderID = existingOrder.ClientOrderID
+				}
+				levelIndex = existingOrder.LevelIndex
+			}
+			b.strategy.OnFill(&FillEvent{
+				OrderID:       event.OrderID,
+				ClientOrderID: clientOrderID,
+				Symbol:        event.Symbol,
+				Side:          event.Side,
+				Price:         event.Price,
+				Quantity:      event.ExecutedQty,
+				Timestamp:     event.Timestamp,
+			})
+
+			// Persist fill to MongoDB
+			if b.mongo != nil {
+				b.mongo.SaveFill(b.ctx, &types.FillEvent{
+					OrderID:       event.OrderID,
+					ClientOrderID: clientOrderID,
+					Symbol:        event.Symbol,
+					Side:          event.Side,
+					Price:         event.Price,
+					Quantity:      event.ExecutedQty,
+					Timestamp:     event.Timestamp,
+					BotID:         b.cfg.BotID,
+					Exchange:      b.cfg.Exchange,
+				})
+			}
+			_ = levelIndex
+		}
 	}
 
 	// Forward to strategy
@@ -534,8 +642,8 @@ func (b *BaseBot) handleOrderUpdate(event *types.OrderEvent) {
 		Timestamp:     event.Timestamp,
 	})
 
-	// Emit order event callback (skip FILLED - already emitted by handleFill)
-	if b.onOrderEvent != nil && event.Status != "FILLED" {
+	// Emit order event callback
+	if b.onOrderEvent != nil {
 		var eventType OrderEventType
 		switch event.Status {
 		case "NEW":
@@ -544,12 +652,11 @@ func (b *BaseBot) handleOrderUpdate(event *types.OrderEvent) {
 			eventType = OrderEventTypeCancel
 		case "PARTIALLY_FILLED":
 			eventType = OrderEventTypePartialFill
+		case "FILLED":
+			eventType = OrderEventTypeFill
 		default:
 			eventType = OrderEventType(event.Status)
 		}
-
-		level := parseLevelFromTag(event.ClientOrderID)
-
 		b.onOrderEvent(BotOrderEvent{
 			Type:      eventType,
 			Symbol:    event.Symbol,
@@ -557,145 +664,17 @@ func (b *BaseBot) handleOrderUpdate(event *types.OrderEvent) {
 			Side:      event.Side,
 			Price:     event.Price,
 			Qty:       event.Quantity,
-			Level:     level,
+			Level:     parseLevelFromTag(event.ClientOrderID),
 			Reason:    event.Status,
 			Timestamp: event.Timestamp.UnixMilli(),
 		})
 	}
 
-	// Save to Redis on NEW
-	if event.Status == "NEW" && b.redis != nil {
-		b.redis.SaveOrder(b.ctx, &store.OrderInfo{
-			OrderID:       event.OrderID,
-			ClientOrderID: event.ClientOrderID,
-			Exchange:      b.cfg.Exchange,
-			Symbol:        event.Symbol,
-			Side:          event.Side,
-			Price:         event.Price,
-			Quantity:      event.Quantity,
-			CreatedAt:     event.Timestamp.UnixMilli(),
-			Status:        "NEW",
-			BotID:         b.cfg.BotID,
-		})
-	}
-
-	// Delete from Redis on cancel/fill
-	if event.Status == "CANCELED" || event.Status == "FILLED" {
-		if b.redis != nil {
-			b.redis.DeleteOrder(b.ctx, b.cfg.Exchange, b.cfg.Symbol, event.OrderID)
-		}
-	}
-
-	// Publish to Redis Stream
+	// Publish all status changes to Redis Stream
 	if b.redis != nil {
 		if err := b.redis.PublishOrderUpdate(b.ctx, event); err != nil {
 			log.Printf("[%s] Failed to publish order update to Redis: %v", b.strategy.Name(), err)
 		}
-	}
-}
-
-func (b *BaseBot) handleFill(event *types.FillEvent) {
-	now := time.Now()
-	eventTime := event.Timestamp
-	latency := now.Sub(eventTime)
-
-	// Check if this is partial or full fill
-	existingOrder := b.orderTracker.Get(event.OrderID)
-	isPartialFill := false
-	if existingOrder != nil {
-		isPartialFill = event.Quantity < existingOrder.RemainingQty
-	}
-
-	fillType := "FULL"
-	if isPartialFill {
-		fillType = "PARTIAL"
-	}
-
-	log.Printf("[FILL] %s %s @ %.8f x %.6f (order=%s) [%s]",
-		event.Side, event.Symbol, event.Price, event.Quantity, event.OrderID, fillType)
-	log.Printf("[DEBUG][Fill] order=%s | event_time=%s recv_time=%s latency=%v",
-		event.OrderID, eventTime.Format("15:04:05.000"), now.Format("15:04:05.000"), latency)
-
-	// Handle partial vs full fill
-	if isPartialFill && existingOrder != nil {
-		// Partial fill - update remaining quantity
-		newRemaining := existingOrder.RemainingQty - event.Quantity
-		b.orderTracker.UpdateRemaining(event.OrderID, newRemaining)
-		log.Printf("[DEBUG][Fill] PARTIAL - Updated remaining: %.6f -> %.6f", existingOrder.RemainingQty, newRemaining)
-	} else {
-		// Full fill - remove from tracker
-		b.orderTracker.Remove(event.OrderID)
-
-		// Track filled order to ignore late NEW events (only for full fills)
-		b.mu.Lock()
-		b.filledOrders[event.OrderID] = time.Now().UnixMilli()
-		// Clean up confirmedOrders map
-		delete(b.confirmedOrders, event.OrderID)
-		// Cleanup old entries (older than 60 seconds)
-		cutoff := time.Now().UnixMilli() - 60000
-		for id, ts := range b.filledOrders {
-			if ts < cutoff {
-				delete(b.filledOrders, id)
-			}
-		}
-		b.mu.Unlock()
-
-		log.Printf("[DEBUG][Fill] FULL - Order removed from tracker: %s", event.OrderID)
-	}
-
-	// Update last trade price for market data
-	b.marketData.SetLastTradePrice(event.Price)
-
-	// Resolve ClientOrderID and level from tracker (existingOrder captured before removal above)
-	clientOrderID := ""
-	levelIndex := 0
-	if existingOrder != nil {
-		clientOrderID = existingOrder.ClientOrderID
-		levelIndex = existingOrder.LevelIndex
-	}
-
-	// Forward to strategy
-	b.strategy.OnFill(&FillEvent{
-		OrderID:         event.OrderID,
-		ClientOrderID:   clientOrderID,
-		Symbol:          event.Symbol,
-		Side:            event.Side,
-		Price:           event.Price,
-		Quantity:        event.Quantity,
-		Commission:      event.Commission,
-		CommissionAsset: event.CommissionAsset,
-		TradeID:         event.TradeID,
-		Timestamp:       event.Timestamp,
-	})
-
-	// Emit fill event callback
-	if b.onOrderEvent != nil {
-		log.Printf("[WS_EMIT_FILL] side=%s order=%s price=%.8f qty=%.2f level=%d",
-			event.Side, event.OrderID, event.Price, event.Quantity, levelIndex)
-
-		b.onOrderEvent(BotOrderEvent{
-			Type:      OrderEventTypeFill,
-			Symbol:    event.Symbol,
-			OrderID:   event.OrderID,
-			Side:      event.Side,
-			Price:     event.Price,
-			Qty:       event.Quantity,
-			Level:     levelIndex,
-			Reason:    "filled",
-			Timestamp: event.Timestamp.UnixMilli(),
-		})
-	}
-
-	// Set bot metadata before saving
-	event.BotID = b.cfg.BotID
-	event.Exchange = b.cfg.Exchange
-
-	// Publish to Redis + MongoDB
-	if b.redis != nil {
-		b.redis.PublishFill(b.ctx, event)
-	}
-	if b.mongo != nil {
-		b.mongo.SaveFill(b.ctx, event)
 	}
 }
 
@@ -718,8 +697,14 @@ func (b *BaseBot) syncLiveOrders() error {
 		return err
 	}
 
+	// Save recently placed orders before clearing (exchange may not list them yet)
+	const recentGrace = 10 * time.Second
+	recentOrders := b.orderTracker.GetAll()
+
 	b.orderTracker.Clear()
+	exchangeIDs := make(map[string]struct{}, len(orders))
 	for _, o := range orders {
+		exchangeIDs[o.OrderID] = struct{}{}
 		b.orderTracker.Add(&LiveOrder{
 			OrderID:       o.OrderID,
 			ClientOrderID: o.ClientOrderID,
@@ -732,11 +717,45 @@ func (b *BaseBot) syncLiveOrders() error {
 		})
 	}
 
-	log.Printf("[%s] Synced %d live orders from exchange", b.strategy.Name(), len(orders))
+	// Re-add recently placed orders not yet visible on exchange
+	now := time.Now()
+	reAdded := 0
+	for i := range recentOrders {
+		o := &recentOrders[i]
+		if _, exists := exchangeIDs[o.OrderID]; !exists && now.Sub(o.PlacedAt) < recentGrace {
+			b.orderTracker.Add(o)
+			reAdded++
+		}
+	}
+
+	if reAdded > 0 {
+		log.Printf("[%s] Synced %d live orders from exchange (+%d pending)", b.strategy.Name(), len(orders), reAdded)
+	} else {
+		log.Printf("[%s] Synced %d live orders from exchange", b.strategy.Name(), len(orders))
+	}
 
 	// Reconcile Redis: push missing orders, remove stale ones
 	if b.redis != nil && b.cfg.BotID != "" {
 		b.reconcileRedisOrders(orders)
+	}
+
+	// Replace live orders Hash with authoritative snapshot from exchange
+	if b.redis != nil {
+		liveOrderInfos := make([]*store.LiveOrderInfo, 0, len(orders))
+		for _, o := range orders {
+			liveOrderInfos = append(liveOrderInfos, &store.LiveOrderInfo{
+				OrderID:   o.OrderID,
+				Side:      o.Side,
+				Price:     o.Price,
+				Qty:       o.Quantity,
+				FilledQty: o.ExecutedQty,
+				Status:    "NEW",
+				UpdatedAt: time.Now().UnixMilli(),
+			})
+		}
+		if err := b.redis.ReplaceLiveOrders(b.ctx, b.cfg.Exchange, b.cfg.Symbol, liveOrderInfos); err != nil {
+			log.Printf("[%s] Failed to replace live orders in Redis: %v", b.strategy.Name(), err)
+		}
 	}
 
 	return nil

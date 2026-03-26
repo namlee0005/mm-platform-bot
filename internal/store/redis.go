@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"mm-platform-engine/internal/types"
@@ -409,6 +410,54 @@ type MMOrderEvent struct {
 	Reason    string  `json:"reason"`    // why this action was taken
 	Timestamp int64   `json:"timestamp"` // unix milliseconds
 	BotID     string  `json:"bot_id"`    // unique bot instance ID
+}
+
+// LiveOrderInfo represents a live order stored in Redis Hash
+type LiveOrderInfo struct {
+	OrderID   string  `json:"order_id"`
+	Side      string  `json:"side"`
+	Price     float64 `json:"price"`
+	Qty       float64 `json:"qty"`
+	FilledQty float64 `json:"filled_qty"`
+	Status    string  `json:"status"`
+	UpdatedAt int64   `json:"updated_at"` // unix milliseconds
+}
+
+// liveOrdersKey returns the Redis Hash key for live orders
+// Format: live:orders:{exchange}:{symbol}
+func liveOrdersKey(exchange, symbol string) string {
+	return fmt.Sprintf("live:orders:%s:%s", strings.ToLower(exchange), strings.ToLower(symbol))
+}
+
+// UpsertLiveOrder adds or updates a single live order in the Hash
+func (s *RedisStore) UpsertLiveOrder(ctx context.Context, exchange, symbol string, order *LiveOrderInfo) error {
+	data, err := json.Marshal(order)
+	if err != nil {
+		return fmt.Errorf("failed to marshal live order: %w", err)
+	}
+	return s.client.HSet(ctx, liveOrdersKey(exchange, symbol), order.OrderID, data).Err()
+}
+
+// RemoveLiveOrder removes a single order from the Hash
+func (s *RedisStore) RemoveLiveOrder(ctx context.Context, exchange, symbol, orderID string) error {
+	return s.client.HDel(ctx, liveOrdersKey(exchange, symbol), orderID).Err()
+}
+
+// ReplaceLiveOrders replaces the entire Hash with a fresh snapshot (used after full sync)
+func (s *RedisStore) ReplaceLiveOrders(ctx context.Context, exchange, symbol string, orders []*LiveOrderInfo) error {
+	key := liveOrdersKey(exchange, symbol)
+
+	pipe := s.client.Pipeline()
+	pipe.Del(ctx, key)
+	for _, o := range orders {
+		data, err := json.Marshal(o)
+		if err != nil {
+			continue
+		}
+		pipe.HSet(ctx, key, o.OrderID, data)
+	}
+	_, err := pipe.Exec(ctx)
+	return err
 }
 
 // PublishMMOrderEvent publishes MM order event to Redis Stream

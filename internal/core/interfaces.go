@@ -46,6 +46,10 @@ type Strategy interface {
 
 	// UpdateConfig updates strategy config at runtime (hot-reload)
 	UpdateConfig(newCfg interface{}) error
+
+	// UpdatePrevSnapshot saves post-execution state for fill detection next cycle.
+	// Called by bot after syncLiveOrders + getBalanceState following order execution.
+	UpdatePrevSnapshot(liveOrders []LiveOrder, balance *BalanceState)
 }
 
 // TickInput contains all data needed for a strategy tick

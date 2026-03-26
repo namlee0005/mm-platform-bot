@@ -149,7 +149,7 @@ func (t *TelegramNotifier) formatHeader(level AlertLevel) string {
 		emoji = "🚨"
 	}
 
-	return fmt.Sprintf("%s <b>[%s]</b> %s | %s", emoji, level, t.exchange, t.symbol)
+	return fmt.Sprintf("%s <b>[%s]</b> %s | %s | <code>%s</code>", emoji, level, t.exchange, t.symbol, t.botID)
 }
 
 // ========================================
