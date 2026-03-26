@@ -11,8 +11,11 @@ variables:
 build-binary:
   stage: build
   image: golang:1.25
+  timeout: 2h
   cache:
-    key: go-modules-$CI_COMMIT_REF_SLUG
+    key:
+      files:
+        - go.sum
     paths:
       - .go-cache/pkg/mod
       - .go-cache/cache/go-build

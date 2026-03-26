@@ -646,10 +646,18 @@ func (b *BaseBot) handleFill(event *types.FillEvent) {
 	// Update last trade price for market data
 	b.marketData.SetLastTradePrice(event.Price)
 
+	// Resolve ClientOrderID and level from tracker (existingOrder captured before removal above)
+	clientOrderID := ""
+	levelIndex := 0
+	if existingOrder != nil {
+		clientOrderID = existingOrder.ClientOrderID
+		levelIndex = existingOrder.LevelIndex
+	}
+
 	// Forward to strategy
 	b.strategy.OnFill(&FillEvent{
 		OrderID:         event.OrderID,
-		ClientOrderID:   "", // Not available in types.FillEvent
+		ClientOrderID:   clientOrderID,
 		Symbol:          event.Symbol,
 		Side:            event.Side,
 		Price:           event.Price,
@@ -662,8 +670,8 @@ func (b *BaseBot) handleFill(event *types.FillEvent) {
 
 	// Emit fill event callback
 	if b.onOrderEvent != nil {
-		log.Printf("[WS_EMIT_FILL] side=%s order=%s price=%.8f qty=%.2f",
-			event.Side, event.OrderID, event.Price, event.Quantity)
+		log.Printf("[WS_EMIT_FILL] side=%s order=%s price=%.8f qty=%.2f level=%d",
+			event.Side, event.OrderID, event.Price, event.Quantity, levelIndex)
 
 		b.onOrderEvent(BotOrderEvent{
 			Type:      OrderEventTypeFill,
@@ -672,7 +680,7 @@ func (b *BaseBot) handleFill(event *types.FillEvent) {
 			Side:      event.Side,
 			Price:     event.Price,
 			Qty:       event.Quantity,
-			Level:     0,
+			Level:     levelIndex,
 			Reason:    "filled",
 			Timestamp: event.Timestamp.UnixMilli(),
 		})
@@ -701,7 +709,9 @@ func (b *BaseBot) loadMarketInfo() error {
 	return b.marketData.UpdateFromExchangeInfo(info, b.cfg.Symbol)
 }
 
-// syncLiveOrders fetches current open orders from exchange
+// syncLiveOrders fetches current open orders from exchange and reconciles Redis.
+// Any order present on exchange but missing from Redis is pushed before returning.
+// Any order in Redis but gone from exchange is removed.
 func (b *BaseBot) syncLiveOrders() error {
 	orders, err := b.exch.GetOpenOrders(b.ctx, b.cfg.Symbol)
 	if err != nil {
@@ -723,7 +733,78 @@ func (b *BaseBot) syncLiveOrders() error {
 	}
 
 	log.Printf("[%s] Synced %d live orders from exchange", b.strategy.Name(), len(orders))
+
+	// Reconcile Redis: push missing orders, remove stale ones
+	if b.redis != nil && b.cfg.BotID != "" {
+		b.reconcileRedisOrders(orders)
+	}
+
 	return nil
+}
+
+// reconcileRedisOrders ensures Redis matches the current live orders from exchange.
+// Only performs reconciliation if the Redis count for this bot differs from live order count.
+func (b *BaseBot) reconcileRedisOrders(liveOrders []*exchange.Order) {
+	ctx := b.ctx
+
+	// Get current Redis orders for this bot
+	redisOrders, err := b.redis.GetAllOrders(ctx, b.cfg.Exchange, b.cfg.Symbol)
+	if err != nil {
+		log.Printf("[%s] Redis reconcile: failed to get orders: %v", b.strategy.Name(), err)
+		return
+	}
+
+	// Count Redis orders belonging to this bot
+	var botRedisCount int
+	for _, o := range redisOrders {
+		if o.BotID == b.cfg.BotID {
+			botRedisCount++
+		}
+	}
+
+	// Skip reconciliation if counts already match
+	if botRedisCount == len(liveOrders) {
+		return
+	}
+
+	log.Printf("[%s] Redis reconcile: live=%d redis=%d — reconciling", b.strategy.Name(), len(liveOrders), botRedisCount)
+
+	// Build set of live orderIDs from exchange
+	liveSet := make(map[string]struct{}, len(liveOrders))
+	for _, o := range liveOrders {
+		liveSet[o.OrderID] = struct{}{}
+	}
+
+	// Build set of Redis orderIDs for this bot, remove stale ones
+	redisSet := make(map[string]struct{}, len(redisOrders))
+	for _, o := range redisOrders {
+		if o.BotID != b.cfg.BotID {
+			continue
+		}
+		redisSet[o.OrderID] = struct{}{}
+		// Remove from Redis if no longer on exchange
+		if _, exists := liveSet[o.OrderID]; !exists {
+			b.redis.DeleteOrder(ctx, b.cfg.Exchange, b.cfg.Symbol, o.OrderID)
+		}
+	}
+
+	// Push to Redis if on exchange but missing from Redis
+	for _, o := range liveOrders {
+		if _, exists := redisSet[o.OrderID]; !exists {
+			b.redis.SaveOrder(ctx, &store.OrderInfo{
+				OrderID:       o.OrderID,
+				ClientOrderID: o.ClientOrderID,
+				Exchange:      b.cfg.Exchange,
+				Symbol:        b.cfg.Symbol,
+				Side:          o.Side,
+				Price:         o.Price,
+				Quantity:      o.Quantity,
+				CreatedAt:     time.Now().UnixMilli(),
+				Status:        "NEW",
+				BotID:         b.cfg.BotID,
+			})
+		}
+	}
 }
 
 // getSnapshot fetches current market snapshot

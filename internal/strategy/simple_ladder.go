@@ -496,10 +496,10 @@ func (s *SimpleLadderStrategy) UpdateConfig(newCfg interface{}) error {
 	return nil
 }
 
-// getAvailableBalance returns total available balance (both base and quote as notional)
+// getAvailableBalance returns total NAV (base + quote, including locked in orders)
+// Must include locked so that fully-deployed sides don't incorrectly trigger CancelAll.
 func (s *SimpleLadderStrategy) getAvailableBalance(balance *core.BalanceState, mid float64) float64 {
-	// Total notional = base value + quote value
-	return (balance.BaseFree * mid) + balance.QuoteFree
+	return balance.TotalBase()*mid + balance.TotalQuote()
 }
 
 // calculateVWAP computes volume-weighted average price from recent trades
@@ -1188,6 +1188,93 @@ func (s *SimpleLadderStrategy) maintainLadder(mid float64, balance *core.Balance
 					order := makeOrder("BUY", innerBuyPrice, 0)
 					if order != nil {
 						toAdd = append(toAdd, *order)
+					}
+				}
+			}
+		}
+	}
+
+	// Step 5: notional top-up — if either side's total remaining notional is below
+	// targetDepthPerSide, add one outer order sized to cover the shortfall.
+	// Only runs when count is already at target (Step 2/3 handle count deficits).
+	{
+		// Compute total notional per side: live orders + pending adds
+		var bidTotal, askTotal float64
+		for _, o := range validBids {
+			bidTotal += o.Price * o.RemainingQty
+		}
+		for _, o := range validAsks {
+			askTotal += o.Price * o.RemainingQty
+		}
+		for _, o := range toAdd {
+			if o.Side == "BUY" {
+				bidTotal += o.Price * o.Qty
+			} else {
+				askTotal += o.Price * o.Qty
+			}
+		}
+
+		// BUY side top-up
+		if bidCount+len(toAdd) >= expectedPerSide {
+			shortfall := targetDepthPerSide - bidTotal
+			if shortfall > s.minNotional {
+				// Place below the current lowest bid
+				lowestBid := depthFloor
+				for _, o := range validBids {
+					if o.Price < lowestBid || lowestBid == depthFloor {
+						lowestBid = o.Price
+					}
+				}
+				avgStep := s.computeAvgStep(validBids, "BUY")
+				if avgStep < s.tickSize {
+					avgStep = s.tickSize * 2
+				}
+				topUpPrice := s.roundToTick(lowestBid - avgStep)
+				if topUpPrice < depthFloor {
+					topUpPrice = depthFloor
+				}
+				if topUpPrice > 0 && topUpPrice < mid {
+					qty := s.roundToStep(shortfall / topUpPrice)
+					if qty > 0 && topUpPrice*qty >= s.minNotional {
+						if s.maxOrderQty > 0 && qty > s.maxOrderQty {
+							qty = s.maxOrderQty
+						}
+						tag := fmt.Sprintf("SM_%s_TU_B", batchID)
+						toAdd = append(toAdd, core.DesiredOrder{Side: "BUY", Price: topUpPrice, Qty: qty, Tag: tag})
+						log.Printf("[%s] Notional top-up BUY: shortfall=%.2f qty=%.6f @ %.8f", s.Name(), shortfall, qty, topUpPrice)
+					}
+				}
+			}
+		}
+
+		// SELL side top-up
+		if askCount+len(toAdd) >= expectedPerSide {
+			shortfall := targetDepthPerSide - askTotal
+			if shortfall > s.minNotional {
+				// Place above the current highest ask
+				highestAsk := depthCeil
+				for _, o := range validAsks {
+					if o.Price > highestAsk || highestAsk == depthCeil {
+						highestAsk = o.Price
+					}
+				}
+				avgStep := s.computeAvgStep(validAsks, "SELL")
+				if avgStep < s.tickSize {
+					avgStep = s.tickSize * 2
+				}
+				topUpPrice := s.roundToTick(highestAsk + avgStep)
+				if topUpPrice > depthCeil {
+					topUpPrice = depthCeil
+				}
+				if topUpPrice > mid {
+					qty := s.roundToStep(shortfall / topUpPrice)
+					if qty > 0 && topUpPrice*qty >= s.minNotional {
+						if s.maxOrderQty > 0 && qty > s.maxOrderQty {
+							qty = s.maxOrderQty
+						}
+						tag := fmt.Sprintf("SM_%s_TU_A", batchID)
+						toAdd = append(toAdd, core.DesiredOrder{Side: "SELL", Price: topUpPrice, Qty: qty, Tag: tag})
+						log.Printf("[%s] Notional top-up SELL: shortfall=%.2f qty=%.6f @ %.8f", s.Name(), shortfall, qty, topUpPrice)
 					}
 				}
 			}

@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
 	"time"
 
 	"mm-platform-engine/internal/types"
@@ -255,9 +254,6 @@ type OrderInfo struct {
 	BotID         string  `json:"botId,omitempty"` // Bot instance ID
 }
 
-// Order list expiration time
-const OrderListExpiration = 6 * time.Hour
-
 // SaveOrder saves order information to Redis List
 // Key format: order:{exchange}:{symbol}
 func (s *RedisStore) SaveOrder(ctx context.Context, order *OrderInfo) error {
@@ -268,14 +264,8 @@ func (s *RedisStore) SaveOrder(ctx context.Context, order *OrderInfo) error {
 		return fmt.Errorf("failed to marshal order: %w", err)
 	}
 
-	// Add to list (RPUSH)
 	if err := s.client.RPush(ctx, key, data).Err(); err != nil {
 		return fmt.Errorf("failed to save order to list: %w", err)
-	}
-
-	// Set expiration to prevent unbounded growth (6 hours)
-	if err := s.client.Expire(ctx, key, OrderListExpiration).Err(); err != nil {
-		log.Printf("WARNING: Failed to set order list expiration: %v", err)
 	}
 
 	return nil
