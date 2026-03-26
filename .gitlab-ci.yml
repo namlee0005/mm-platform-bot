@@ -5,14 +5,11 @@ stages:
 variables:
   IMAGE_NAME: $CI_REGISTRY_IMAGE:$CI_COMMIT_REF_SLUG
   IMAGE_LATEST: $CI_REGISTRY_IMAGE:latest
-
-  # Go cache (QUAN TRỌNG)
   GOMODCACHE: $CI_PROJECT_DIR/.cache/gomod
   GOCACHE: $CI_PROJECT_DIR/.cache/go-build
+  GOMAXPROCS: "1"
+  GOFLAGS: "-p=1"
 
-# =========================
-# BUILD GO BINARY
-# =========================
 build-binary:
   stage: build
   image: golang:1.25
@@ -29,26 +26,50 @@ build-binary:
 
   script:
     - echo "=== GO ENV ==="
+    - go version
     - go env
 
-    - echo "=== DOWNLOAD MODULES ==="
+    - echo "=== SYSTEM INFO ==="
+    - uname -a || true
+    - nproc || true
+    - free -m || true
+    - df -h || true
+
+    - echo "=== DOWNLOAD ==="
     - time go mod download
 
-    # Heartbeat để tránh GitLab tưởng job bị treo
+    - echo "=== BUILD START ==="
     - |
-      (while true; do
+      env CGO_ENABLED=0 GOOS=linux go build -x -work -v -o mm-bot ./cmd/main.go &
+      BUILD_PID=$!
+      echo "BUILD_PID=$BUILD_PID"
+
+      while kill -0 "$BUILD_PID" 2>/dev/null; do
         echo "[heartbeat] $(date -Iseconds) build still running..."
+        echo "--- ps ---"
+        ps -o pid,ppid,stat,%cpu,%mem,etime,cmd -p "$BUILD_PID" --forest || true
+        pgrep -P "$BUILD_PID" | xargs -r ps -o pid,ppid,stat,%cpu,%mem,etime,cmd -p || true
+        echo "--- memory ---"
+        free -m || true
+        echo "--- disk ---"
+        df -h || true
+        echo "--- load ---"
+        cat /proc/loadavg || true
         sleep 30
-      done) &
-      HEARTBEAT_PID=$!
+      done
 
-    - echo "=== BUILD ==="
-    - time CGO_ENABLED=0 GOOS=linux go build -x -v -o mm-bot ./cmd/main.go
+      wait "$BUILD_PID"
+      BUILD_EXIT=$?
+      echo "BUILD_EXIT=$BUILD_EXIT"
+      exit "$BUILD_EXIT"
 
-    - kill $HEARTBEAT_PID || true
-
-    - echo "=== DONE BUILD ==="
-    - ls -lah mm-bot
+  after_script:
+    - echo "=== AFTER SCRIPT ==="
+    - ls -lah || true
+    - ls -lah .cache || true
+    - ls -lah .cache/gomod | head -50 || true
+    - ls -lah .cache/go-build | head -50 || true
+    - test -f mm-bot && ls -lah mm-bot || true
 
   artifacts:
     paths:
@@ -60,9 +81,6 @@ build-binary:
     - develop
     - tags
 
-# =========================
-# BUILD DOCKER IMAGE
-# =========================
 build-docker:
   stage: docker
   image: docker:24
@@ -77,20 +95,14 @@ build-docker:
     DOCKER_TLS_CERTDIR: "/certs"
 
   before_script:
-    - echo "=== LOGIN REGISTRY ==="
-    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$CI_REGISTRY"
 
   script:
-    - echo "=== CHECK ARTIFACT ==="
     - ls -lah
     - test -f mm-bot
-
-    - echo "=== BUILD IMAGE ==="
-    - docker build -t $IMAGE_NAME -t $IMAGE_LATEST .
-
-    - echo "=== PUSH IMAGE ==="
-    - docker push $IMAGE_NAME
-    - docker push $IMAGE_LATEST
+    - docker build -t "$IMAGE_NAME" -t "$IMAGE_LATEST" .
+    - docker push "$IMAGE_NAME"
+    - docker push "$IMAGE_LATEST"
 
   only:
     - main
