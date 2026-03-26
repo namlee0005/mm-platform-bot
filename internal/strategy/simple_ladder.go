@@ -497,9 +497,10 @@ func (s *SimpleLadderStrategy) UpdateConfig(newCfg interface{}) error {
 	s.cfg.MinBalanceToTrade = cfg.MinBalanceToTrade
 	s.cfg.LevelGapTicksMax = cfg.LevelGapTicksMax
 	s.cfg.DepthBps = cfg.DepthBps
+	s.cfg.LevelStepBps = cfg.LevelStepBps
 
-	log.Printf("[%s] Config updated: spread=%.0fbps, depthBps=%.0f, levels=%d, depth=$%.0f",
-		s.Name(), s.cfg.SpreadMinBps, s.cfg.DepthBps, s.cfg.NumLevels, s.cfg.TargetDepthNotional)
+	log.Printf("[%s] Config updated: spread=%.0fbps, depthBps=%.0f, levels=%d, depth=$%.0f, levelStepBps=%.0f",
+		s.Name(), s.cfg.SpreadMinBps, s.cfg.DepthBps, s.cfg.NumLevels, s.cfg.TargetDepthNotional, s.cfg.LevelStepBps)
 
 	return nil
 }
@@ -892,7 +893,19 @@ func (s *SimpleLadderStrategy) generateSideOrders(mid, firstLevelSpreadBps, dept
 
 		orderNotional := price * qty
 		if orderNotional < s.minNotional {
-			continue
+			// Bump qty up to minimum viable rather than dropping the level
+			minQty := s.minNotional / price
+			qty = s.roundToStep(minQty)
+			// After rounding up, re-check (roundToStep may round down on some exchanges)
+			if price*qty < s.minNotional {
+				qty += s.stepSize
+				qty = s.roundToStep(qty)
+			}
+			orderNotional = price * qty
+			if orderNotional < s.minNotional {
+				log.Printf("[%s] Skipping level %d: can't meet minNotional %.4f at price %.8f (minQty=%.8f)", s.Name(), level, s.minNotional, price, qty)
+				continue
+			}
 		}
 
 		orders = append(orders, core.DesiredOrder{
@@ -1019,26 +1032,39 @@ func (s *SimpleLadderStrategy) maintainLadder(mid, marketBestBid, marketBestAsk 
 	bidCount := len(validBids)
 	askCount := len(validAsks)
 
-	// Cancel excess orders (keep only expectedPerSide per side, cancel outermost first)
+	// Cancel excess orders (keep only expectedPerSide per side, cancel outermost first).
+	// Exception: if notional is still below target, allow up to expectedPerSide*2 to keep top-up orders alive.
 	if bidCount > expectedPerSide {
-		sort.Slice(validBids, func(i, j int) bool { return validBids[i].Price < validBids[j].Price })
-		excess := bidCount - expectedPerSide
-		for i := 0; i < excess; i++ {
-			log.Printf("[%s] CANCEL order=%s BUY @ %.8f — excess BUY (%d > %d), removing outermost", s.Name(), validBids[i].OrderID, validBids[i].Price, bidCount, expectedPerSide)
-			toCancel = append(toCancel, validBids[i].OrderID)
+		totalBidNotional := 0.0
+		for _, o := range validBids {
+			totalBidNotional += o.Price * o.Qty
 		}
-		validBids = validBids[excess:]
-		bidCount = expectedPerSide
+		if totalBidNotional >= targetDepthPerSide || bidCount > expectedPerSide*2 {
+			sort.Slice(validBids, func(i, j int) bool { return validBids[i].Price < validBids[j].Price })
+			excess := bidCount - expectedPerSide
+			for i := 0; i < excess; i++ {
+				log.Printf("[%s] CANCEL order=%s BUY @ %.8f — excess BUY (%d > %d), removing outermost", s.Name(), validBids[i].OrderID, validBids[i].Price, bidCount, expectedPerSide)
+				toCancel = append(toCancel, validBids[i].OrderID)
+			}
+			validBids = validBids[excess:]
+			bidCount = expectedPerSide
+		}
 	}
 	if askCount > expectedPerSide {
-		sort.Slice(validAsks, func(i, j int) bool { return validAsks[i].Price > validAsks[j].Price })
-		excess := askCount - expectedPerSide
-		for i := 0; i < excess; i++ {
-			log.Printf("[%s] CANCEL order=%s SELL @ %.8f — excess SELL (%d > %d), removing outermost", s.Name(), validAsks[i].OrderID, validAsks[i].Price, askCount, expectedPerSide)
-			toCancel = append(toCancel, validAsks[i].OrderID)
+		totalAskNotional := 0.0
+		for _, o := range validAsks {
+			totalAskNotional += o.Price * o.Qty
 		}
-		validAsks = validAsks[excess:]
-		askCount = expectedPerSide
+		if totalAskNotional >= targetDepthPerSide || askCount > expectedPerSide*2 {
+			sort.Slice(validAsks, func(i, j int) bool { return validAsks[i].Price > validAsks[j].Price })
+			excess := askCount - expectedPerSide
+			for i := 0; i < excess; i++ {
+				log.Printf("[%s] CANCEL order=%s SELL @ %.8f — excess SELL (%d > %d), removing outermost", s.Name(), validAsks[i].OrderID, validAsks[i].Price, askCount, expectedPerSide)
+				toCancel = append(toCancel, validAsks[i].OrderID)
+			}
+			validAsks = validAsks[excess:]
+			askCount = expectedPerSide
+		}
 	}
 
 	existingBidPrices := make([]float64, 0, len(validBids))
@@ -1050,9 +1076,21 @@ func (s *SimpleLadderStrategy) maintainLadder(mid, marketBestBid, marketBestAsk 
 		existingAskPrices = append(existingAskPrices, o.Price)
 	}
 
+	// priceExists: broad check (priceTolerance) used for Step 4 / cancel guards
 	priceExists := func(price float64, existing []float64) bool {
 		for _, ep := range existing {
 			if math.Abs(ep-price) <= priceTolerance {
+				return true
+			}
+		}
+		return false
+	}
+
+	// priceSlotTaken: tight check (1 tick) used for partial replenishment and top-up
+	// to avoid blocking valid slots that are just >1 tick away from existing orders
+	priceSlotTaken := func(price float64, existing []float64) bool {
+		for _, ep := range existing {
+			if math.Abs(ep-price) <= s.tickSize {
 				return true
 			}
 		}
@@ -1118,6 +1156,13 @@ func (s *SimpleLadderStrategy) maintainLadder(mid, marketBestBid, marketBestAsk 
 					avgStep = s.tickSize * 2
 				}
 			}
+			// Cap step if level_step_bps is configured
+			if s.cfg.LevelStepBps > 0 {
+				maxStep := mid * s.cfg.LevelStepBps / 10000.0
+				if avgStep > maxStep {
+					avgStep = maxStep
+				}
+			}
 
 			lowestBid := validBids[0].Price
 			for _, o := range validBids {
@@ -1134,7 +1179,7 @@ func (s *SimpleLadderStrategy) maintainLadder(mid, marketBestBid, marketBestAsk 
 					outerPrice = depthFloor
 				}
 				outerPrice = s.roundToTick(outerPrice)
-				if outerPrice <= 0 || clamped || priceExists(outerPrice, existingBidPrices) {
+				if outerPrice <= 0 || priceSlotTaken(outerPrice, existingBidPrices) {
 					break
 				}
 				order := makeOrder("BUY", outerPrice, bidCount+added)
@@ -1146,7 +1191,93 @@ func (s *SimpleLadderStrategy) maintainLadder(mid, marketBestBid, marketBestAsk 
 				existingBidPrices = append(existingBidPrices, outerPrice)
 			}
 		}
-		log.Printf("[%s] Maintain BUY: had=%d expected=%d adding=%d", s.Name(), bidCount, expectedPerSide, len(toAdd))
+		if len(toAdd) > 0 {
+			log.Printf("[%s] Maintain BUY: had=%d expected=%d adding=%d", s.Name(), bidCount, expectedPerSide, len(toAdd))
+		}
+	}
+
+	// Step 2.5: BUY notional top-up — if total BUY notional still below target, add extra orders.
+	// Extra count is random between numLevels/2 and numLevels.
+	{
+		currentBidNotional := 0.0
+		for _, o := range validBids {
+			currentBidNotional += o.Price * o.Qty
+		}
+		for _, o := range toAdd {
+			if o.Side == "BUY" {
+				currentBidNotional += o.Price * o.Qty
+			}
+		}
+		if currentBidNotional < targetDepthPerSide {
+			half := expectedPerSide / 2
+			if half < 1 {
+				half = 1
+			}
+			extraCount := half + rand.Intn(expectedPerSide-half+1)
+			lowestBid := math.MaxFloat64
+			for _, o := range validBids {
+				if o.Price < lowestBid {
+					lowestBid = o.Price
+				}
+			}
+			for _, o := range toAdd {
+				if o.Side == "BUY" && o.Price < lowestBid {
+					lowestBid = o.Price
+				}
+			}
+			if lowestBid == math.MaxFloat64 {
+				lowestBid = mid * (1.0 - spreadMinBps/2/10000.0)
+			}
+			deficit := targetDepthPerSide - currentBidNotional
+			priceRange := lowestBid - depthFloor
+			step := s.tickSize * 2
+			if priceRange > 0 && extraCount > 0 {
+				step = priceRange / float64(extraCount+1)
+				if step < s.tickSize {
+					step = s.tickSize * 2
+				}
+			}
+			added := 0
+			for i := 1; i <= extraCount; i++ {
+				p := lowestBid - float64(i)*step
+				if p < depthFloor {
+					p = depthFloor
+				}
+				p = s.roundToTick(p)
+				if p <= 0 || priceSlotTaken(p, existingBidPrices) {
+					continue
+				}
+				unitNotional := deficit / float64(extraCount)
+				qty := s.roundToStep((unitNotional * calculateSizeMultiplier() * sizeMult) / p)
+				if qty <= 0 || p*qty < s.minNotional {
+					qty = s.roundToStep(s.minNotional / p)
+					if p*qty < s.minNotional {
+						qty += s.stepSize
+						qty = s.roundToStep(qty)
+					}
+				}
+				if s.maxOrderQty > 0 && qty > s.maxOrderQty {
+					qty = s.maxOrderQty
+				}
+				if qty <= 0 || p*qty < s.minNotional {
+					continue
+				}
+				o := core.DesiredOrder{
+					Side:       "BUY",
+					Price:      p,
+					Qty:        qty,
+					LevelIndex: bidCount + added,
+					Tag:        fmt.Sprintf("SM_%s_L%d_B", batchID, bidCount+added),
+				}
+				log.Printf("[%s] ADD BUY @ %.8f x %.2f — notional top-up (%d/%d, deficit=$%.2f)", s.Name(), p, qty, added+1, extraCount, deficit)
+				toAdd = append(toAdd, o)
+				existingBidPrices = append(existingBidPrices, p)
+				added++
+			}
+			if added > 0 {
+				log.Printf("[%s] BUY notional top-up: had=$%.2f target=$%.2f added=%d", s.Name(), currentBidNotional, targetDepthPerSide, added)
+			}
+		}
 	}
 
 	// Step 3: add missing SELL orders
@@ -1178,6 +1309,13 @@ func (s *SimpleLadderStrategy) maintainLadder(mid, marketBestBid, marketBestAsk 
 					avgStep = s.tickSize * 2
 				}
 			}
+			// Cap step if level_step_bps is configured
+			if s.cfg.LevelStepBps > 0 {
+				maxStep := mid * s.cfg.LevelStepBps / 10000.0
+				if avgStep > maxStep {
+					avgStep = maxStep
+				}
+			}
 
 			highestAsk := validAsks[0].Price
 			for _, o := range validAsks {
@@ -1194,7 +1332,7 @@ func (s *SimpleLadderStrategy) maintainLadder(mid, marketBestBid, marketBestAsk 
 					outerPrice = depthCeil
 				}
 				outerPrice = s.roundToTick(outerPrice)
-				if outerPrice <= 0 || clamped || priceExists(outerPrice, existingAskPrices) {
+				if outerPrice <= 0 || priceSlotTaken(outerPrice, existingAskPrices) {
 					break
 				}
 				order := makeOrder("SELL", outerPrice, askCount+added)
@@ -1207,7 +1345,62 @@ func (s *SimpleLadderStrategy) maintainLadder(mid, marketBestBid, marketBestAsk 
 				addedAsks++
 			}
 		}
-		log.Printf("[%s] Maintain ASK: had=%d expected=%d adding=%d", s.Name(), askCount, expectedPerSide, addedAsks)
+		if addedAsks > 0 {
+			log.Printf("[%s] Maintain ASK: had=%d expected=%d adding=%d", s.Name(), askCount, expectedPerSide, addedAsks)
+		}
+	}
+
+	// Step 3.5: SELL notional top-up — if total SELL notional still below target,
+	// pick a random outer SELL order (from outer half of ladder) and replace it
+	// with a larger one that absorbs the deficit.
+	{
+		currentAskNotional := 0.0
+		for _, o := range validAsks {
+			currentAskNotional += o.Price * o.Qty
+		}
+		for _, o := range toAdd {
+			if o.Side == "SELL" {
+				currentAskNotional += o.Price * o.Qty
+			}
+		}
+		if currentAskNotional < targetDepthPerSide && len(validAsks) > 0 {
+			deficit := targetDepthPerSide - currentAskNotional
+
+			// Sort by price descending — outermost (highest) first
+			sortedAsks := make([]core.LiveOrder, len(validAsks))
+			copy(sortedAsks, validAsks)
+			sort.Slice(sortedAsks, func(i, j int) bool {
+				return sortedAsks[i].Price > sortedAsks[j].Price
+			})
+
+			// Candidates: outer half (highest prices)
+			outerCount := len(sortedAsks) / 2
+			if outerCount < 1 {
+				outerCount = 1
+			}
+			candidates := sortedAsks[:outerCount]
+			target := candidates[rand.Intn(len(candidates))]
+
+			// New qty absorbs original notional + deficit
+			newNotional := target.Price*target.Qty + deficit
+			newQty := s.roundToStep(newNotional / target.Price)
+			if s.maxOrderQty > 0 && newQty > s.maxOrderQty {
+				newQty = s.maxOrderQty
+			}
+			if newQty > target.Qty && newQty*target.Price >= s.minNotional {
+				toCancel = append(toCancel, target.OrderID)
+				o := core.DesiredOrder{
+					Side:       "SELL",
+					Price:      target.Price,
+					Qty:        newQty,
+					LevelIndex: target.LevelIndex,
+					Tag:        fmt.Sprintf("SM_%s_L%d_A", batchID, target.LevelIndex),
+				}
+				log.Printf("[%s] SELL notional top-up: replace outer L%d @ %.8f qty %.2f→%.2f (deficit=$%.2f)",
+					s.Name(), target.LevelIndex, target.Price, target.Qty, newQty, deficit)
+				toAdd = append(toAdd, o)
+			}
+		}
 	}
 
 	// Step 4: fill-driven opposite-side response.

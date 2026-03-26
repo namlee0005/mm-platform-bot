@@ -108,6 +108,7 @@ type SimpleConfigUpdate struct {
 	LevelGapTicksMax  int     `bson:"level_gap_ticks_max,omitempty"`
 	DepthBps          float64 `bson:"depth_bps,omitempty"`        // max distance from mid in bps (e.g., 200 = 2%)
 	FillCooldownMs    int     `bson:"fill_cooldown_ms,omitempty"` // cooldown after fill in ms (e.g., 5000 = 5s)
+	LevelStepBps      float64 `bson:"level_step_bps,omitempty"`   // max price gap between orders in bps (e.g., 20 = 0.2%)
 }
 
 type ReplaceThresholds struct {

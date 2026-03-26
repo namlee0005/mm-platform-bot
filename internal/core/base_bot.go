@@ -518,17 +518,7 @@ func (b *BaseBot) handleOrderUpdate(event *types.OrderEvent) {
 			})
 		}
 
-		// Upsert into live orders hash
 		if b.redis != nil {
-			b.redis.UpsertLiveOrder(b.ctx, b.cfg.Exchange, b.cfg.Symbol, &store.LiveOrderInfo{
-				OrderID:   event.OrderID,
-				Side:      event.Side,
-				Price:     event.Price,
-				Qty:       event.Quantity,
-				FilledQty: 0,
-				Status:    event.Status,
-				UpdatedAt: event.Timestamp.UnixMilli(),
-			})
 			b.redis.SaveOrder(b.ctx, &store.OrderInfo{
 				OrderID:       event.OrderID,
 				ClientOrderID: event.ClientOrderID,
@@ -545,17 +535,6 @@ func (b *BaseBot) handleOrderUpdate(event *types.OrderEvent) {
 
 	case "PARTIALLY_FILLED":
 		b.orderTracker.UpdateRemaining(event.OrderID, event.Quantity-event.ExecutedQty)
-		if b.redis != nil {
-			b.redis.UpsertLiveOrder(b.ctx, b.cfg.Exchange, b.cfg.Symbol, &store.LiveOrderInfo{
-				OrderID:   event.OrderID,
-				Side:      event.Side,
-				Price:     event.Price,
-				Qty:       event.Quantity,
-				FilledQty: event.ExecutedQty,
-				Status:    event.Status,
-				UpdatedAt: event.Timestamp.UnixMilli(),
-			})
-		}
 
 	case "FILLED", "CANCELED", "EXPIRED", "REJECTED":
 		// Guard: Bybit WatchOrders sends full snapshots that repeat closed/canceled orders.
@@ -581,7 +560,6 @@ func (b *BaseBot) handleOrderUpdate(event *types.OrderEvent) {
 		b.mu.Unlock()
 
 		if b.redis != nil {
-			b.redis.RemoveLiveOrder(b.ctx, b.cfg.Exchange, b.cfg.Symbol, event.OrderID)
 			b.redis.DeleteOrder(b.ctx, b.cfg.Exchange, b.cfg.Symbol, event.OrderID)
 		}
 
@@ -739,25 +717,6 @@ func (b *BaseBot) syncLiveOrders() error {
 		b.reconcileRedisOrders(orders)
 	}
 
-	// Replace live orders Hash with authoritative snapshot from exchange
-	if b.redis != nil {
-		liveOrderInfos := make([]*store.LiveOrderInfo, 0, len(orders))
-		for _, o := range orders {
-			liveOrderInfos = append(liveOrderInfos, &store.LiveOrderInfo{
-				OrderID:   o.OrderID,
-				Side:      o.Side,
-				Price:     o.Price,
-				Qty:       o.Quantity,
-				FilledQty: o.ExecutedQty,
-				Status:    "NEW",
-				UpdatedAt: time.Now().UnixMilli(),
-			})
-		}
-		if err := b.redis.ReplaceLiveOrders(b.ctx, b.cfg.Exchange, b.cfg.Symbol, liveOrderInfos); err != nil {
-			log.Printf("[%s] Failed to replace live orders in Redis: %v", b.strategy.Name(), err)
-		}
-	}
-
 	return nil
 }
 
@@ -767,7 +726,7 @@ func (b *BaseBot) reconcileRedisOrders(liveOrders []*exchange.Order) {
 	ctx := b.ctx
 
 	// Get current Redis orders for this bot
-	redisOrders, err := b.redis.GetAllOrders(ctx, b.cfg.Exchange, b.cfg.Symbol)
+	redisOrders, err := b.redis.GetAllOrders(ctx, b.cfg.Exchange, b.cfg.Symbol, b.cfg.BotID)
 	if err != nil {
 		log.Printf("[%s] Redis reconcile: failed to get orders: %v", b.strategy.Name(), err)
 		return

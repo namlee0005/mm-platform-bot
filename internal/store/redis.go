@@ -255,8 +255,8 @@ type OrderInfo struct {
 	BotID         string  `json:"botId,omitempty"` // Bot instance ID
 }
 
-// SaveOrder saves order information to Redis List
-// Key format: order:{exchange}:{symbol}
+// SaveOrder saves order information to Redis List.
+// Key format: order:{exchange}:{symbol}  (shared; BotID is stored in the value JSON)
 func (s *RedisStore) SaveOrder(ctx context.Context, order *OrderInfo) error {
 	key := fmt.Sprintf("order:%s:%s", order.Exchange, order.Symbol)
 
@@ -272,17 +272,15 @@ func (s *RedisStore) SaveOrder(ctx context.Context, order *OrderInfo) error {
 	return nil
 }
 
-// GetOrder retrieves order information from Redis List by orderId
+// GetOrder retrieves order information from Redis List by orderId.
 func (s *RedisStore) GetOrder(ctx context.Context, exchange, symbol, orderID string) (*OrderInfo, error) {
 	key := fmt.Sprintf("order:%s:%s", exchange, symbol)
 
-	// Get all items from list
 	items, err := s.client.LRange(ctx, key, 0, -1).Result()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get orders from list: %w", err)
 	}
 
-	// Find the order by orderId
 	for _, item := range items {
 		var order OrderInfo
 		if err := json.Unmarshal([]byte(item), &order); err != nil {
@@ -296,45 +294,32 @@ func (s *RedisStore) GetOrder(ctx context.Context, exchange, symbol, orderID str
 	return nil, nil // Order not found
 }
 
-// DeleteOrder removes order from Redis List by orderId
+// DeleteOrder removes a specific value from the shared Redis List by orderID.
+// Uses LRem so only that exact JSON entry is removed; other bots' entries are untouched.
 func (s *RedisStore) DeleteOrder(ctx context.Context, exchange, symbol, orderID string) error {
 	key := fmt.Sprintf("order:%s:%s", exchange, symbol)
 
-	// Get all items to find the one to remove
 	items, err := s.client.LRange(ctx, key, 0, -1).Result()
 	if err != nil {
 		return fmt.Errorf("failed to get orders from list: %w", err)
 	}
 
-	// Find and remove the order
-	found := false
 	for _, item := range items {
 		var order OrderInfo
 		if err := json.Unmarshal([]byte(item), &order); err != nil {
 			continue
 		}
 		if order.OrderID == orderID {
-			// Remove this item from list (LREM removes by value)
-			removed, err := s.client.LRem(ctx, key, 1, item).Result()
-			if err != nil {
-				return fmt.Errorf("failed to remove order from list: %w", err)
-			}
-			if removed > 0 {
-				found = true
-			}
-			break
+			s.client.LRem(ctx, key, 1, item)
+			return nil
 		}
 	}
 
-	if !found {
-		return fmt.Errorf("order %s not found in list", orderID)
-	}
-
-	return nil
+	return nil // Not found is not an error
 }
 
-// GetAllOrders retrieves all orders for a symbol from Redis List
-func (s *RedisStore) GetAllOrders(ctx context.Context, exchange, symbol string) ([]*OrderInfo, error) {
+// GetAllOrders retrieves all orders belonging to botID from the shared Redis List.
+func (s *RedisStore) GetAllOrders(ctx context.Context, exchange, symbol, botID string) ([]*OrderInfo, error) {
 	key := fmt.Sprintf("order:%s:%s", exchange, symbol)
 
 	items, err := s.client.LRange(ctx, key, 0, -1).Result()
@@ -342,59 +327,66 @@ func (s *RedisStore) GetAllOrders(ctx context.Context, exchange, symbol string) 
 		return nil, fmt.Errorf("failed to get orders from list: %w", err)
 	}
 
-	orders := make([]*OrderInfo, 0, len(items))
-	for _, item := range items {
-		var order OrderInfo
-		if err := json.Unmarshal([]byte(item), &order); err != nil {
-			continue // Skip if unmarshal error
-		}
-		orders = append(orders, &order)
-	}
-
-	return orders, nil
-}
-
-// ClearAllOrders deletes all orders for a symbol from Redis (deletes the list)
-func (s *RedisStore) ClearAllOrders(ctx context.Context, exchange, symbol string) error {
-	key := fmt.Sprintf("order:%s:%s", exchange, symbol)
-
-	if err := s.client.Del(ctx, key).Err(); err != nil {
-		return fmt.Errorf("failed to delete orders list: %w", err)
-	}
-
-	return nil
-}
-
-// ClearOrdersByBotID removes only orders belonging to a specific bot
-// This is safer than ClearAllOrders when multiple bots share the same symbol
-func (s *RedisStore) ClearOrdersByBotID(ctx context.Context, exchange, symbol, botID string) (int, error) {
-	key := fmt.Sprintf("order:%s:%s", exchange, symbol)
-
-	// Get all items from list
-	items, err := s.client.LRange(ctx, key, 0, -1).Result()
-	if err != nil {
-		return 0, fmt.Errorf("failed to get orders from list: %w", err)
-	}
-
-	// Find and remove orders belonging to this bot
-	removedCount := 0
+	orders := make([]*OrderInfo, 0)
 	for _, item := range items {
 		var order OrderInfo
 		if err := json.Unmarshal([]byte(item), &order); err != nil {
 			continue
 		}
 		if order.BotID == botID {
-			removed, err := s.client.LRem(ctx, key, 1, item).Result()
-			if err != nil {
-				continue // Log but don't fail
-			}
-			if removed > 0 {
-				removedCount++
+			orders = append(orders, &order)
+		}
+	}
+
+	return orders, nil
+}
+
+// ClearAllOrders removes all entries belonging to botID from the shared Redis List via LRem.
+func (s *RedisStore) ClearAllOrders(ctx context.Context, exchange, symbol, botID string) error {
+	key := fmt.Sprintf("order:%s:%s", exchange, symbol)
+
+	items, err := s.client.LRange(ctx, key, 0, -1).Result()
+	if err != nil {
+		return fmt.Errorf("failed to get orders from list: %w", err)
+	}
+
+	for _, item := range items {
+		var order OrderInfo
+		if err := json.Unmarshal([]byte(item), &order); err != nil {
+			continue
+		}
+		if order.BotID == botID {
+			s.client.LRem(ctx, key, 1, item)
+		}
+	}
+
+	return nil
+}
+
+// ClearOrdersByBotID removes all entries belonging to botID and returns the count removed.
+func (s *RedisStore) ClearOrdersByBotID(ctx context.Context, exchange, symbol, botID string) (int, error) {
+	key := fmt.Sprintf("order:%s:%s", exchange, symbol)
+
+	items, err := s.client.LRange(ctx, key, 0, -1).Result()
+	if err != nil {
+		return 0, fmt.Errorf("failed to get orders from list: %w", err)
+	}
+
+	removed := 0
+	for _, item := range items {
+		var order OrderInfo
+		if err := json.Unmarshal([]byte(item), &order); err != nil {
+			continue
+		}
+		if order.BotID == botID {
+			n, err := s.client.LRem(ctx, key, 1, item).Result()
+			if err == nil && n > 0 {
+				removed++
 			}
 		}
 	}
 
-	return removedCount, nil
+	return removed, nil
 }
 
 // MMOrderEvent represents an MM engine order event for FE

@@ -148,7 +148,7 @@ func (b *Bot) Start(ctx context.Context) error {
 	}
 
 	// Clear all orders from Redis
-	if err := b.redis.ClearAllOrders(b.ctx, strings.ToLower(b.cfg.ExchangeName), symbol); err != nil {
+	if err := b.redis.ClearAllOrders(b.ctx, strings.ToLower(b.cfg.ExchangeName), symbol, b.userExchangeKeyID); err != nil {
 		log.Printf("WARNING: Failed to clear orders from Redis on startup: %v", err)
 		// Continue despite error
 	} else {
@@ -355,7 +355,7 @@ func (b *Bot) checkAndReloadConfig() {
 		log.Printf("WARNING: Failed to cancel orders on config reload: %v", err)
 	}
 
-	if err := b.redis.ClearAllOrders(b.ctx, strings.ToLower(b.cfg.ExchangeName), symbol); err != nil {
+	if err := b.redis.ClearAllOrders(b.ctx, strings.ToLower(b.cfg.ExchangeName), symbol, b.userExchangeKeyID); err != nil {
 		log.Printf("WARNING: Failed to clear Redis orders on config reload: %v", err)
 	}
 

@@ -539,7 +539,7 @@ func (c *CCXTAdapter) watchOrders() {
 				// Fallback fill detection from watchOrders.
 				// Bybit watchMyTrades (execution topic) is unreliable — fills arrive here
 				// as status=closed/partially_filled. Emit OnFill for any new filled qty delta.
-				if filledQty > 0 && (rawStatus == "closed" || rawStatus == "partially_filled") {
+				if filledQty > 0 && (rawStatus == "closed" || rawStatus == "partially_filled" || rawStatus == "open") {
 					c.filledQtyMu.Lock()
 					lastFilled := c.filledQtyByOrder[orderID]
 					delta := filledQty - lastFilled

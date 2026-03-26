@@ -636,7 +636,7 @@ func (b *Bot) executePlan(ctx context.Context, plan types.ReplacePlan, marketDat
 
 		// Clear all orders from Redis
 		log.Printf("[%s] Clearing orders from Redis", symbol)
-		if err := b.redis.ClearAllOrders(ctx, strings.ToLower(b.cfg.ExchangeName), symbol); err != nil {
+		if err := b.redis.ClearAllOrders(ctx, strings.ToLower(b.cfg.ExchangeName), symbol, b.userExchangeKeyID); err != nil {
 			log.Printf("[%s] WARNING: Failed to clear orders from Redis: %v", symbol, err)
 			// Continue despite Redis error
 		}

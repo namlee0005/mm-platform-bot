@@ -2,6 +2,7 @@ package strategy
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"testing"
 
@@ -526,5 +527,194 @@ func TestShiftLadder_TC10_MinNotional(t *testing.T) {
 			}
 		}
 		t.Logf("TC-10 OK: all orders above minNotional=%.2f", s.minNotional)
+	}
+}
+
+// makeLiveOrderWithQty creates a LiveOrder with explicit quantity.
+func makeLiveOrderWithQty(id, side string, price, qty float64) core.LiveOrder {
+	return core.LiveOrder{OrderID: id, Side: side, Price: price, Qty: qty}
+}
+
+// =============================================================================
+// TC-11: priceSlotTaken fix — 4 BUY orders packed near depthFloor.
+// The 5th BUY must be placed at depthFloor even when lowestBid is only N ticks away.
+//
+// Why N ticks matter:
+//   - priceSlotTaken tolerance = 1 tick  → gap > 1 tick is allowed (fix)
+//   - priceExists tolerance    = 20 ticks → gap < 20 ticks was blocked (old bug)
+//
+// We test gap = 2..19 ticks — any of them should produce a BUY add after the fix.
+// =============================================================================
+func TestShiftLadder_TC11_PartialMissing_NearDepthFloor(t *testing.T) {
+	mid := 0.008
+	// depthFloor = mid*(1 - 200bps) = 0.008 * 0.98 = 0.00784
+	depthFloor := mid * (1.0 - 200.0/10000.0)
+	tickSize := 0.000001
+
+	for _, gapTicks := range []int{2, 5, 10, 15, 19} {
+		gapTicks := gapTicks
+		t.Run(fmt.Sprintf("gap%dticks", gapTicks), func(t *testing.T) {
+			s := newTestStrategy(5)
+			// 4 BUY orders; lowestBid = depthFloor + gapTicks ticks
+			lowestBid := depthFloor + float64(gapTicks)*tickSize
+
+			live := []core.LiveOrder{
+				makeLiveOrder("b1", "BUY", lowestBid+4*tickSize),
+				makeLiveOrder("b2", "BUY", lowestBid+3*tickSize),
+				makeLiveOrder("b3", "BUY", lowestBid+2*tickSize),
+				makeLiveOrder("b4", "BUY", lowestBid), // lowestBid = depthFloor + gapTicks
+				makeLiveOrder("s1", "SELL", mid*1.0040),
+				makeLiveOrder("s2", "SELL", mid*1.0050),
+				makeLiveOrder("s3", "SELL", mid*1.0060),
+				makeLiveOrder("s4", "SELL", mid*1.0070),
+				makeLiveOrder("s5", "SELL", mid*1.0080),
+			}
+
+			t.Logf("depthFloor=%.8f lowestBid=%.8f gap=%d ticks", depthFloor, lowestBid, gapTicks)
+			out := runTick(t, s, mid, live)
+
+			if out.Action != core.TickActionAmend {
+				t.Fatalf("expected AMEND, got %s (reason: %s)", out.Action, out.Reason)
+			}
+			buyAdds := 0
+			for _, o := range out.OrdersToAdd {
+				if o.Side == "BUY" {
+					buyAdds++
+					t.Logf("added BUY @ %.8f (depthFloor=%.8f gap=%d ticks)", o.Price, depthFloor, gapTicks)
+				}
+			}
+			if buyAdds == 0 {
+				t.Errorf("gap=%d ticks: expected BUY add near depthFloor, got 0 (priceSlotTaken regression)", gapTicks)
+			}
+		})
+	}
+}
+
+// =============================================================================
+// TC-12: Notional top-up BUY — 5 orders with tiny qty (notional << target).
+// Step 2.5 must add extra orders to approach target_depth_notional.
+// =============================================================================
+func TestShiftLadder_TC12_NotionalTopUp_BUY(t *testing.T) {
+	mid := 0.008
+	s := newTestStrategy(5)
+	// target = $100/side; orders with qty=1 each → notional ≈ $0.008 * 5 = $0.04, far below $100
+
+	live := []core.LiveOrder{
+		makeLiveOrderWithQty("b1", "BUY", mid*0.9960, 1),
+		makeLiveOrderWithQty("b2", "BUY", mid*0.9950, 1),
+		makeLiveOrderWithQty("b3", "BUY", mid*0.9940, 1),
+		makeLiveOrderWithQty("b4", "BUY", mid*0.9930, 1),
+		makeLiveOrderWithQty("b5", "BUY", mid*0.9920, 1),
+		makeLiveOrderWithQty("s1", "SELL", mid*1.0040, 500),
+		makeLiveOrderWithQty("s2", "SELL", mid*1.0050, 500),
+		makeLiveOrderWithQty("s3", "SELL", mid*1.0060, 500),
+		makeLiveOrderWithQty("s4", "SELL", mid*1.0070, 500),
+		makeLiveOrderWithQty("s5", "SELL", mid*1.0080, 500),
+	}
+
+	currentBidNotional := 0.0
+	for _, o := range live {
+		if o.Side == "BUY" {
+			currentBidNotional += o.Price * o.Qty
+		}
+	}
+	t.Logf("TC-12: initial BUY notional=%.4f target=%.2f", currentBidNotional, s.cfg.TargetDepthNotional)
+
+	out := runTick(t, s, mid, live)
+
+	buyAdds := 0
+	for _, o := range out.OrdersToAdd {
+		if o.Side == "BUY" {
+			buyAdds++
+		}
+	}
+	if buyAdds == 0 {
+		t.Error("TC-12 FAIL: expected BUY top-up orders when notional << target, got 0")
+	} else {
+		t.Logf("TC-12 OK: %d top-up BUY order(s) added", buyAdds)
+	}
+}
+
+// =============================================================================
+// TC-13: cancel-excess skipped when notional below target.
+// 6 BUY orders (1 excess) with low total notional → should NOT cancel.
+// =============================================================================
+func TestShiftLadder_TC13_CancelExcess_SkippedWhenLowNotional(t *testing.T) {
+	mid := 0.008
+	s := newTestStrategy(5) // expectedPerSide=5, target=$100
+
+	// 6 BUY orders (1 excess) each with qty=1 → total BUY notional ≈ $0.048 << $100
+	live := []core.LiveOrder{
+		makeLiveOrderWithQty("b1", "BUY", mid*0.9960, 1),
+		makeLiveOrderWithQty("b2", "BUY", mid*0.9950, 1),
+		makeLiveOrderWithQty("b3", "BUY", mid*0.9940, 1),
+		makeLiveOrderWithQty("b4", "BUY", mid*0.9930, 1),
+		makeLiveOrderWithQty("b5", "BUY", mid*0.9920, 1),
+		makeLiveOrderWithQty("b6", "BUY", mid*0.9910, 1), // 1 excess
+		makeLiveOrderWithQty("s1", "SELL", mid*1.0040, 500),
+		makeLiveOrderWithQty("s2", "SELL", mid*1.0050, 500),
+		makeLiveOrderWithQty("s3", "SELL", mid*1.0060, 500),
+		makeLiveOrderWithQty("s4", "SELL", mid*1.0070, 500),
+		makeLiveOrderWithQty("s5", "SELL", mid*1.0080, 500),
+	}
+
+	out := runTick(t, s, mid, live)
+
+	for _, id := range out.OrdersToCancel {
+		for _, o := range live {
+			if o.OrderID == id && o.Side == "BUY" {
+				t.Errorf("TC-13 FAIL: cancelled BUY %s @ %.8f but notional was below target (should keep)", id, o.Price)
+			}
+		}
+	}
+	t.Logf("TC-13 OK: no BUY excess cancel when notional < target (cancels=%d)", len(out.OrdersToCancel))
+}
+
+// =============================================================================
+// TC-14: cancel-excess runs when notional meets target.
+// 6 BUY orders with high qty → notional >= target → outermost MUST be cancelled.
+// =============================================================================
+func TestShiftLadder_TC14_CancelExcess_RunsWhenNotionalOk(t *testing.T) {
+	mid := 0.008
+	s := newTestStrategy(5) // expectedPerSide=5, target=$100
+
+	// 6 BUY orders each with qty=2500 → notional ≈ 2500*0.008*6 = $120 >= $100
+	live := []core.LiveOrder{
+		makeLiveOrderWithQty("b1", "BUY", mid*0.9960, 2500),
+		makeLiveOrderWithQty("b2", "BUY", mid*0.9950, 2500),
+		makeLiveOrderWithQty("b3", "BUY", mid*0.9940, 2500),
+		makeLiveOrderWithQty("b4", "BUY", mid*0.9930, 2500),
+		makeLiveOrderWithQty("b5", "BUY", mid*0.9920, 2500),
+		makeLiveOrderWithQty("b6", "BUY", mid*0.9910, 2500), // 1 excess, outermost
+		makeLiveOrderWithQty("s1", "SELL", mid*1.0040, 500),
+		makeLiveOrderWithQty("s2", "SELL", mid*1.0050, 500),
+		makeLiveOrderWithQty("s3", "SELL", mid*1.0060, 500),
+		makeLiveOrderWithQty("s4", "SELL", mid*1.0070, 500),
+		makeLiveOrderWithQty("s5", "SELL", mid*1.0080, 500),
+	}
+
+	totalBidNotional := 0.0
+	for _, o := range live {
+		if o.Side == "BUY" {
+			totalBidNotional += o.Price * o.Qty
+		}
+	}
+	t.Logf("TC-14: BUY notional=%.2f target=%.2f", totalBidNotional, s.cfg.TargetDepthNotional)
+
+	out := runTick(t, s, mid, live)
+
+	cancelledBuys := 0
+	for _, id := range out.OrdersToCancel {
+		for _, o := range live {
+			if o.OrderID == id && o.Side == "BUY" {
+				cancelledBuys++
+				t.Logf("TC-14: cancelled BUY %s @ %.8f (excess, correct)", id, o.Price)
+			}
+		}
+	}
+	if cancelledBuys == 0 {
+		t.Error("TC-14 FAIL: expected 1 excess BUY to be cancelled when notional >= target")
+	} else {
+		t.Logf("TC-14 OK: %d excess BUY(s) cancelled when notional >= target", cancelledBuys)
 	}
 }
