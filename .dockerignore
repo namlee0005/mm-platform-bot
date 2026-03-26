@@ -13,6 +13,10 @@
 .DS_Store
 Thumbs.db
 
+# Go workspace (not needed in Docker)
+go.work
+go.work.sum
+
 # Build artifacts
 *.exe
 *.exe~
@@ -31,6 +35,7 @@ temp/
 Dockerfile
 docker-compose.yml
 .dockerignore
+dn_config.json
 
 # Documentation
 README.md

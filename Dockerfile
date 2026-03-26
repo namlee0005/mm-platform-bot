@@ -1,40 +1,27 @@
-# Build stage
-FROM golang:1.25-alpine AS builder
+# syntax=docker/dockerfile:1
 
-# Install build dependencies
-RUN apk add --no-cache git
-
-# Set working directory
+FROM golang:1.25 AS builder
 WORKDIR /build
 
-# Copy go mod files
+RUN apt-get update && apt-get install -y git && rm -rf /var/lib/apt/lists/*
+
 COPY go.mod go.sum ./
+RUN --mount=type=cache,target=/go/pkg/mod \
+    go mod download
 
-# Download dependencies
-RUN go mod download
-
-# Copy source code
 COPY . .
 
-# Build the application
-RUN CGO_ENABLED=0 GOOS=linux go build -o mm-bot ./cmd/main/main.go
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 GOOS=linux GONOSUMDB=* GOFLAGS=-mod=mod \
+    go build -o mm-bot ./cmd/main.go
 
-# Final stage
 FROM alpine:latest
-
-# Install ca-certificates for HTTPS requests
 RUN apk --no-cache add ca-certificates tzdata
 
 WORKDIR /app
 
-# Copy binary from builder
 COPY --from=builder /build/mm-bot .
 
-# Copy config file (can be overridden with volume mount)
-COPY dn_config.json .
-
-# Expose HTTP port (if your bot has HTTP server)
 EXPOSE 8080
-
-# Run the bot
 CMD ["./mm-bot"]
