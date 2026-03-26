@@ -5,13 +5,19 @@ stages:
 variables:
   IMAGE_NAME: $CI_REGISTRY_IMAGE:$CI_COMMIT_REF_SLUG
   IMAGE_LATEST: $CI_REGISTRY_IMAGE:latest
+
+  # Go cache (QUAN TRỌNG)
   GOMODCACHE: $CI_PROJECT_DIR/.cache/gomod
   GOCACHE: $CI_PROJECT_DIR/.cache/go-build
 
+# =========================
+# BUILD GO BINARY
+# =========================
 build-binary:
   stage: build
   image: golang:1.25
   timeout: 2h
+
   cache:
     key:
       files:
@@ -20,32 +26,72 @@ build-binary:
       - .cache/gomod
       - .cache/go-build
     policy: pull-push
+
   script:
+    - echo "=== GO ENV ==="
     - go env
-    - go mod download
-    - CGO_ENABLED=0 GOOS=linux go build -v -o mm-bot ./cmd/main.go
+
+    - echo "=== DOWNLOAD MODULES ==="
+    - time go mod download
+
+    # Heartbeat để tránh GitLab tưởng job bị treo
+    - |
+      (while true; do
+        echo "[heartbeat] $(date -Iseconds) build still running..."
+        sleep 30
+      done) &
+      HEARTBEAT_PID=$!
+
+    - echo "=== BUILD ==="
+    - time CGO_ENABLED=0 GOOS=linux go build -x -v -o mm-bot ./cmd/main.go
+
+    - kill $HEARTBEAT_PID || true
+
+    - echo "=== DONE BUILD ==="
+    - ls -lah mm-bot
+
   artifacts:
     paths:
       - mm-bot
     expire_in: 1 hour
+
   only:
     - main
     - develop
     - tags
 
+# =========================
+# BUILD DOCKER IMAGE
+# =========================
 build-docker:
   stage: docker
   image: docker:24
   services:
     - docker:24-dind
+
+  needs:
+    - job: build-binary
+      artifacts: true
+
   variables:
     DOCKER_TLS_CERTDIR: "/certs"
+
   before_script:
+    - echo "=== LOGIN REGISTRY ==="
     - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+
   script:
+    - echo "=== CHECK ARTIFACT ==="
+    - ls -lah
+    - test -f mm-bot
+
+    - echo "=== BUILD IMAGE ==="
     - docker build -t $IMAGE_NAME -t $IMAGE_LATEST .
+
+    - echo "=== PUSH IMAGE ==="
     - docker push $IMAGE_NAME
     - docker push $IMAGE_LATEST
+
   only:
     - main
     - develop
