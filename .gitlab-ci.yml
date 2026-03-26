@@ -5,9 +5,9 @@ stages:
 variables:
   IMAGE_NAME: $CI_REGISTRY_IMAGE:$CI_COMMIT_REF_SLUG
   IMAGE_LATEST: $CI_REGISTRY_IMAGE:latest
-  GOPATH: $CI_PROJECT_DIR/.go-cache
+  GOMODCACHE: $CI_PROJECT_DIR/.cache/gomod
+  GOCACHE: $CI_PROJECT_DIR/.cache/go-build
 
-# Build Go binary on runner (with module cache)
 build-binary:
   stage: build
   image: golang:1.25
@@ -17,14 +17,13 @@ build-binary:
       files:
         - go.sum
     paths:
-      - .go-cache/pkg/mod
-      - .go-cache/cache/go-build
+      - .cache/gomod
+      - .cache/go-build
     policy: pull-push
-  before_script:
-    - export GOMODCACHE=$GOPATH/pkg/mod
-    - export GOCACHE=$GOPATH/cache/go-build
   script:
-    - CGO_ENABLED=0 GOOS=linux go build -o mm-bot ./cmd/main.go
+    - go env
+    - go mod download
+    - CGO_ENABLED=0 GOOS=linux go build -v -o mm-bot ./cmd/main.go
   artifacts:
     paths:
       - mm-bot
@@ -34,7 +33,6 @@ build-binary:
     - develop
     - tags
 
-# Build and push Docker image (just copies pre-built binary)
 build-docker:
   stage: docker
   image: docker:24
