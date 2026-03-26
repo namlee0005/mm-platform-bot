@@ -1,5 +1,5 @@
 # Build stage
-FROM golang:1.25-alpine AS builder
+FROM golang:1.23-alpine AS builder
 
 # Install build dependencies
 RUN apk add --no-cache git
@@ -17,7 +17,7 @@ RUN go mod download
 COPY . .
 
 # Build the application
-RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o mm-bot ./cmd/main/main.go
+RUN CGO_ENABLED=0 GOOS=linux go build -o mm-bot ./cmd/main/main.go
 
 # Final stage
 FROM alpine:latest
