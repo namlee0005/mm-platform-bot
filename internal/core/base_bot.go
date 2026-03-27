@@ -717,9 +717,23 @@ func (b *BaseBot) syncLiveOrders() error {
 		log.Printf("[%s] Synced %d live orders from exchange", b.strategy.Name(), len(orders))
 	}
 
-	// Reconcile Redis: push missing orders, remove stale ones
+	// Sync Redis: clear bot's orders and re-add from exchange snapshot
 	if b.redis != nil && b.cfg.BotID != "" {
-		b.reconcileRedisOrders(orders)
+		b.redis.ClearOrdersByBotID(b.ctx, b.cfg.Exchange, b.cfg.Symbol, b.cfg.BotID)
+		for _, o := range orders {
+			b.redis.SaveOrder(b.ctx, &store.OrderInfo{
+				OrderID:       o.OrderID,
+				ClientOrderID: o.ClientOrderID,
+				Exchange:      b.cfg.Exchange,
+				Symbol:        b.cfg.Symbol,
+				Side:          o.Side,
+				Price:         o.Price,
+				Quantity:      o.Quantity,
+				CreatedAt:     time.Now().UnixMilli(),
+				Status:        "NEW",
+				BotID:         b.cfg.BotID,
+			})
+		}
 	}
 
 	return nil

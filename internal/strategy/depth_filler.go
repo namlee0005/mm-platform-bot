@@ -402,7 +402,7 @@ func (s *DepthFillerStrategy) generateRandomOrders(
 	var orders []core.DesiredOrder
 	remainingNotional := totalNotional
 
-	minDepth := s.cfg.MinDepthPct / 100.0
+	minDepth := s.cfg.MinDepthPct/100.0 + 0.01 // +100bps buffer so innermost order stays well inside remove threshold
 	maxDepth := s.cfg.MaxDepthPct / 100.0
 
 	levelIndex := 0

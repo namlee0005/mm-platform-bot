@@ -69,6 +69,9 @@ type Config struct {
 	// Simple config (raw from MongoDB)
 	SimpleConfig SimpleConfig
 
+	// Environment ("mainnet" or "staging")
+	Env string
+
 	// Redis settings
 	RedisAddr     string
 	RedisPassword string
@@ -189,6 +192,9 @@ func Load() (*Config, error) {
 
 		// Simple config (raw from MongoDB)
 		SimpleConfig: userExchangeKey.SimpleConfig,
+
+		// Environment
+		Env: getEnv("APP_ENV", "mainnet"),
 
 		// Redis settings from env
 		RedisAddr:     getEnv("REDIS_ADDR", "localhost:6379"),

@@ -69,7 +69,7 @@ func NewBot(cfg *config.Config) (*Bot, error) {
 	log.Printf("Using CCXT adapter for %s exchange", exchangeName)
 
 	// Create Redis store
-	redisStore, err := store.NewRedisStore(cfg.RedisAddr, cfg.RedisPassword, cfg.RedisDB)
+	redisStore, err := store.NewRedisStore(cfg.RedisAddr, cfg.RedisPassword, cfg.RedisDB, cfg.Env)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create redis store: %w", err)
 	}

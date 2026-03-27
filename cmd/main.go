@@ -58,7 +58,7 @@ func main() {
 	log.Printf("Using CCXT adapter for %s exchange", exchangeName)
 
 	// Create Redis store
-	redis, err := store.NewRedisStore(cfg.RedisAddr, cfg.RedisPassword, cfg.RedisDB)
+	redis, err := store.NewRedisStore(cfg.RedisAddr, cfg.RedisPassword, cfg.RedisDB, cfg.Env)
 	if err != nil {
 		log.Fatalf("Failed to create Redis store: %v", err)
 	}

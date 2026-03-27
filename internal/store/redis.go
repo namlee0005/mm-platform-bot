@@ -15,10 +15,11 @@ import (
 // RedisStore handles publishing events to Redis
 type RedisStore struct {
 	client *redis.Client
+	env    string // "mainnet" or "staging" — prefixed on all keys
 }
 
 // NewRedisStore creates a new Redis store
-func NewRedisStore(addr, password string, db int) (*RedisStore, error) {
+func NewRedisStore(addr, password string, db int, env string) (*RedisStore, error) {
 	client := redis.NewClient(&redis.Options{
 		Addr:     addr,
 		Password: password,
@@ -31,12 +32,25 @@ func NewRedisStore(addr, password string, db int) (*RedisStore, error) {
 		return nil, fmt.Errorf("failed to connect to redis: %w", err)
 	}
 
-	return &RedisStore{client: client}, nil
+	if env == "" {
+		env = "mainnet"
+	}
+
+	return &RedisStore{client: client, env: env}, nil
+}
+
+// k prefixes a Redis key with the environment namespace.
+// Mainnet keeps original keys unchanged; other envs (e.g. "staging") get a prefix.
+func (s *RedisStore) k(key string) string {
+	if s.env == "" || s.env == "mainnet" {
+		return key
+	}
+	return s.env + ":" + key
 }
 
 // PublishFill publishes a fill event to Redis Stream
 func (s *RedisStore) PublishFill(ctx context.Context, fill *types.FillEvent) error {
-	streamKey := fmt.Sprintf("fills:stream:%s", fill.Symbol)
+	streamKey := s.k(fmt.Sprintf("fills:stream:%s", fill.Symbol))
 
 	_, err := s.client.XAdd(ctx, &redis.XAddArgs{
 		Stream: streamKey,
@@ -71,7 +85,7 @@ func (s *RedisStore) PublishAccountUpdate(ctx context.Context, account *types.Ac
 	}
 
 	_, err = s.client.XAdd(ctx, &redis.XAddArgs{
-		Stream: "account:stream",
+		Stream: s.k("account:stream"),
 		MaxLen: 500,
 		Approx: true,
 		Values: map[string]interface{}{
@@ -89,7 +103,7 @@ func (s *RedisStore) PublishAccountUpdate(ctx context.Context, account *types.Ac
 
 // PublishOrderUpdate publishes an order update to Redis Stream
 func (s *RedisStore) PublishOrderUpdate(ctx context.Context, order *types.OrderEvent) error {
-	streamKey := fmt.Sprintf("orders:stream:%s", order.Symbol)
+	streamKey := s.k(fmt.Sprintf("orders:stream:%s", order.Symbol))
 
 	_, err := s.client.XAdd(ctx, &redis.XAddArgs{
 		Stream: streamKey,
@@ -117,7 +131,7 @@ func (s *RedisStore) PublishOrderUpdate(ctx context.Context, order *types.OrderE
 
 // SetBalance stores both free and locked balances in Redis using hash
 func (s *RedisStore) SetBalance(ctx context.Context, symbol, asset string, free, locked float64) error {
-	key := fmt.Sprintf("balance:%s:%s", symbol, asset)
+	key := s.k(fmt.Sprintf("balance:%s:%s", symbol, asset))
 
 	// Store as hash with free and locked fields
 	if err := s.client.HSet(ctx, key, map[string]interface{}{
@@ -143,7 +157,7 @@ type MMBalance struct {
 // SetMMBalance stores MM bot balance in Redis
 // Key: balance:{exchange}:{symbol}, Field: {botId}, Value: JSON {free, locked, total, updated_at}
 func (s *RedisStore) SetMMBalance(ctx context.Context, exchange, symbol, botID string, free, locked float64) error {
-	key := fmt.Sprintf("balance:%s:%s", exchange, symbol)
+	key := s.k(fmt.Sprintf("balance:%s:%s", exchange, symbol))
 
 	balanceData := MMBalance{
 		Free:      free,
@@ -180,7 +194,7 @@ type BotBalances struct {
 // SetMMBalances stores all asset balances for a bot in Redis
 // Key: balance:{exchange}:{symbol}, Field: {botId}, Value: JSON {balances: {asset: {free, locked, total}}, updated_at}
 func (s *RedisStore) SetMMBalances(ctx context.Context, exchange, symbol, botID string, balances []AssetBalance) error {
-	key := fmt.Sprintf("balance:%s:%s", exchange, symbol)
+	key := s.k(fmt.Sprintf("balance:%s:%s", exchange, symbol))
 	now := time.Now().Unix()
 
 	// Build balances map
@@ -218,7 +232,7 @@ func (s *RedisStore) SetMMBalances(ctx context.Context, exchange, symbol, botID 
 // ClearMMBalances removes balance data for a specific bot from Redis
 // Key: balance:{exchange}:{symbol}, Field: {botId}
 func (s *RedisStore) ClearMMBalances(ctx context.Context, exchange, symbol, botID string) error {
-	key := fmt.Sprintf("balance:%s:%s", exchange, symbol)
+	key := s.k(fmt.Sprintf("balance:%s:%s", exchange, symbol))
 
 	if err := s.client.HDel(ctx, key, botID).Err(); err != nil {
 		return fmt.Errorf("failed to clear MM balances: %w", err)
@@ -229,7 +243,7 @@ func (s *RedisStore) ClearMMBalances(ctx context.Context, exchange, symbol, botI
 
 // SetStatus stores bot status in Redis
 func (s *RedisStore) SetStatus(ctx context.Context, symbol, status string) error {
-	key := fmt.Sprintf("status:%s", symbol)
+	key := s.k(fmt.Sprintf("status:%s", symbol))
 	if err := s.client.Set(ctx, key, status, 0).Err(); err != nil {
 		return fmt.Errorf("failed to set status: %w", err)
 	}
@@ -258,7 +272,7 @@ type OrderInfo struct {
 // SaveOrder saves order information to Redis List.
 // Key format: order:{exchange}:{symbol}  (shared; BotID is stored in the value JSON)
 func (s *RedisStore) SaveOrder(ctx context.Context, order *OrderInfo) error {
-	key := fmt.Sprintf("order:%s:%s", order.Exchange, order.Symbol)
+	key := s.k(fmt.Sprintf("order:%s:%s", order.Exchange, order.Symbol))
 
 	data, err := json.Marshal(order)
 	if err != nil {
@@ -274,7 +288,7 @@ func (s *RedisStore) SaveOrder(ctx context.Context, order *OrderInfo) error {
 
 // GetOrder retrieves order information from Redis List by orderId.
 func (s *RedisStore) GetOrder(ctx context.Context, exchange, symbol, orderID string) (*OrderInfo, error) {
-	key := fmt.Sprintf("order:%s:%s", exchange, symbol)
+	key := s.k(fmt.Sprintf("order:%s:%s", exchange, symbol))
 
 	items, err := s.client.LRange(ctx, key, 0, -1).Result()
 	if err != nil {
@@ -297,7 +311,7 @@ func (s *RedisStore) GetOrder(ctx context.Context, exchange, symbol, orderID str
 // DeleteOrder removes a specific value from the shared Redis List by orderID.
 // Uses LRem so only that exact JSON entry is removed; other bots' entries are untouched.
 func (s *RedisStore) DeleteOrder(ctx context.Context, exchange, symbol, orderID string) error {
-	key := fmt.Sprintf("order:%s:%s", exchange, symbol)
+	key := s.k(fmt.Sprintf("order:%s:%s", exchange, symbol))
 
 	items, err := s.client.LRange(ctx, key, 0, -1).Result()
 	if err != nil {
@@ -320,7 +334,7 @@ func (s *RedisStore) DeleteOrder(ctx context.Context, exchange, symbol, orderID 
 
 // GetAllOrders retrieves all orders belonging to botID from the shared Redis List.
 func (s *RedisStore) GetAllOrders(ctx context.Context, exchange, symbol, botID string) ([]*OrderInfo, error) {
-	key := fmt.Sprintf("order:%s:%s", exchange, symbol)
+	key := s.k(fmt.Sprintf("order:%s:%s", exchange, symbol))
 
 	items, err := s.client.LRange(ctx, key, 0, -1).Result()
 	if err != nil {
@@ -343,7 +357,7 @@ func (s *RedisStore) GetAllOrders(ctx context.Context, exchange, symbol, botID s
 
 // ClearAllOrders removes all entries belonging to botID from the shared Redis List via LRem.
 func (s *RedisStore) ClearAllOrders(ctx context.Context, exchange, symbol, botID string) error {
-	key := fmt.Sprintf("order:%s:%s", exchange, symbol)
+	key := s.k(fmt.Sprintf("order:%s:%s", exchange, symbol))
 
 	items, err := s.client.LRange(ctx, key, 0, -1).Result()
 	if err != nil {
@@ -365,7 +379,7 @@ func (s *RedisStore) ClearAllOrders(ctx context.Context, exchange, symbol, botID
 
 // ClearOrdersByBotID removes all entries belonging to botID and returns the count removed.
 func (s *RedisStore) ClearOrdersByBotID(ctx context.Context, exchange, symbol, botID string) (int, error) {
-	key := fmt.Sprintf("order:%s:%s", exchange, symbol)
+	key := s.k(fmt.Sprintf("order:%s:%s", exchange, symbol))
 
 	items, err := s.client.LRange(ctx, key, 0, -1).Result()
 	if err != nil {
@@ -417,8 +431,8 @@ type LiveOrderInfo struct {
 
 // liveOrdersKey returns the Redis Hash key for live orders
 // Format: live:orders:{exchange}:{symbol}
-func liveOrdersKey(exchange, symbol string) string {
-	return fmt.Sprintf("live:orders:%s:%s", strings.ToLower(exchange), strings.ToLower(symbol))
+func (s *RedisStore) liveOrdersKey(exchange, symbol string) string {
+	return s.k(fmt.Sprintf("live:orders:%s:%s", strings.ToLower(exchange), strings.ToLower(symbol)))
 }
 
 // UpsertLiveOrder adds or updates a single live order in the Hash
@@ -427,17 +441,17 @@ func (s *RedisStore) UpsertLiveOrder(ctx context.Context, exchange, symbol strin
 	if err != nil {
 		return fmt.Errorf("failed to marshal live order: %w", err)
 	}
-	return s.client.HSet(ctx, liveOrdersKey(exchange, symbol), order.OrderID, data).Err()
+	return s.client.HSet(ctx, s.liveOrdersKey(exchange, symbol), order.OrderID, data).Err()
 }
 
 // RemoveLiveOrder removes a single order from the Hash
 func (s *RedisStore) RemoveLiveOrder(ctx context.Context, exchange, symbol, orderID string) error {
-	return s.client.HDel(ctx, liveOrdersKey(exchange, symbol), orderID).Err()
+	return s.client.HDel(ctx, s.liveOrdersKey(exchange, symbol), orderID).Err()
 }
 
 // ReplaceLiveOrders replaces the entire Hash with a fresh snapshot (used after full sync)
 func (s *RedisStore) ReplaceLiveOrders(ctx context.Context, exchange, symbol string, orders []*LiveOrderInfo) error {
-	key := liveOrdersKey(exchange, symbol)
+	key := s.liveOrdersKey(exchange, symbol)
 
 	pipe := s.client.Pipeline()
 	pipe.Del(ctx, key)
@@ -456,7 +470,7 @@ func (s *RedisStore) ReplaceLiveOrders(ctx context.Context, exchange, symbol str
 // Stream key format: mm:stream:{exchange}:{symbol}
 // Uses XADD with MAXLEN ~1000 to limit memory usage
 func (s *RedisStore) PublishMMOrderEvent(ctx context.Context, event *MMOrderEvent) error {
-	streamKey := fmt.Sprintf("mm:stream:%s:%s", event.Exchange, event.Symbol)
+	streamKey := s.k(fmt.Sprintf("mm:stream:%s:%s", event.Exchange, event.Symbol))
 
 	// Add to stream with auto-generated ID and approximate maxlen
 	_, err := s.client.XAdd(ctx, &redis.XAddArgs{
