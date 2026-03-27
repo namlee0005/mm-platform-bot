@@ -745,11 +745,6 @@ func (b *BaseBot) reconcileRedisOrders(liveOrders []*exchange.Order) {
 		}
 	}
 
-	// Skip reconciliation if counts already match
-	if botRedisCount == len(liveOrders) {
-		return
-	}
-
 	log.Printf("[%s] Redis reconcile: live=%d redis=%d — reconciling", b.strategy.Name(), len(liveOrders), botRedisCount)
 
 	// Build set of live orderIDs from exchange
