@@ -389,7 +389,7 @@ func (b *BaseBot) tick() error {
 
 	// 7. Log tick summary (before action, so it always logs)
 	invRatio, invDev := balance.ComputeInventory(snap.Mid, 0.5) // TODO: get target ratio from strategy
-	log.Printf("[%s] mid=%.8f, inv=%.2f%% (dev=%.2f%%), bid=%.4f, ask=%.4f, orders=%d, action=%s",
+	log.Printf("[%s] mid=%.8f, inv=%.2f%% (dev=%.2f%%), quoteLocked=%.4f, baseLocked=%.4f, orders=%d, action=%s",
 		b.strategy.Name(), snap.Mid, invRatio*100, invDev*100, balance.QuoteLocked, balance.BaseLocked, len(liveOrders), output.Action)
 
 	// 8. Execute the action
@@ -534,6 +534,9 @@ func (b *BaseBot) handleOrderUpdate(event *types.OrderEvent) {
 		}
 
 	case "PARTIALLY_FILLED":
+		b.mu.Lock()
+		b.confirmedOrders[event.OrderID] = true
+		b.mu.Unlock()
 		b.orderTracker.UpdateRemaining(event.OrderID, event.Quantity-event.ExecutedQty)
 
 	case "FILLED", "CANCELED", "EXPIRED", "REJECTED":
@@ -753,16 +756,23 @@ func (b *BaseBot) reconcileRedisOrders(liveOrders []*exchange.Order) {
 		liveSet[o.OrderID] = struct{}{}
 	}
 
-	// Build set of Redis orderIDs for this bot, remove stale ones
+	// Build set of Redis orderIDs for this bot, remove stale and duplicate entries
 	redisSet := make(map[string]struct{}, len(redisOrders))
 	for _, o := range redisOrders {
 		if o.BotID != b.cfg.BotID {
+			continue
+		}
+		if _, alreadySeen := redisSet[o.OrderID]; alreadySeen {
+			// Duplicate entry for an active order — delete all occurrences and re-add once
+			b.redis.DeleteOrder(ctx, b.cfg.Exchange, b.cfg.Symbol, o.OrderID)
+			delete(redisSet, o.OrderID) // will be re-added in the SaveOrder loop below
 			continue
 		}
 		redisSet[o.OrderID] = struct{}{}
 		// Remove from Redis if no longer on exchange
 		if _, exists := liveSet[o.OrderID]; !exists {
 			b.redis.DeleteOrder(ctx, b.cfg.Exchange, b.cfg.Symbol, o.OrderID)
+			delete(redisSet, o.OrderID)
 		}
 	}
 
@@ -799,19 +809,13 @@ func (b *BaseBot) getSnapshot() (*Snapshot, error) {
 	return b.marketData.BuildSnapshot(depth)
 }
 
-// getBalanceState returns current balance state
+// getBalanceState returns current balance state via REST API.
+// watchBalance was removed (caused CCXT internal concurrent-map fatal crashes).
 func (b *BaseBot) getBalanceState() (*BalanceState, error) {
-	// Prefer WebSocket cached balance (has accurate locked values for Bybit)
-	if bal := b.balanceTracker.Get(); bal != nil {
-		return bal, nil
-	}
-
-	// Fallback to REST API if no cache
 	acct, err := b.exch.GetAccount(b.ctx)
 	if err != nil {
 		return nil, err
 	}
-
 	return b.balanceTracker.UpdateFromAccount(acct), nil
 }
 

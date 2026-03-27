@@ -501,9 +501,10 @@ func (c *CCXTAdapter) SubscribeUserStream(ctx context.Context, handlers UserStre
 	c.ws.LoadMarkets()
 
 	// Start WebSocket watchers in separate goroutines
+	// watchBalance and watchMyTrades removed: both share the same c.ws instance
+	// which causes fatal CCXT internal concurrent-map races. watchOrders handles
+	// fills via delta tracking; balance is fetched via REST in getBalanceState().
 	go c.watchOrders()
-	go c.watchBalance()
-	go c.watchMyTrades()
 
 	return nil
 }
@@ -518,6 +519,15 @@ func (c *CCXTAdapter) watchOrders() {
 			log.Printf("[CCXT:%s] Order watcher stopped", c.exchangeName)
 			return
 		default:
+		}
+
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("[CCXT:%s] watchOrders panic (CCXT internal race): %v — restarting in 1s", c.exchangeName, r)
+					time.Sleep(time.Second)
+				}
+			}()
 			orders, err := c.ws.WatchOrders(ccxt.WithWatchOrdersSymbol(c.symbol))
 			if err != nil {
 				log.Printf("[CCXT:%s] WatchOrders error: %v", c.exchangeName, err)
@@ -525,7 +535,7 @@ func (c *CCXTAdapter) watchOrders() {
 					c.handlers.OnError(err)
 				}
 				time.Sleep(time.Second)
-				continue
+				return
 			}
 
 			for _, order := range orders {
@@ -562,13 +572,19 @@ func (c *CCXTAdapter) watchOrders() {
 				}
 
 				if c.handlers.OnOrderUpdate != nil {
+					mappedStatus := mapCCXTStatus(order.Status)
+					// Bybit sends status=open for partial fills — remap to PARTIALLY_FILLED
+					// so downstream handlers don't drop the event as a duplicate NEW.
+					if mappedStatus == "NEW" && filledQty > 0 && filledQty < derefFloat(order.Amount) {
+						mappedStatus = "PARTIALLY_FILLED"
+					}
 					c.handlers.OnOrderUpdate(&types.OrderEvent{
 						OrderID:            orderID,
 						ClientOrderID:      derefString(order.ClientOrderId),
 						Symbol:             c.nativeSymbol,
 						Side:               strings.ToUpper(derefString(order.Side)),
 						Type:               strings.ToUpper(derefString(order.Type)),
-						Status:             mapCCXTStatus(order.Status),
+						Status:             mappedStatus,
 						Price:              derefFloat(order.Price),
 						Quantity:           derefFloat(order.Amount),
 						ExecutedQty:        derefFloat(order.Filled),
@@ -577,109 +593,7 @@ func (c *CCXTAdapter) watchOrders() {
 					})
 				}
 			}
-		}
-	}
-}
-
-// watchBalance watches for balance updates via WebSocket
-func (c *CCXTAdapter) watchBalance() {
-	log.Printf("[CCXT:%s] Starting balance watcher", c.exchangeName)
-
-	for {
-		select {
-		case <-c.ctx.Done():
-			log.Printf("[CCXT:%s] Balance watcher stopped", c.exchangeName)
-			return
-		default:
-			balance, err := c.ws.WatchBalance()
-			if err != nil {
-				log.Printf("[CCXT:%s] WatchBalance error: %v", c.exchangeName, err)
-				if c.handlers.OnError != nil {
-					c.handlers.OnError(err)
-				}
-				time.Sleep(time.Second)
-				continue
-			}
-
-			if c.handlers.OnAccountUpdate != nil {
-				var balances []types.Balance
-				for asset, freePtr := range balance.Free {
-					free := derefFloat(freePtr)
-					locked := 0.0
-					if usedPtr, ok := balance.Used[asset]; ok {
-						locked = derefFloat(usedPtr)
-					}
-					if free > 0 || locked > 0 {
-						balances = append(balances, types.Balance{
-							Asset:  asset,
-							Free:   free,
-							Locked: locked,
-						})
-					}
-				}
-
-				c.handlers.OnAccountUpdate(&types.AccountEvent{
-					Balances:  balances,
-					Timestamp: time.Now(),
-				})
-			}
-		}
-	}
-}
-
-// watchMyTrades watches for trade executions via WebSocket
-func (c *CCXTAdapter) watchMyTrades() {
-	log.Printf("[CCXT:%s] Starting my trades watcher for symbol=%s", c.exchangeName, c.symbol)
-
-	for {
-		select {
-		case <-c.ctx.Done():
-			log.Printf("[CCXT:%s] My trades watcher stopped", c.exchangeName)
-			return
-		default:
-			log.Printf("[CCXT:%s] Calling WatchMyTrades...", c.exchangeName)
-			trades, err := c.ws.WatchMyTrades(ccxt.WithWatchMyTradesSymbol(c.symbol))
-			if err != nil {
-				log.Printf("[CCXT:%s] WatchMyTrades error: %v", c.exchangeName, err)
-				if c.handlers.OnError != nil {
-					c.handlers.OnError(err)
-				}
-				time.Sleep(time.Second)
-				continue
-			}
-			log.Printf("[CCXT:%s] WatchMyTrades returned %d trades", c.exchangeName, len(trades))
-
-			for _, trade := range trades {
-				tradeOrderID := derefString(trade.Order)
-				tradeQty := derefFloat(trade.Amount)
-
-				log.Printf("[CCXT:%s] Received trade: order=%s side=%s price=%.8f qty=%.6f",
-					c.exchangeName, tradeOrderID, derefString(trade.Side),
-					derefFloat(trade.Price), tradeQty)
-
-				// Update tracker so watchOrders fallback doesn't double-count this fill
-				c.filledQtyMu.Lock()
-				c.filledQtyByOrder[tradeOrderID] += tradeQty
-				c.filledQtyMu.Unlock()
-
-				if c.handlers.OnFill != nil {
-					commission := derefFloat(trade.Fee.Cost)
-
-					c.handlers.OnFill(&types.FillEvent{
-						OrderID:         tradeOrderID,
-						ClientOrderID:   "",
-						Symbol:          c.nativeSymbol,
-						Side:            strings.ToUpper(derefString(trade.Side)),
-						Price:           derefFloat(trade.Price),
-						Quantity:        tradeQty,
-						Commission:      commission,
-						CommissionAsset: "",
-						TradeID:         derefString(trade.Id),
-						Timestamp:       time.UnixMilli(derefInt64(trade.Timestamp)),
-					})
-				}
-			}
-		}
+		}()
 	}
 }
 

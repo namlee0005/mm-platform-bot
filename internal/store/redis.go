@@ -311,7 +311,7 @@ func (s *RedisStore) DeleteOrder(ctx context.Context, exchange, symbol, orderID 
 		}
 		if order.OrderID == orderID {
 			s.client.LRem(ctx, key, 1, item)
-			return nil
+			// Don't return — continue to remove all duplicate entries for this orderID
 		}
 	}
 

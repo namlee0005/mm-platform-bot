@@ -57,6 +57,10 @@ type DepthFillerStrategy struct {
 
 	// Shift ladder tracking - orders to add after fill
 	pendingShifts []depthFillerShift
+
+	// Cooldown: track last time orders were removed due to price approaching.
+	// Prevents immediate regen after price-approaching removal.
+	lastRemoveTime time.Time
 }
 
 // NewDepthFillerStrategy creates a new DepthFillerStrategy
@@ -75,7 +79,9 @@ func NewDepthFillerStrategy(cfg *DepthFillerConfig) *DepthFillerStrategy {
 		cfg.TimeSleepMs = 200 // 200ms between orders
 	}
 	if cfg.RemoveThresholdPct == 0 {
-		cfg.RemoveThresholdPct = cfg.MinDepthPct // Same as min depth
+		// Set 20% tighter than min depth so innermost orders placed at minDepth
+		// are not immediately removed on tiny mid fluctuations.
+		cfg.RemoveThresholdPct = cfg.MinDepthPct * 0.8
 	}
 	if cfg.LadderRegenBps == 0 {
 		cfg.LadderRegenBps = 100 // 1% move triggers regen
@@ -137,6 +143,10 @@ func (s *DepthFillerStrategy) Tick(ctx context.Context, input *core.TickInput) (
 	ordersToRemove := s.checkOrdersToRemove(input.LiveOrders, mid)
 	if len(ordersToRemove) > 0 {
 		log.Printf("[%s] Removing %d orders - price approaching", s.Name(), len(ordersToRemove))
+		// Record removal time so adding new orders is paused during cooldown.
+		s.mu.Lock()
+		s.lastRemoveTime = time.Now()
+		s.mu.Unlock()
 		return &core.TickOutput{
 			Action:         core.TickActionAmend,
 			OrdersToCancel: ordersToRemove,
@@ -144,7 +154,14 @@ func (s *DepthFillerStrategy) Tick(ctx context.Context, input *core.TickInput) (
 		}, nil
 	}
 
-	// Check if we need to regenerate ladder
+	if s.cfg.UseFullBalance {
+		// Full-balance mode: surgical amend — never cancel all orders.
+		// Cancel only orders that drifted outside [minDepth, maxDepth] from the
+		// current mid, then place new orders with the freed + free balance.
+		return s.tickFullBalanceAmend(mid, input.LiveOrders, balance)
+	}
+
+	// Fixed-levels mode: keep existing regen + full-replace logic.
 	shouldRegen, reason := s.shouldRegenerateLadder(mid, len(input.LiveOrders))
 	if !shouldRegen {
 		return &core.TickOutput{
@@ -153,7 +170,6 @@ func (s *DepthFillerStrategy) Tick(ctx context.Context, input *core.TickInput) (
 		}, nil
 	}
 
-	// Generate new ladder
 	desired := s.computeDesiredOrders(mid, balance)
 	if len(desired) == 0 {
 		return &core.TickOutput{
@@ -177,6 +193,103 @@ func (s *DepthFillerStrategy) Tick(ctx context.Context, input *core.TickInput) (
 	}, nil
 }
 
+// tickFullBalanceAmend handles the full-balance mode using surgical AMEND operations.
+// It never cancels all orders. Instead it:
+//  1. On initial run (no live orders): places full ladder via TickActionAmend + OrdersToAdd.
+//  2. Otherwise: cancels only orders outside [minDepth, maxDepth] from current mid,
+//     then places new orders with freed + free balance.
+func (s *DepthFillerStrategy) tickFullBalanceAmend(mid float64, liveOrders []core.LiveOrder, balance *core.BalanceState) (*core.TickOutput, error) {
+	// Initial placement — no live orders.
+	if len(liveOrders) == 0 {
+		s.mu.RLock()
+		inCooldown := !s.lastRemoveTime.IsZero() && time.Since(s.lastRemoveTime) < removeRegenCooldown
+		s.mu.RUnlock()
+		if inCooldown {
+			return &core.TickOutput{Action: core.TickActionKeep, Reason: "cooldown"}, nil
+		}
+
+		desired := s.computeFullBalanceOrders(mid, balance, s.newBatchID())
+		if len(desired) == 0 {
+			return &core.TickOutput{Action: core.TickActionKeep, Reason: "no_orders_to_place"}, nil
+		}
+		log.Printf("[%s] Initial placement: %d orders", s.Name(), len(desired))
+		return &core.TickOutput{
+			Action:      core.TickActionAmend,
+			OrdersToAdd: desired,
+			Reason:      "initial",
+		}, nil
+	}
+
+	// Find orders that drifted outside the valid depth band.
+	toCancel, freedQuote, freedBase := s.findOutOfRangeOrders(mid, liveOrders)
+
+	// Respect cooldown when ADDING new orders (cancels are always safe).
+	s.mu.RLock()
+	inCooldown := !s.lastRemoveTime.IsZero() && time.Since(s.lastRemoveTime) < removeRegenCooldown
+	s.mu.RUnlock()
+
+	var toAdd []core.DesiredOrder
+	if !inCooldown {
+		quoteAvail := balance.QuoteFree + freedQuote
+		baseAvail := balance.BaseFree + freedBase
+		baseNotional := baseAvail * mid
+		totalNotional := quoteAvail + baseNotional
+
+		minOrderNotional := totalNotional * s.cfg.MinOrderSizePct / 100.0
+		if minOrderNotional < s.minNotional {
+			minOrderNotional = s.minNotional
+		}
+
+		batchID := s.newBatchID()
+		if quoteAvail >= minOrderNotional {
+			toAdd = append(toAdd, s.generateRandomOrders(mid, "BUY", quoteAvail, minOrderNotional, batchID)...)
+		}
+		if baseNotional >= minOrderNotional {
+			toAdd = append(toAdd, s.generateRandomOrders(mid, "SELL", baseNotional, minOrderNotional, batchID)...)
+		}
+	}
+
+	if len(toCancel) == 0 && len(toAdd) == 0 {
+		return &core.TickOutput{Action: core.TickActionKeep, Reason: "orders_ok"}, nil
+	}
+
+	log.Printf("[%s] Amend: cancel %d out-of-range, add %d new", s.Name(), len(toCancel), len(toAdd))
+	return &core.TickOutput{
+		Action:         core.TickActionAmend,
+		OrdersToCancel: toCancel,
+		OrdersToAdd:    toAdd,
+		Reason:         fmt.Sprintf("amend_c%d_a%d", len(toCancel), len(toAdd)),
+	}, nil
+}
+
+// findOutOfRangeOrders returns order IDs (and freed notional) for orders that are
+// outside the valid [minDepth, maxDepth] band from the current mid.
+func (s *DepthFillerStrategy) findOutOfRangeOrders(mid float64, liveOrders []core.LiveOrder) (toCancel []string, freedQuote, freedBase float64) {
+	minDepth := s.cfg.MinDepthPct / 100.0
+	maxDepth := s.cfg.MaxDepthPct / 100.0
+
+	for _, order := range liveOrders {
+		depth := math.Abs(order.Price-mid) / mid
+		if depth < minDepth || depth > maxDepth {
+			log.Printf("[%s] Order %s %.8f depth=%.2f%% out of range [%.1f%%, %.1f%%] — canceling",
+				s.Name(), order.OrderID, order.Price, depth*100, minDepth*100, maxDepth*100)
+			toCancel = append(toCancel, order.OrderID)
+			if order.Side == "BUY" {
+				freedQuote += order.Price * order.RemainingQty
+			} else {
+				freedBase += order.RemainingQty
+			}
+		}
+	}
+	return
+}
+
+// newBatchID generates a short unique batch identifier for order tags.
+func (s *DepthFillerStrategy) newBatchID() string {
+	timestamp := time.Now().UnixMilli() % 100000000
+	return fmt.Sprintf("%d%03d", timestamp, rand.Intn(1000))
+}
+
 // checkOrdersToRemove returns order IDs that are too close to mid price
 func (s *DepthFillerStrategy) checkOrdersToRemove(liveOrders []core.LiveOrder, mid float64) []string {
 	threshold := s.cfg.RemoveThresholdPct / 100.0
@@ -195,6 +308,10 @@ func (s *DepthFillerStrategy) checkOrdersToRemove(liveOrders []core.LiveOrder, m
 }
 
 // shouldRegenerateLadder checks if we need to regenerate the ladder
+// removeRegenCooldown is the minimum wait after price-approaching removals
+// before a ladder regen is allowed. Prevents the remove→regen→remove loop.
+const removeRegenCooldown = 10 * time.Second
+
 func (s *DepthFillerStrategy) shouldRegenerateLadder(mid float64, currentOrderCount int) (bool, string) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -204,7 +321,14 @@ func (s *DepthFillerStrategy) shouldRegenerateLadder(mid float64, currentOrderCo
 		return true, "initial"
 	}
 
-	// No orders left
+	// Cooldown: if we recently removed orders due to price approaching,
+	// don't immediately regen — the price may continue moving and new orders
+	// would just get removed again on the next tick.
+	if !s.lastRemoveTime.IsZero() && time.Since(s.lastRemoveTime) < removeRegenCooldown {
+		return false, ""
+	}
+
+	// No orders left (and cooldown expired)
 	if currentOrderCount == 0 {
 		return true, "no_orders"
 	}
@@ -215,28 +339,21 @@ func (s *DepthFillerStrategy) shouldRegenerateLadder(mid float64, currentOrderCo
 		return true, fmt.Sprintf("mid_moved_%.1fbps", midChangeBps)
 	}
 
-	// Too few orders (more than half removed)
+	// Too few orders (more than half removed) — use 1/3 threshold to be less aggressive
 	expectedOrders := len(s.cachedLadder)
 	if s.cfg.NumLevels > 0 {
 		expectedOrders = s.cfg.NumLevels * 2
 	}
-	if currentOrderCount < expectedOrders/2 {
+	if currentOrderCount < expectedOrders/3 {
 		return true, fmt.Sprintf("orders_low_%d/%d", currentOrderCount, expectedOrders)
 	}
 
 	return false, ""
 }
 
-// computeDesiredOrders computes the desired order ladder
+// computeDesiredOrders computes the desired order ladder (used by fixed-levels mode).
 func (s *DepthFillerStrategy) computeDesiredOrders(mid float64, balance *core.BalanceState) []core.DesiredOrder {
-	// Short batchID
-	timestamp := time.Now().UnixMilli() % 100000000
-	batchID := fmt.Sprintf("%d%03d", timestamp, rand.Intn(1000))
-
-	if s.cfg.UseFullBalance {
-		return s.computeFullBalanceOrders(mid, balance, batchID)
-	}
-	return s.computeFixedLevelOrders(mid, balance, batchID)
+	return s.computeFixedLevelOrders(mid, balance, s.newBatchID())
 }
 
 // computeFullBalanceOrders generates random orders using all available balance
