@@ -328,6 +328,7 @@ func (b *BaseBot) tick() error {
 	if err != nil {
 		return fmt.Errorf("balance failed: %w", err)
 	}
+	b.publishAllBalancesToRedis()
 
 	// 3. Get live orders (sync with exchange based on interval)
 	// SyncOrdersIntervalMs: 0 = every tick, >0 = every N ms
@@ -397,7 +398,8 @@ func (b *BaseBot) tick() error {
 	case TickActionCancelAll:
 		return b.cancelAllOrders(output.Reason)
 	case TickActionKeep:
-		// Do nothing
+		// Update prev snapshot so fill detection doesn't re-fire on stale counts
+		b.strategy.UpdatePrevSnapshot(liveOrders, balance)
 	case TickActionReplace:
 		if err := b.replaceOrders(output.DesiredOrders, output.Reason); err != nil {
 			return err

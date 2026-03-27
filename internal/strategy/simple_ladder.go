@@ -1246,10 +1246,11 @@ func (s *SimpleLadderStrategy) maintainLadder(mid, marketBestBid, marketBestAsk 
 			missing := expectedPerSide - bidCount
 			deficitBid := targetDepthPerSide - currentBidNotional
 			notionalPerBid := deficitBid / float64(missing)
+			safeFloor := s.roundToTick(depthFloor * (1.0 + 10.0/10000.0))
 			for added := 0; added < missing; added++ {
 				outerPrice := lowestBid - float64(added+1)*avgStep
-				if outerPrice < depthFloor {
-					outerPrice = depthFloor
+				if outerPrice < safeFloor {
+					outerPrice = safeFloor
 				}
 				outerPrice = s.roundToTick(outerPrice)
 				if outerPrice <= 0 || priceSlotTaken(outerPrice, existingBidPrices) {
@@ -1379,10 +1380,11 @@ func (s *SimpleLadderStrategy) maintainLadder(mid, marketBestBid, marketBestAsk 
 			missing := expectedPerSide - askCount
 			deficitAsk := targetDepthPerSide - currentAskNotional
 			notionalPerAsk := deficitAsk / float64(missing)
+			safeCeil := s.roundToTick(depthCeil * (1.0 - 10.0/10000.0))
 			for added := 0; added < missing; added++ {
 				outerPrice := highestAsk + float64(added+1)*avgStep
-				if outerPrice > depthCeil {
-					outerPrice = depthCeil
+				if outerPrice > safeCeil {
+					outerPrice = safeCeil
 				}
 				outerPrice = s.roundToTick(outerPrice)
 				if outerPrice <= 0 || priceSlotTaken(outerPrice, existingAskPrices) {
