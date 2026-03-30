@@ -389,9 +389,14 @@ func (b *BaseBot) tick() error {
 	}
 
 	// 7. Log tick summary (before action, so it always logs)
-	invRatio, invDev := balance.ComputeInventory(snap.Mid, 0.5) // TODO: get target ratio from strategy
+	// Use fair_price from strategy metrics if available, fallback to snap.Mid
+	logMid := snap.Mid
+	if fp, ok := output.Metrics["fair_price"]; ok && fp > 0 {
+		logMid = fp
+	}
+	invRatio, invDev := balance.ComputeInventory(logMid, 0.5) // TODO: get target ratio from strategy
 	log.Printf("[%s] mid=%.8f, inv=%.2f%% (dev=%.2f%%), quoteLocked=%.4f, baseLocked=%.4f, orders=%d, action=%s",
-		b.strategy.Name(), snap.Mid, invRatio*100, invDev*100, balance.QuoteLocked, balance.BaseLocked, len(liveOrders), output.Action)
+		b.strategy.Name(), logMid, invRatio*100, invDev*100, balance.QuoteLocked, balance.BaseLocked, len(liveOrders), output.Action)
 
 	// 8. Execute the action
 	switch output.Action {

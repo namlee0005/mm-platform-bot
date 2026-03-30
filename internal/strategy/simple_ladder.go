@@ -55,7 +55,7 @@ const (
 	minTradesForVWAP = 3
 
 	// Inventory adjustment strength: bps per 10% inventory skew
-	// Example: 10% skew → ±50 bps adjustment
+	// Example: 10% skew → ±50 bps adjustment (500 → ~10bps at 19% skew)
 	inventoryAdjustmentBps = 50.0
 )
 
@@ -324,9 +324,10 @@ func (s *SimpleLadderStrategy) Tick(ctx context.Context, input *core.TickInput) 
 	sizeMult := s.calculateSizeMultiplier(drawdown, mode)
 
 	metrics := map[string]float64{
-		"nav":       nav,
-		"drawdown":  drawdown,
-		"size_mult": sizeMult,
+		"nav":        nav,
+		"drawdown":   drawdown,
+		"size_mult":  sizeMult,
+		"fair_price": mid,
 	}
 
 	result := s.maintainLadder(mid, input.Snapshot.BestBid, input.Snapshot.BestAsk, balance, input.LiveOrders, sizeMult)
@@ -616,8 +617,8 @@ func (s *SimpleLadderStrategy) calculateFairPrice(trades []exchange.Trade, balan
 		}
 	} else {
 		// Valid VWAP — blend with last trade price (Option B)
-		// fairPrice = 0.7 × vwap + 0.3 × lastTradePrice
-		// Reduces lag when price moves fast on thin volume
+		// fairPrice = 0.9 × vwap + 0.1 × lastTradePrice
+		// Small lastTrade weight: enough to reduce lag, not enough to cause churn from noise
 		vwap := vwapRes.price
 		isFresh = true
 
@@ -633,7 +634,7 @@ func (s *SimpleLadderStrategy) calculateFairPrice(trades []exchange.Trade, balan
 			lastTradePrice = latest.Price
 		}
 
-		basePrice = 0.7*vwap + 0.3*lastTradePrice
+		basePrice = 0.9*vwap + 0.1*lastTradePrice
 
 		// Update cache
 		s.lastVWAP = vwap
@@ -647,7 +648,7 @@ func (s *SimpleLadderStrategy) calculateFairPrice(trades []exchange.Trade, balan
 			log.Printf("[FairPrice] VWAP: %.8f (trades=%d, age=%v, volume=%.2f)",
 				vwap, vwapRes.tradeCount, vwapRes.age, vwapRes.totalVolume)
 		}
-		log.Printf("[FairPrice] Blend: 0.7×vwap(%.8f) + 0.3×last(%.8f) = %.8f",
+		log.Printf("[FairPrice] Blend: 0.9×vwap(%.8f) + 0.1×last(%.8f) = %.8f",
 			vwap, lastTradePrice, basePrice)
 	}
 
