@@ -46,7 +46,7 @@ const (
 // Fair price calculation constants
 const (
 	// VWAP calculation window for fair price
-	vwapWindowMinutes = 10 // Use 10 minutes of trade history
+	vwapWindowMinutes = 3 // Use 3 minutes of trade history
 
 	// Maximum age of VWAP before considering it stale
 	maxVWAPStalenessMinutes = 30 // Warn if VWAP older than 30 minutes
@@ -241,6 +241,14 @@ func (s *SimpleLadderStrategy) Init(ctx context.Context, snap *core.Snapshot, ba
 	// Default max order qty if not set (Bybit default is 2M for most tokens)
 	if s.maxOrderQty <= 0 {
 		s.maxOrderQty = 1000000 // Conservative default: 1M
+	}
+
+	// Auto-detect InitBase/InitQuote from current balance if not configured
+	if s.cfg.InitBase == 0 && s.cfg.InitQuote == 0 {
+		s.cfg.InitBase = balance.TotalBase()
+		s.cfg.InitQuote = balance.TotalQuote()
+		log.Printf("[%s] Auto-detected init inventory: base=%.2f, quote=%.2f",
+			s.Name(), s.cfg.InitBase, s.cfg.InitQuote)
 	}
 
 	log.Printf("[%s] Initialized: tickSize=%.8f, stepSize=%.8f, minNotional=%.2f, maxOrderQty=%.0f",
@@ -607,22 +615,40 @@ func (s *SimpleLadderStrategy) calculateFairPrice(trades []exchange.Trade, balan
 			log.Printf("[FairPrice] 🔴 No VWAP available, using order book mid: %.8f", basePrice)
 		}
 	} else {
-		// Valid VWAP
-		basePrice = vwapRes.price
+		// Valid VWAP — blend with last trade price (Option B)
+		// fairPrice = 0.7 × vwap + 0.3 × lastTradePrice
+		// Reduces lag when price moves fast on thin volume
+		vwap := vwapRes.price
 		isFresh = true
 
+		// Find last trade price (most recent trade in slice)
+		lastTradePrice := vwap // fallback to vwap if no trades
+		if len(trades) > 0 {
+			latest := trades[0]
+			for _, t := range trades[1:] {
+				if t.Timestamp.After(latest.Timestamp) {
+					latest = t
+				}
+			}
+			lastTradePrice = latest.Price
+		}
+
+		basePrice = 0.7*vwap + 0.3*lastTradePrice
+
 		// Update cache
-		s.lastVWAP = basePrice
+		s.lastVWAP = vwap
 		s.lastVWAPTime = time.Now()
 
 		// Log VWAP calculation
 		if vwapRes.age > time.Duration(maxVWAPStalenessMinutes)*time.Minute {
 			log.Printf("[FairPrice] ⚠️  VWAP stale: %.8f (trades=%d, age=%v, volume=%.2f)",
-				basePrice, vwapRes.tradeCount, vwapRes.age, vwapRes.totalVolume)
+				vwap, vwapRes.tradeCount, vwapRes.age, vwapRes.totalVolume)
 		} else {
 			log.Printf("[FairPrice] VWAP: %.8f (trades=%d, age=%v, volume=%.2f)",
-				basePrice, vwapRes.tradeCount, vwapRes.age, vwapRes.totalVolume)
+				vwap, vwapRes.tradeCount, vwapRes.age, vwapRes.totalVolume)
 		}
+		log.Printf("[FairPrice] Blend: 0.7×vwap(%.8f) + 0.3×last(%.8f) = %.8f",
+			vwap, lastTradePrice, basePrice)
 	}
 
 	// Calculate inventory state
@@ -641,7 +667,7 @@ func (s *SimpleLadderStrategy) calculateFairPrice(trades []exchange.Trade, balan
 			inv.skew*100, inv.baseValue, inv.quoteValue, adjustment)
 	}
 
-	log.Printf("[FairPrice] Final: %.8f (base=%.8f, inv_adj=%.8f)", fairPrice, basePrice, adjustment)
+	log.Printf("[FairPrice] mid=%.8f (blend=%.8f, inv_adj=%.8f)", fairPrice, basePrice, adjustment)
 
 	// Update cache
 	s.lastFairPrice = fairPrice
@@ -1068,8 +1094,8 @@ func (s *SimpleLadderStrategy) converge(desired []core.DesiredOrder, live []core
 		}
 	}
 
-	// Determine if fill gap protection is active (within 30s of a fill)
-	const fillGapWindow = 15 * time.Second
+	// Determine if fill gap protection is active (within 1m of a fill)
+	const fillGapWindow = 1 * time.Minute
 	now := time.Now()
 	bidFillActive := !s.lastBidFillTime.IsZero() && now.Sub(s.lastBidFillTime) < fillGapWindow
 	askFillActive := !s.lastAskFillTime.IsZero() && now.Sub(s.lastAskFillTime) < fillGapWindow
