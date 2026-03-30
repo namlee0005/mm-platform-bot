@@ -566,10 +566,9 @@ func (b *BaseBot) handleOrderUpdate(event *types.OrderEvent) {
 
 		// Fill-specific handling (FILLED only)
 		if event.Status == "FILLED" {
-			now := time.Now()
-			latency := now.Sub(event.Timestamp)
-			log.Printf("[FILL] %s %s @ %.8f x %.6f (order=%s) latency=%v",
-				event.Side, event.Symbol, event.Price, event.ExecutedQty, event.OrderID, latency)
+			ttf := time.Since(event.Timestamp)
+			log.Printf("[FILL] %s %s @ %.8f x %.6f (order=%s) ttf=%v",
+				event.Side, event.Symbol, event.Price, event.ExecutedQty, event.OrderID, ttf)
 			b.marketData.SetLastTradePrice(event.Price)
 
 			clientOrderID := event.ClientOrderID
@@ -1025,6 +1024,15 @@ func (b *BaseBot) logOrderPlaced(order *exchange.Order, tag string, requestedPri
 
 	log.Printf("[%s] Placed %s L%d @ %.8f x %.6f (id=%s)",
 		b.strategy.Name(), logSide, level, logPrice, logQty, order.OrderID)
+
+	// Skip adding to tracker if order already reached terminal state (instant fill / reject)
+	b.mu.RLock()
+	_, alreadyFilled := b.filledOrders[order.OrderID]
+	b.mu.RUnlock()
+	if alreadyFilled {
+		log.Printf("[%s] Order %s already terminal, skipping tracker add", b.strategy.Name(), order.OrderID)
+		return
+	}
 
 	// Add to orderTracker immediately (don't wait for WebSocket NEW event)
 	b.orderTracker.Add(&LiveOrder{

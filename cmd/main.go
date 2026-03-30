@@ -94,12 +94,16 @@ func main() {
 		maker = createSimpleMaker(cfg, exch, redis, mongo, exchangeName, botID, telegram)
 		log.Println("Mode: SIMPLE-MAKER (2-sided market maker)")
 
+	case "spike-maker":
+		maker = createSpikeMaker(cfg, exch, redis, mongo, exchangeName, botID)
+		log.Println("Mode: SPIKE-MAKER (spike-adaptive market maker)")
+
 	case "depth-filler":
 		maker = createDepthFiller(cfg, exch, redis, mongo, exchangeName, botID)
 		log.Println("Mode: DEPTH-FILLER (order book depth filler)")
 
 	default:
-		log.Fatalf("Invalid bot_type: %s (must be 'simple-maker' or 'depth-filler')", botType)
+		log.Fatalf("Invalid bot_type: %s (must be 'simple-maker', 'spike-maker', or 'depth-filler')", botType)
 	}
 
 	// Wire up fill notifications (Telegram) — co-located with SaveFill in BaseBot
@@ -256,6 +260,49 @@ func createSimpleMaker(
 		simpleConfig.SpreadMinBps, simpleConfig.NumLevels, simpleConfig.TargetDepthNotional, simpleConfig.FillCooldownMs)
 
 	return bot.NewSimpleMaker(makerCfg, exch, redis, mongo)
+}
+
+// createSpikeMaker creates a SpikeMaker bot (spike-adaptive 2-sided market maker)
+func createSpikeMaker(
+	cfg *config.Config,
+	exch exchange.Exchange,
+	redis *store.RedisStore,
+	mongo *store.MongoStore,
+	exchangeName string,
+	botID string,
+) *core.BaseBot {
+	simpleConfig := &cfg.SimpleConfig
+
+	// Set defaults
+	if simpleConfig.NumLevels == 0 {
+		simpleConfig.NumLevels = 10
+	}
+	if simpleConfig.TargetDepthNotional == 0 {
+		simpleConfig.TargetDepthNotional = 5800
+	}
+	if simpleConfig.TickIntervalMs == 0 {
+		simpleConfig.TickIntervalMs = 5000
+	}
+	if simpleConfig.DepthBps == 0 {
+		simpleConfig.DepthBps = 200
+	}
+
+	spikeCfg := &bot.SpikeMakerBotConfig{
+		SimpleConfig:        simpleConfig,
+		Exchange:            exchangeName,
+		ExchangeID:          cfg.ExchangeID,
+		BotID:               botID,
+		BotType:             "spike-maker",
+		TickIntervalMs:      simpleConfig.TickIntervalMs,
+		DrawdownWarnPct:     simpleConfig.DrawdownLimitPct * 0.6,
+		DrawdownReducePct:   simpleConfig.DrawdownLimitPct * 0.4,
+		MaxRecoverySizeMult: 0.3,
+	}
+
+	log.Printf("SpikeMaker config: levels=%d, depth=$%.0f, depthBps=%.0f, tick=%dms",
+		simpleConfig.NumLevels, simpleConfig.TargetDepthNotional, simpleConfig.DepthBps, simpleConfig.TickIntervalMs)
+
+	return bot.NewSpikeMaker(spikeCfg, exch, redis, mongo)
 }
 
 // createDepthFiller creates a DepthFiller bot (order book depth filler)

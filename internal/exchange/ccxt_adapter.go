@@ -592,13 +592,19 @@ func (c *CCXTAdapter) watchOrders() {
 				log.Printf("[CCXT:%s] WatchOrders update: order=%s status=%s filled=%.6f price=%.8f",
 					c.exchangeName, orderID, rawStatus, filledQty, derefFloat(order.Price))
 
+				// Use average fill price when available, fallback to limit price
+				fillPrice := derefFloat(order.Average)
+				if fillPrice == 0 {
+					fillPrice = derefFloat(order.Price)
+				}
+
 				// Emit OnFill for any new filled qty delta
 				if fillDelta > 0 && c.handlers.OnFill != nil {
 					c.handlers.OnFill(&types.FillEvent{
 						OrderID:   orderID,
 						Symbol:    c.nativeSymbol,
 						Side:      strings.ToUpper(derefString(order.Side)),
-						Price:     derefFloat(order.Price),
+						Price:     fillPrice,
 						Quantity:  fillDelta,
 						TradeID:   fmt.Sprintf("%s_order", orderID),
 						Timestamp: time.UnixMilli(derefInt64(order.Timestamp)),
@@ -619,7 +625,7 @@ func (c *CCXTAdapter) watchOrders() {
 						Side:               strings.ToUpper(derefString(order.Side)),
 						Type:               strings.ToUpper(derefString(order.Type)),
 						Status:             mappedStatus,
-						Price:              derefFloat(order.Price),
+						Price:              fillPrice,
 						Quantity:           derefFloat(order.Amount),
 						ExecutedQty:        derefFloat(order.Filled),
 						CumulativeQuoteQty: derefFloat(order.Cost),

@@ -948,8 +948,8 @@ func (s *SimpleLadderStrategy) computeDesiredOrders(mid, marketBestBid, marketBe
 		if price <= 0 || price >= mid {
 			continue
 		}
-		// Anti-taker guard
-		if marketBestAsk > 0 && price >= marketBestAsk {
+		// Anti-taker guard: must be at least 1 tick below best ask
+		if marketBestAsk > 0 && price >= marketBestAsk-s.tickSize {
 			continue
 		}
 		notional := targetDepth * bidWeights[i]
@@ -980,8 +980,8 @@ func (s *SimpleLadderStrategy) computeDesiredOrders(mid, marketBestBid, marketBe
 		if price <= 0 || price <= mid {
 			continue
 		}
-		// Anti-taker guard
-		if marketBestBid > 0 && price <= marketBestBid {
+		// Anti-taker guard: must be at least 1 tick above best bid
+		if marketBestBid > 0 && price <= marketBestBid+s.tickSize {
 			continue
 		}
 		notional := targetDepth * askWeights[i]
