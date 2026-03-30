@@ -119,6 +119,16 @@ type SimpleLadderStrategy struct {
 	lastVWAP          float64   // Last calculated VWAP (without inventory adjustment)
 	lastVWAPTime      time.Time // When VWAP was last calculated
 
+	// Cached noise for stable desired orders across ticks
+	cachedBidPriceJitter []float64 // per-level price jitter in ticks (signed)
+	cachedAskPriceJitter []float64
+	cachedBidQtyNoise    []float64 // per-level qty multiplier (0.8-1.2)
+	cachedAskQtyNoise    []float64
+	cachedNoiseMid       float64 // mid when noise was generated
+
+	// Fill tracking for inner gap protection
+	lastBidFillTime time.Time // last time a BUY order was filled
+	lastAskFillTime time.Time // last time a SELL order was filled
 }
 
 // SimpleLadderMode represents the operating mode
@@ -470,6 +480,13 @@ func (s *SimpleLadderStrategy) OnFill(event *core.FillEvent) {
 	notional := event.Price * event.Quantity
 	log.Printf("[%s] 💰 FILL %s @ %.8f x %.4f ($%.2f) order=%s",
 		s.Name(), event.Side, event.Price, event.Quantity, notional, event.OrderID)
+
+	now := time.Now()
+	if event.Side == "BUY" {
+		s.lastBidFillTime = now
+	} else {
+		s.lastAskFillTime = now
+	}
 }
 
 // OnOrderUpdate handles order status updates
@@ -708,15 +725,52 @@ func calculateSpreadAllocation(spreadMinBps, spreadMaxBps float64, invSkew float
 	}
 }
 
+// refreshNoiseIfNeeded regenerates cached noise when mid has shifted significantly (>1%)
+// or when noise hasn't been generated yet. This ensures desired orders are stable
+// across ticks while still appearing organic.
+func (s *SimpleLadderStrategy) refreshNoiseIfNeeded(mid float64, numLevels int) {
+	// Refresh if: no cache, wrong size, or mid shifted >0.3%
+	needRefresh := len(s.cachedBidPriceJitter) != numLevels ||
+		len(s.cachedBidQtyNoise) != numLevels ||
+		s.cachedNoiseMid == 0 ||
+		math.Abs(mid-s.cachedNoiseMid)/s.cachedNoiseMid > 0.003
+
+	if !needRefresh {
+		return
+	}
+
+	generateNoise := func() ([]float64, []float64) {
+		jitter := make([]float64, numLevels)
+		noise := make([]float64, numLevels)
+		for i := 0; i < numLevels; i++ {
+			if i > 0 && i < numLevels-1 {
+				jitterTicks := float64(rand.Intn(5) + 2)
+				jitter[i] = (rand.Float64()*2 - 1) * jitterTicks
+			}
+			noise[i] = 0.80 + rand.Float64()*0.40
+		}
+		return jitter, noise
+	}
+
+	s.cachedBidPriceJitter, s.cachedBidQtyNoise = generateNoise()
+	s.cachedAskPriceJitter, s.cachedAskQtyNoise = generateNoise()
+	s.cachedNoiseMid = mid
+}
+
 // logSpacedPrices generates numLevels prices between inner and outer using
-// logarithmic spacing (dense near inner, sparse near outer) with random jitter.
+// logarithmic spacing (dense near inner, sparse near outer) with cached jitter.
 // Returns prices sorted inner→outer (descending for BUY, ascending for SELL).
-func (s *SimpleLadderStrategy) logSpacedPrices(inner, outer float64, numLevels int) []float64 {
+func (s *SimpleLadderStrategy) logSpacedPrices(inner, outer float64, numLevels int, side string) []float64 {
 	if numLevels <= 0 {
 		return nil
 	}
 	if numLevels == 1 {
 		return []float64{s.roundToTick(inner)}
+	}
+
+	jitterCache := s.cachedBidPriceJitter
+	if side == "SELL" {
+		jitterCache = s.cachedAskPriceJitter
 	}
 
 	priceRange := math.Abs(outer - inner)
@@ -733,11 +787,9 @@ func (s *SimpleLadderStrategy) logSpacedPrices(inner, outer float64, numLevels i
 		t := math.Log(1+float64(i)) / logBase
 		basePrice := inner + direction*t*priceRange
 
-		// Add jitter for middle levels (keep L0 and outermost exact)
-		if i > 0 && i < numLevels-1 {
-			jitterTicks := float64(rand.Intn(5) + 2) // 2-6 ticks
-			jitter := (rand.Float64()*2 - 1) * s.tickSize * jitterTicks
-			basePrice += jitter
+		// Apply cached jitter for middle levels
+		if i > 0 && i < numLevels-1 && i < len(jitterCache) {
+			basePrice += jitterCache[i] * s.tickSize
 		}
 
 		price := s.roundToTick(basePrice)
@@ -749,18 +801,34 @@ func (s *SimpleLadderStrategy) logSpacedPrices(inner, outer float64, numLevels i
 
 	// Remove duplicates
 	prices = s.removeDuplicatePrices(prices)
+
+	// If dedup reduced count, pad with outer prices (2 ticks apart) to maintain numLevels
+	for len(prices) < numLevels {
+		lastPrice := prices[len(prices)-1]
+		nextPrice := s.roundToTick(lastPrice + direction*s.tickSize*2)
+		if nextPrice <= 0 {
+			break
+		}
+		prices = append(prices, nextPrice)
+	}
+
 	return prices
 }
 
 // noisyPyramidWeights generates normalized pyramid weights with ±20% noise.
 // Level 0 (inner) gets weight ~1.0, level N-1 (outer) gets weight ~pyramidFactor.
 // Total weights sum to 1.0 so multiplying by targetDepth gives exact notional.
-func noisyPyramidWeights(numLevels int, pyramidFactor float64) []float64 {
+func (s *SimpleLadderStrategy) noisyPyramidWeights(numLevels int, pyramidFactor float64, side string) []float64 {
 	if numLevels <= 0 {
 		return nil
 	}
 	if pyramidFactor <= 0 {
 		pyramidFactor = 1.0
+	}
+
+	noiseCache := s.cachedBidQtyNoise
+	if side == "SELL" {
+		noiseCache = s.cachedAskQtyNoise
 	}
 
 	weights := make([]float64, numLevels)
@@ -770,8 +838,10 @@ func noisyPyramidWeights(numLevels int, pyramidFactor float64) []float64 {
 		if numLevels > 1 {
 			w = 1.0 + (pyramidFactor-1.0)*float64(i)/float64(numLevels-1)
 		}
-		// ±20% noise for organic appearance
-		w *= 0.80 + rand.Float64()*0.40
+		// Apply cached noise for organic appearance
+		if i < len(noiseCache) {
+			w *= noiseCache[i]
+		}
 		weights[i] = w
 		totalW += w
 	}
@@ -827,6 +897,9 @@ func (s *SimpleLadderStrategy) computeDesiredOrders(mid, marketBestBid, marketBe
 		pyramidFactor = 2.0
 	}
 
+	// Refresh cached noise if mid shifted significantly
+	s.refreshNoiseIfNeeded(mid, numLevels)
+
 	// 1. Inventory → spread allocation
 	inv := calculateInventoryState(balance.TotalBase(), balance.TotalQuote(), mid, float64(s.cfg.InitBase), float64(s.cfg.InitQuote))
 	spread := calculateSpreadAllocation(spreadMinBps, spreadMaxBps, inv.skew)
@@ -839,10 +912,10 @@ func (s *SimpleLadderStrategy) computeDesiredOrders(mid, marketBestBid, marketBe
 	if bidOuter < s.tickSize {
 		bidOuter = s.tickSize
 	}
-	bidPrices := s.logSpacedPrices(bidInner, bidOuter, numLevels)
+	bidPrices := s.logSpacedPrices(bidInner, bidOuter, numLevels, "BUY")
 	// Sort descending (inner first = highest price for BUY)
 	sort.Sort(sort.Reverse(sort.Float64Slice(bidPrices)))
-	bidWeights := noisyPyramidWeights(len(bidPrices), pyramidFactor)
+	bidWeights := s.noisyPyramidWeights(len(bidPrices), pyramidFactor, "BUY")
 
 	for i, price := range bidPrices {
 		if price <= 0 || price >= mid {
@@ -871,10 +944,10 @@ func (s *SimpleLadderStrategy) computeDesiredOrders(mid, marketBestBid, marketBe
 	// 3. SELL side: independent random (different spacing + weights)
 	askInner := s.roundToTick(mid * (1.0 + spread.askBps/10000.0))
 	askOuter := s.roundToTick(mid * (1.0 + (depthBps-outerSafetyBps)/10000.0))
-	askPrices := s.logSpacedPrices(askInner, askOuter, numLevels)
+	askPrices := s.logSpacedPrices(askInner, askOuter, numLevels, "SELL")
 	// Sort ascending (inner first = lowest price for SELL)
 	sort.Float64s(askPrices)
-	askWeights := noisyPyramidWeights(len(askPrices), pyramidFactor)
+	askWeights := s.noisyPyramidWeights(len(askPrices), pyramidFactor, "SELL")
 
 	for i, price := range askPrices {
 		if price <= 0 || price <= mid {
@@ -918,12 +991,17 @@ func (s *SimpleLadderStrategy) applyBudgetConstraint(desired []core.DesiredOrder
 		}
 	}
 
+	// Use total balance (free + locked) since desired orders are computed from scratch
+	// and converge can cancel/replace any existing order.
+	availableQuote := balance.QuoteFree + balance.QuoteLocked
+	availableBase := balance.BaseFree + balance.BaseLocked
+
 	bidScale := 1.0
-	if bidTotal > 0 && balance.QuoteFree < bidTotal {
-		bidScale = balance.QuoteFree / bidTotal
+	if bidTotal > 0 && availableQuote < bidTotal {
+		bidScale = availableQuote / bidTotal
 	}
 	askScale := 1.0
-	askValue := balance.BaseFree * mid
+	askValue := availableBase * mid
 	if askTotal > 0 && askValue < askTotal {
 		askScale = askValue / askTotal
 	}
@@ -951,7 +1029,7 @@ func (s *SimpleLadderStrategy) applyBudgetConstraint(desired []core.DesiredOrder
 
 	if bidScale < 1.0 {
 		log.Printf("[%s] Budget constraint: BUY scaled to %.0f%% (available=$%.2f, target=$%.2f)",
-			s.Name(), bidScale*100, balance.QuoteFree, bidTotal)
+			s.Name(), bidScale*100, availableQuote, bidTotal)
 	}
 	if askScale < 1.0 {
 		log.Printf("[%s] Budget constraint: SELL scaled to %.0f%% (available=$%.2f, target=$%.2f)",
@@ -990,26 +1068,35 @@ func (s *SimpleLadderStrategy) converge(desired []core.DesiredOrder, live []core
 		}
 	}
 
-	// Find innermost live price per side (to detect inner gaps from fills)
+	// Determine if fill gap protection is active (within 30s of a fill)
+	const fillGapWindow = 15 * time.Second
+	now := time.Now()
+	bidFillActive := !s.lastBidFillTime.IsZero() && now.Sub(s.lastBidFillTime) < fillGapWindow
+	askFillActive := !s.lastAskFillTime.IsZero() && now.Sub(s.lastAskFillTime) < fillGapWindow
+
+	// Find innermost live price per side (only needed when fill gap is active)
 	innermostLiveBid := 0.0
-	for _, lo := range liveBuys {
-		if lo.Price > innermostLiveBid {
-			innermostLiveBid = lo.Price
+	innermostLiveAsk := math.MaxFloat64
+	if bidFillActive {
+		for _, lo := range liveBuys {
+			if lo.Price > innermostLiveBid {
+				innermostLiveBid = lo.Price
+			}
 		}
 	}
-	innermostLiveAsk := math.MaxFloat64
-	for _, lo := range liveSells {
-		if lo.Price < innermostLiveAsk {
-			innermostLiveAsk = lo.Price
+	if askFillActive {
+		for _, lo := range liveSells {
+			if lo.Price < innermostLiveAsk {
+				innermostLiveAsk = lo.Price
+			}
 		}
 	}
 
 	// matchSide: for each desired order, find closest live order by price.
-	// If unmatched desired is INNER (closer to mid than innermost live) → skip it
-	// (fill gap — don't prop up price). Then add OUTER orders to compensate skipped count.
+	// Unmatched desired → create (or skip if inner gap after recent fill).
+	// Unmatched live → cancel (orphans).
 	matchSide := func(desiredSide []core.DesiredOrder, liveSide []core.LiveOrder, side string) {
 		used := make([]bool, len(liveSide))
-		skippedInner := 0
 
 		for _, d := range desiredSide {
 			bestIdx := -1
@@ -1040,105 +1127,26 @@ func (s *SimpleLadderStrategy) converge(desired []core.DesiredOrder, live []core
 					used[bestIdx] = false
 				}
 			} else {
-				// No live order close enough — check if this is an inner gap
+				// No live order close enough — check if inner gap after recent fill
 				isInnerGap := false
-				if side == "BUY" && len(liveSide) > 0 && d.Price > innermostLiveBid {
+				if side == "BUY" && bidFillActive && len(liveSide) > 0 && d.Price > innermostLiveBid {
 					isInnerGap = true
 				}
-				if side == "SELL" && len(liveSide) > 0 && d.Price < innermostLiveAsk {
+				if side == "SELL" && askFillActive && len(liveSide) > 0 && d.Price < innermostLiveAsk {
 					isInnerGap = true
 				}
 
 				if isInnerGap {
-					skippedInner++
-					log.Printf("[%s] converge: skip inner %s @ %.8f (fill gap, innermost live=%.8f)",
-						s.Name(), side, d.Price, func() float64 {
+					log.Printf("[%s] converge: skip inner %s @ %.8f (fill gap, expires in %.0fs)",
+						s.Name(), side, d.Price, fillGapWindow.Seconds()-now.Sub(func() time.Time {
 							if side == "BUY" {
-								return innermostLiveBid
+								return s.lastBidFillTime
 							}
-							return innermostLiveAsk
-						}())
+							return s.lastAskFillTime
+						}()).Seconds())
 				} else {
-					// Outer order or no live orders → create
 					toCreate = append(toCreate, d)
 				}
-			}
-		}
-
-		// Compensate skipped inner: add outer orders beyond current outermost
-		// to maintain total order count and depth liquidity
-		if skippedInner > 0 && len(liveSide) > 0 {
-			// Find outermost live price
-			outermostPrice := liveSide[0].Price
-			for _, lo := range liveSide {
-				if side == "BUY" && lo.Price < outermostPrice {
-					outermostPrice = lo.Price
-				}
-				if side == "SELL" && lo.Price > outermostPrice {
-					outermostPrice = lo.Price
-				}
-			}
-			// Also check outermost desired to not duplicate
-			for _, d := range desiredSide {
-				if side == "BUY" && d.Price < outermostPrice {
-					outermostPrice = d.Price
-				}
-				if side == "SELL" && d.Price > outermostPrice {
-					outermostPrice = d.Price
-				}
-			}
-
-			// Compute avg step from existing live orders
-			var prices []float64
-			for _, lo := range liveSide {
-				prices = append(prices, lo.Price)
-			}
-			sort.Float64s(prices)
-			avgStep := s.tickSize * 10 // fallback
-			if len(prices) >= 2 {
-				totalGap := prices[len(prices)-1] - prices[0]
-				avgStep = totalGap / float64(len(prices)-1)
-			}
-
-			// Use outermost desired as reference for notional
-			outermostNotional := 0.0
-			for _, d := range desiredSide {
-				n := d.Price * d.Qty
-				if n > outermostNotional {
-					outermostNotional = n
-				}
-			}
-			if outermostNotional <= 0 {
-				outermostNotional = s.minNotional * 2
-			}
-
-			for i := 0; i < skippedInner; i++ {
-				var newPrice float64
-				if side == "BUY" {
-					newPrice = outermostPrice - float64(i+1)*avgStep
-				} else {
-					newPrice = outermostPrice + float64(i+1)*avgStep
-				}
-				newPrice = s.roundToTick(newPrice)
-				if newPrice <= 0 {
-					break
-				}
-
-				qty := s.roundToStep(outermostNotional / newPrice)
-				if qty <= 0 || newPrice*qty < s.minNotional {
-					break
-				}
-				if s.maxOrderQty > 0 && qty > s.maxOrderQty {
-					qty = s.maxOrderQty
-				}
-
-				log.Printf("[%s] converge: add outer %s @ %.8f × %.1f (compensate %d skipped inner)",
-					s.Name(), side, newPrice, qty, skippedInner)
-				toCreate = append(toCreate, core.DesiredOrder{
-					Side:  side,
-					Price: newPrice,
-					Qty:   qty,
-				})
 			}
 		}
 

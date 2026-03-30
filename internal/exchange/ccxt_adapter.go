@@ -387,12 +387,40 @@ func (c *CCXTAdapter) BatchPlaceOrders(ctx context.Context, orders []*OrderReque
 	return response, nil
 }
 
+// isOrderGoneError checks if an error string indicates the order no longer exists.
+// Covers Bybit ("OrderNotFound", "Order does not exist"), MEXC ("Order cancelled", code -2011),
+// and Gate/other exchanges with similar patterns.
+func isOrderGoneError(errStr string) bool {
+	lower := strings.ToLower(errStr)
+	return strings.Contains(lower, "ordernotfound") ||
+		strings.Contains(lower, "order does not exist") ||
+		strings.Contains(lower, "order cancelled") ||
+		strings.Contains(lower, "order canceled") ||
+		strings.Contains(errStr, "-2011")
+}
+
 // CancelOrder cancels a single order
-func (c *CCXTAdapter) CancelOrder(ctx context.Context, symbol, orderID string) error {
+func (c *CCXTAdapter) CancelOrder(ctx context.Context, symbol, orderID string) (retErr error) {
 	ccxtSymbol := convertToCCXTSymbol(symbol)
+
+	defer func() {
+		if r := recover(); r != nil {
+			errStr := fmt.Sprintf("%v", r)
+			if isOrderGoneError(errStr) {
+				log.Printf("[CCXT:%s] CancelOrder %s: order already gone (ignored)", c.exchangeName, orderID)
+				retErr = nil
+				return
+			}
+			retErr = fmt.Errorf("cancel order panic: %v", r)
+		}
+	}()
 
 	_, err := c.rest.CancelOrder(orderID, ccxt.WithCancelOrderSymbol(ccxtSymbol))
 	if err != nil {
+		if isOrderGoneError(err.Error()) {
+			log.Printf("[CCXT:%s] CancelOrder %s: order already gone (ignored)", c.exchangeName, orderID)
+			return nil
+		}
 		return fmt.Errorf("failed to cancel order: %w", err)
 	}
 
