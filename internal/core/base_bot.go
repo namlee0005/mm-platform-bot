@@ -520,20 +520,7 @@ func (b *BaseBot) handleOrderUpdate(event *types.OrderEvent) {
 			})
 		}
 
-		if b.redis != nil {
-			b.redis.SaveOrder(b.ctx, &store.OrderInfo{
-				OrderID:       event.OrderID,
-				ClientOrderID: event.ClientOrderID,
-				Exchange:      b.cfg.Exchange,
-				Symbol:        event.Symbol,
-				Side:          event.Side,
-				Price:         event.Price,
-				Quantity:      event.Quantity,
-				CreatedAt:     event.Timestamp.UnixMilli(),
-				Status:        "NEW",
-				BotID:         b.cfg.BotID,
-			})
-		}
+		// Redis orders are synced exclusively by syncLiveOrders()
 
 	case "PARTIALLY_FILLED":
 		b.mu.Lock()
@@ -564,9 +551,7 @@ func (b *BaseBot) handleOrderUpdate(event *types.OrderEvent) {
 		}
 		b.mu.Unlock()
 
-		if b.redis != nil {
-			b.redis.DeleteOrder(b.ctx, b.cfg.Exchange, b.cfg.Symbol, event.OrderID)
-		}
+		// Redis orders are synced exclusively by syncLiveOrders()
 
 		// Fill-specific handling (FILLED only)
 		if event.Status == "FILLED" {
@@ -739,73 +724,6 @@ func (b *BaseBot) syncLiveOrders() error {
 	return nil
 }
 
-// reconcileRedisOrders ensures Redis matches the current live orders from exchange.
-// Only performs reconciliation if the Redis count for this bot differs from live order count.
-func (b *BaseBot) reconcileRedisOrders(liveOrders []*exchange.Order) {
-	ctx := b.ctx
-
-	// Get current Redis orders for this bot
-	redisOrders, err := b.redis.GetAllOrders(ctx, b.cfg.Exchange, b.cfg.Symbol, b.cfg.BotID)
-	if err != nil {
-		log.Printf("[%s] Redis reconcile: failed to get orders: %v", b.strategy.Name(), err)
-		return
-	}
-
-	// Count Redis orders belonging to this bot
-	var botRedisCount int
-	for _, o := range redisOrders {
-		if o.BotID == b.cfg.BotID {
-			botRedisCount++
-		}
-	}
-
-	log.Printf("[%s] Redis reconcile: live=%d redis=%d — reconciling", b.strategy.Name(), len(liveOrders), botRedisCount)
-
-	// Build set of live orderIDs from exchange
-	liveSet := make(map[string]struct{}, len(liveOrders))
-	for _, o := range liveOrders {
-		liveSet[o.OrderID] = struct{}{}
-	}
-
-	// Build set of Redis orderIDs for this bot, remove stale and duplicate entries
-	redisSet := make(map[string]struct{}, len(redisOrders))
-	for _, o := range redisOrders {
-		if o.BotID != b.cfg.BotID {
-			continue
-		}
-		if _, alreadySeen := redisSet[o.OrderID]; alreadySeen {
-			// Duplicate entry for an active order — delete all occurrences and re-add once
-			b.redis.DeleteOrder(ctx, b.cfg.Exchange, b.cfg.Symbol, o.OrderID)
-			delete(redisSet, o.OrderID) // will be re-added in the SaveOrder loop below
-			continue
-		}
-		redisSet[o.OrderID] = struct{}{}
-		// Remove from Redis if no longer on exchange
-		if _, exists := liveSet[o.OrderID]; !exists {
-			b.redis.DeleteOrder(ctx, b.cfg.Exchange, b.cfg.Symbol, o.OrderID)
-			delete(redisSet, o.OrderID)
-		}
-	}
-
-	// Push to Redis if on exchange but missing from Redis
-	for _, o := range liveOrders {
-		if _, exists := redisSet[o.OrderID]; !exists {
-			b.redis.SaveOrder(ctx, &store.OrderInfo{
-				OrderID:       o.OrderID,
-				ClientOrderID: o.ClientOrderID,
-				Exchange:      b.cfg.Exchange,
-				Symbol:        b.cfg.Symbol,
-				Side:          o.Side,
-				Price:         o.Price,
-				Quantity:      o.Quantity,
-				CreatedAt:     time.Now().UnixMilli(),
-				Status:        "NEW",
-				BotID:         b.cfg.BotID,
-			})
-		}
-	}
-}
-
 // getSnapshot fetches current market snapshot
 func (b *BaseBot) getSnapshot() (*Snapshot, error) {
 	// Get depth
@@ -839,11 +757,7 @@ func (b *BaseBot) cancelAllOrders(reason string) error {
 	}
 
 	b.orderTracker.Clear()
-
-	// Clear from Redis
-	if b.redis != nil && b.cfg.BotID != "" {
-		b.redis.ClearOrdersByBotID(b.ctx, b.cfg.Exchange, b.cfg.Symbol, b.cfg.BotID)
-	}
+	// Redis orders are synced exclusively by syncLiveOrders()
 
 	return nil
 }
@@ -882,11 +796,7 @@ func (b *BaseBot) replaceOrders(desired []DesiredOrder, reason string) error {
 	}
 
 	b.orderTracker.Clear()
-
-	// Clear from Redis
-	if b.redis != nil && b.cfg.BotID != "" {
-		b.redis.ClearOrdersByBotID(b.ctx, b.cfg.Exchange, b.cfg.Symbol, b.cfg.BotID)
-	}
+	// Redis orders are synced exclusively by syncLiveOrders()
 
 	if len(desired) == 0 {
 		return nil

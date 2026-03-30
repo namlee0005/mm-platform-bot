@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"mm-platform-engine/internal/exchange"
-	"mm-platform-engine/internal/store"
 	"mm-platform-engine/internal/types"
 )
 
@@ -75,23 +74,9 @@ func (b *Bot) handleOrderUpdate(event *types.OrderEvent) {
 	log.Printf("📝 [USER STREAM] Order update: %s %s %s @ %.8f (status: %s)",
 		event.Symbol, event.Side, event.OrderID, event.Price, event.Status)
 
-	// Save order to Redis (replaces manual save after order creation)
-	orderInfo := &store.OrderInfo{
-		OrderID:       event.OrderID,
-		ClientOrderID: event.ClientOrderID,
-		Exchange:      strings.ToLower(b.cfg.ExchangeName),
-		Symbol:        event.Symbol,
-		Side:          event.Side,
-		Price:         event.Price,
-		Quantity:      event.Quantity,
-		CreatedAt:     event.Timestamp.UnixMilli(),
-		Status:        event.Status,
-	}
-	if err := b.redis.SaveOrder(b.ctx, orderInfo); err != nil {
-		log.Printf("Failed to save order to Redis: %v", err)
-	}
+	// Redis orders are synced exclusively by syncLiveOrders() in BaseBot
 
-	// Publish to Redis
+	// Publish to Redis Stream (event log, not order storage)
 	if err := b.redis.PublishOrderUpdate(b.ctx, event); err != nil {
 		log.Printf("Failed to publish order update: %v", err)
 	}

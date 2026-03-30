@@ -16,6 +16,16 @@ import (
 	ccxtpro "github.com/ccxt/ccxt/go/v4/pro"
 )
 
+// cachedOrderState tracks the last known state of an order for dedup.
+// Bybit WatchOrders returns full snapshots — without this, every unchanged
+// order in the snapshot would re-emit OnOrderUpdate downstream.
+type cachedOrderState struct {
+	status    string
+	filledQty float64
+	seenAt    time.Time
+	terminal  bool // true when closed/canceled — eligible for GC
+}
+
 // CCXTAdapter wraps CCXT exchange to implement Exchange interface
 // Uses ccxt for REST API and ccxtpro for WebSocket
 type CCXTAdapter struct {
@@ -32,10 +42,11 @@ type CCXTAdapter struct {
 	wsRunning bool
 	wsMu      sync.RWMutex
 
-	// Fill deduplication: track cumulative filled qty per orderID
-	// watchOrders uses this as fallback when watchMyTrades doesn't deliver (e.g. Bybit)
-	filledQtyMu      sync.Mutex
-	filledQtyByOrder map[string]float64
+	// Order state dedup: track status + filledQty per orderID.
+	// Only emit OnOrderUpdate/OnFill when state actually changes.
+	orderStateMu    sync.Mutex
+	orderStateCache map[string]*cachedOrderState
+	lastGCTime      time.Time
 
 	// Cached market info
 	market *ccxt.Market
@@ -520,7 +531,7 @@ func (c *CCXTAdapter) SubscribeUserStream(ctx context.Context, handlers UserStre
 	c.handlers = handlers
 	c.ctx, c.cancel = context.WithCancel(ctx)
 	c.wsRunning = true
-	c.filledQtyByOrder = make(map[string]float64)
+	c.orderStateCache = make(map[string]*cachedOrderState)
 	c.wsMu.Unlock()
 
 	log.Printf("[CCXT:%s] Starting WebSocket streams for %s", c.exchangeName, c.symbol)
@@ -571,38 +582,33 @@ func (c *CCXTAdapter) watchOrders() {
 				rawStatus := derefString(order.Status)
 				filledQty := derefFloat(order.Filled)
 
+				// Dedup: only process orders whose state actually changed.
+				// Bybit sends full snapshots — skip unchanged orders.
+				changed, fillDelta := c.updateOrderState(orderID, rawStatus, filledQty)
+				if !changed {
+					continue
+				}
+
 				log.Printf("[CCXT:%s] WatchOrders update: order=%s status=%s filled=%.6f price=%.8f",
 					c.exchangeName, orderID, rawStatus, filledQty, derefFloat(order.Price))
 
-				// Fallback fill detection from watchOrders.
-				// Bybit watchMyTrades (execution topic) is unreliable — fills arrive here
-				// as status=closed/partially_filled. Emit OnFill for any new filled qty delta.
-				if filledQty > 0 && (rawStatus == "closed" || rawStatus == "partially_filled" || rawStatus == "open") {
-					c.filledQtyMu.Lock()
-					lastFilled := c.filledQtyByOrder[orderID]
-					delta := filledQty - lastFilled
-					if delta > 0 {
-						c.filledQtyByOrder[orderID] = filledQty
-					}
-					c.filledQtyMu.Unlock()
-
-					if delta > 0 && c.handlers.OnFill != nil {
-						c.handlers.OnFill(&types.FillEvent{
-							OrderID:   orderID,
-							Symbol:    c.nativeSymbol,
-							Side:      strings.ToUpper(derefString(order.Side)),
-							Price:     derefFloat(order.Price),
-							Quantity:  delta,
-							TradeID:   fmt.Sprintf("%s_order", orderID),
-							Timestamp: time.UnixMilli(derefInt64(order.Timestamp)),
-						})
-					}
+				// Emit OnFill for any new filled qty delta
+				if fillDelta > 0 && c.handlers.OnFill != nil {
+					c.handlers.OnFill(&types.FillEvent{
+						OrderID:   orderID,
+						Symbol:    c.nativeSymbol,
+						Side:      strings.ToUpper(derefString(order.Side)),
+						Price:     derefFloat(order.Price),
+						Quantity:  fillDelta,
+						TradeID:   fmt.Sprintf("%s_order", orderID),
+						Timestamp: time.UnixMilli(derefInt64(order.Timestamp)),
+					})
 				}
 
+				// Emit OnOrderUpdate only when state changed
 				if c.handlers.OnOrderUpdate != nil {
 					mappedStatus := mapCCXTStatus(order.Status)
 					// Bybit sends status=open for partial fills — remap to PARTIALLY_FILLED
-					// so downstream handlers don't drop the event as a duplicate NEW.
 					if mappedStatus == "NEW" && filledQty > 0 && filledQty < derefFloat(order.Amount) {
 						mappedStatus = "PARTIALLY_FILLED"
 					}
@@ -623,6 +629,75 @@ func (c *CCXTAdapter) watchOrders() {
 			}
 		}()
 	}
+}
+
+// updateOrderState checks if an order's state has changed since last seen.
+// Returns (changed bool, fillDelta float64).
+// changed=true means status or filledQty changed → should emit OnOrderUpdate.
+// fillDelta>0 means new fill qty detected → should emit OnFill.
+func (c *CCXTAdapter) updateOrderState(orderID, rawStatus string, filledQty float64) (changed bool, fillDelta float64) {
+	isTerminal := rawStatus == "closed" || rawStatus == "canceled" || rawStatus == "cancelled" || rawStatus == "expired" || rawStatus == "rejected"
+	now := time.Now()
+	c.orderStateMu.Lock()
+	defer c.orderStateMu.Unlock()
+
+	// GC terminal entries every 60s — remove entries not seen for 5 minutes.
+	// Terminal entries don't refresh seenAt, so they expire naturally even if
+	// the exchange keeps resending them (e.g. MEXC keeps canceled orders in WS cache).
+	if now.Sub(c.lastGCTime) > 60*time.Second {
+		cutoff := now.Add(-5 * time.Minute)
+		for id, st := range c.orderStateCache {
+			if st.terminal && st.seenAt.Before(cutoff) {
+				delete(c.orderStateCache, id)
+			}
+		}
+		c.lastGCTime = now
+	}
+
+	prev, exists := c.orderStateCache[orderID]
+	if !exists {
+		// First time seeing this order.
+		// If it arrives already terminal (e.g. MEXC resending old canceled order
+		// after GC cleared it), still record it but don't emit — it was already
+		// processed once before GC. We detect this by checking if filledQty==0
+		// and status is terminal, which means it's a stale replay, not a fresh event.
+		// Fresh terminal events (actual fill/cancel) come from orders we already
+		// track as "open" in the cache, so they hit the status-change path below.
+		c.orderStateCache[orderID] = &cachedOrderState{
+			status:    rawStatus,
+			filledQty: filledQty,
+			seenAt:    now,
+			terminal:  isTerminal,
+		}
+		if isTerminal {
+			// Terminal order we haven't tracked as open → stale replay from exchange.
+			// Don't emit to avoid ghost events after GC.
+			return false, 0
+		}
+		return true, filledQty
+	}
+
+	// Already known order — only refresh seenAt for non-terminal orders.
+	// Terminal orders keep their original seenAt so GC can expire them.
+	if !prev.terminal {
+		prev.seenAt = now
+	}
+
+	// Check fill delta
+	if filledQty > prev.filledQty {
+		fillDelta = filledQty - prev.filledQty
+		prev.filledQty = filledQty
+		changed = true
+	}
+
+	// Check status change
+	if rawStatus != prev.status {
+		prev.status = rawStatus
+		prev.terminal = isTerminal
+		changed = true
+	}
+
+	return changed, fillDelta
 }
 
 // mapCCXTStatus maps CCXT order status to standard status
