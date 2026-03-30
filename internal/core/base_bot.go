@@ -55,6 +55,7 @@ type BaseBot struct {
 
 	// Callbacks
 	onOrderEvent OrderEventCallback
+	fillNotifier FillNotifier
 }
 
 // NewBaseBot creates a new BaseBot with the given configuration and strategy.
@@ -111,6 +112,11 @@ func NewBaseBot(
 // SetOrderEventCallback sets callback for order events (for WS broadcasting)
 func (b *BaseBot) SetOrderEventCallback(cb OrderEventCallback) {
 	b.onOrderEvent = cb
+}
+
+// SetFillNotifier sets the notifier for fill events (Telegram, etc.)
+func (b *BaseBot) SetFillNotifier(n FillNotifier) {
+	b.fillNotifier = n
 }
 
 // Start initializes and runs the bot
@@ -597,6 +603,12 @@ func (b *BaseBot) handleOrderUpdate(event *types.OrderEvent) {
 					BotID:         b.cfg.BotID,
 					Exchange:      b.cfg.Exchange,
 				})
+			}
+
+			// Push fill notification (Telegram)
+			if b.fillNotifier != nil {
+				notional := event.Price * event.ExecutedQty
+				b.fillNotifier.NotifyFill(event.Side, event.Price, event.ExecutedQty, notional, true)
 			}
 			_ = levelIndex
 		}

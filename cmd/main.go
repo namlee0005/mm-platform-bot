@@ -102,7 +102,10 @@ func main() {
 		log.Fatalf("Invalid bot_type: %s (must be 'simple-maker' or 'depth-filler')", botType)
 	}
 
-	// Wire up Redis Stream for order events + Telegram fill notifications
+	// Wire up fill notifications (Telegram) — co-located with SaveFill in BaseBot
+	maker.SetFillNotifier(telegram)
+
+	// Wire up Redis Stream for order events
 	maker.SetOrderEventCallback(func(event core.BotOrderEvent) {
 		redis.PublishMMOrderEvent(context.Background(), &store.MMOrderEvent{
 			Type:      string(event.Type),
@@ -117,10 +120,6 @@ func main() {
 			Timestamp: event.Timestamp,
 			BotID:     botID,
 		})
-		if event.Type == core.OrderEventTypeFill {
-			notional := event.Price * event.Qty
-			telegram.NotifyFill(event.Side, event.Price, event.Qty, notional, true)
-		}
 	})
 
 	// Setup context

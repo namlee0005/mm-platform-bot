@@ -231,6 +231,12 @@ type BaseBotConfig struct {
 	SyncOrdersIntervalMs int
 }
 
+// FillNotifier sends notifications when orders are filled.
+// Implemented by notify.TelegramNotifier.
+type FillNotifier interface {
+	NotifyFill(side string, price, qty, notional float64, isFull bool)
+}
+
 // ComputeInventory computes inventory metrics based on balance and mid price
 func (b *BalanceState) ComputeInventory(mid float64, targetRatio float64) (invRatio, invDev float64) {
 	baseValue := b.TotalBase() * mid

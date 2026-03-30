@@ -1201,6 +1201,16 @@ func (s *SimpleLadderStrategy) maintainLadder(mid, marketBestBid, marketBestAsk 
 		return nil
 	}
 
+	// Post-converge budget check: trim new orders to fit actual free balance.
+	// applyBudgetConstraint uses total balance (free+locked) which is correct for
+	// the full desired set. But converge keeps existing orders (already locking balance),
+	// so new orders must fit in free balance + balance freed by cancellations.
+	toCreate = s.trimNewOrdersToBudget(toCreate, toCancel, liveOrders, balance, mid)
+
+	if len(toCancel) == 0 && len(toCreate) == 0 {
+		return nil
+	}
+
 	// Log summary
 	bidCount, askCount := 0, 0
 	for _, d := range desired {
@@ -1218,6 +1228,93 @@ func (s *SimpleLadderStrategy) maintainLadder(mid, marketBestBid, marketBestAsk 
 		Reason: fmt.Sprintf("converge: desired=%d (bid=%d ask=%d) cancel=%d create=%d",
 			len(desired), bidCount, askCount, len(toCancel), len(toCreate)),
 	}
+}
+
+// trimNewOrdersToBudget ensures new orders fit within actual available balance.
+// Available = free balance + balance freed by cancelled orders.
+// Drops outermost new orders first (highest LevelIndex) when budget is exceeded.
+func (s *SimpleLadderStrategy) trimNewOrdersToBudget(toCreate []core.DesiredOrder, toCancel []string, liveOrders []core.LiveOrder, balance *core.BalanceState, mid float64) []core.DesiredOrder {
+	if len(toCreate) == 0 {
+		return toCreate
+	}
+
+	// Build lookup of cancelled order IDs
+	cancelSet := make(map[string]bool, len(toCancel))
+	for _, id := range toCancel {
+		cancelSet[id] = true
+	}
+
+	// Calculate balance freed by cancellations
+	var freedQuote, freedBase float64
+	for _, lo := range liveOrders {
+		if !cancelSet[lo.OrderID] {
+			continue
+		}
+		if lo.Side == "BUY" {
+			freedQuote += lo.Price * lo.RemainingQty
+		} else {
+			freedBase += lo.RemainingQty
+		}
+	}
+
+	// Available budget for new orders
+	availQuote := balance.QuoteFree + freedQuote
+	availBase := balance.BaseFree + freedBase
+
+	// Sum new order requirements per side
+	var newBuyNotional, newSellBase float64
+	for _, d := range toCreate {
+		if d.Side == "BUY" {
+			newBuyNotional += d.Price * d.Qty
+		} else {
+			newSellBase += d.Qty
+		}
+	}
+
+	// Check if we need to trim
+	buyOk := newBuyNotional <= availQuote*0.99 // 1% margin for rounding
+	sellOk := newSellBase <= availBase*0.99
+	if buyOk && sellOk {
+		return toCreate
+	}
+
+	// Sort new orders: inner first (low LevelIndex), outer last (high LevelIndex)
+	// Drop outermost orders first to stay within budget
+	sort.Slice(toCreate, func(i, j int) bool {
+		if toCreate[i].Side != toCreate[j].Side {
+			return toCreate[i].Side < toCreate[j].Side // BUY before SELL
+		}
+		return toCreate[i].LevelIndex < toCreate[j].LevelIndex
+	})
+
+	var result []core.DesiredOrder
+	var usedQuote, usedBase float64
+	for _, d := range toCreate {
+		if d.Side == "BUY" {
+			notional := d.Price * d.Qty
+			if usedQuote+notional > availQuote*0.99 {
+				log.Printf("[%s] trimBudget: dropping BUY L%d @ %.8f (need $%.2f, avail $%.2f)",
+					s.Name(), d.LevelIndex, d.Price, usedQuote+notional, availQuote)
+				continue
+			}
+			usedQuote += notional
+		} else {
+			if usedBase+d.Qty > availBase*0.99 {
+				log.Printf("[%s] trimBudget: dropping SELL L%d @ %.8f (need %.2f, avail %.2f base)",
+					s.Name(), d.LevelIndex, d.Price, usedBase+d.Qty, availBase)
+				continue
+			}
+			usedBase += d.Qty
+		}
+		result = append(result, d)
+	}
+
+	if len(result) < len(toCreate) {
+		log.Printf("[%s] trimBudget: %d→%d orders (quoteFree=%.2f+freed=%.2f, baseFree=%.2f+freed=%.2f)",
+			s.Name(), len(toCreate), len(result), balance.QuoteFree, freedQuote, balance.BaseFree, freedBase)
+	}
+
+	return result
 }
 
 // UpdatePrevSnapshot is a no-op in the convergence model.
