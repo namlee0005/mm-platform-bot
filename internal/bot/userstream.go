@@ -125,7 +125,7 @@ func (b *Bot) handleFill(event *types.FillEvent) {
 	// Send Telegram notification for fills
 	if b.telegram != nil {
 		isFull := true // Assume full fill for now (could check event.IsMaker or remaining qty)
-		b.telegram.NotifyFill(event.Side, event.Price, event.Quantity, notional, isFull)
+		b.telegram.NotifyFill(event.Side, event.Price, event.Quantity, notional, isFull, event.OrderID)
 	}
 
 	// Set bot metadata before saving

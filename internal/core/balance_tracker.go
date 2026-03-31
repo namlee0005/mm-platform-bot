@@ -2,6 +2,7 @@ package core
 
 import (
 	"sync"
+	"time"
 
 	"mm-platform-engine/internal/exchange"
 	"mm-platform-engine/internal/types"
@@ -13,9 +14,10 @@ type BalanceTracker struct {
 	baseAsset  string
 	quoteAsset string
 
-	mu        sync.RWMutex
-	cache     map[string]*types.Balance // asset -> balance
-	hasCached bool
+	mu             sync.RWMutex
+	cache          map[string]*types.Balance // asset -> balance
+	hasCached      bool
+	lastUpdateTime time.Time
 }
 
 // NewBalanceTracker creates a new balance tracker for the given trading pair
@@ -61,6 +63,7 @@ func (bt *BalanceTracker) UpdateFromEvent(event *types.AccountEvent) {
 		bt.cache[b.Asset] = b
 	}
 	bt.hasCached = true
+	bt.lastUpdateTime = time.Now()
 }
 
 // UpdateFromAccount updates balances from a REST API account response
@@ -88,7 +91,15 @@ func (bt *BalanceTracker) UpdateFromAccount(acct *exchange.Account) *BalanceStat
 	}
 
 	bt.hasCached = true
+	bt.lastUpdateTime = time.Now()
 	return state
+}
+
+// IsFresh returns true if balance was updated within maxAge.
+func (bt *BalanceTracker) IsFresh(maxAge time.Duration) bool {
+	bt.mu.RLock()
+	defer bt.mu.RUnlock()
+	return bt.hasCached && time.Since(bt.lastUpdateTime) < maxAge
 }
 
 // GetAssetBalance returns balance for a specific asset

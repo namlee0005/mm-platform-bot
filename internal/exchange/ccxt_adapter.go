@@ -30,7 +30,7 @@ type cachedOrderState struct {
 // Uses ccxt for REST API and ccxtpro for WebSocket
 type CCXTAdapter struct {
 	rest         ccxt.IExchange    // REST API client
-	ws           ccxtpro.IExchange // WebSocket client
+	ws           ccxtpro.IExchange // WebSocket client (private: orders)
 	exchangeName string
 	symbol       string // CCXT format: BASE/QUOTE
 	nativeSymbol string // Exchange format: BASEQUOTE
@@ -47,6 +47,10 @@ type CCXTAdapter struct {
 	orderStateMu    sync.Mutex
 	orderStateCache map[string]*cachedOrderState
 	lastGCTime      time.Time
+
+	// Track filled order IDs permanently to prevent duplicate fill emissions
+	// after GC clears orderStateCache. Bybit resends filled orders in snapshots.
+	emittedFills map[string]bool
 
 	// Cached market info
 	market *ccxt.Market
@@ -141,8 +145,31 @@ func convertToCCXTSymbol(symbol string) string {
 func (c *CCXTAdapter) Start(ctx context.Context) error {
 	log.Printf("[CCXT:%s] Starting exchange adapter for %s", c.exchangeName, c.symbol)
 
-	// Load markets
-	c.rest.LoadMarkets()
+	// Load markets for REST with retry (CCXT may panic internally)
+	var lastErr error
+	for attempt := 1; attempt <= 3; attempt++ {
+		lastErr = func() (err error) {
+			defer func() {
+				if r := recover(); r != nil {
+					err = fmt.Errorf("LoadMarkets panic: %v", r)
+				}
+			}()
+			if _, e := c.rest.LoadMarkets(); e != nil {
+				return fmt.Errorf("LoadMarkets error: %w", e)
+			}
+			// Verify markets actually loaded by calling Market()
+			c.rest.Market(c.symbol)
+			return nil
+		}()
+		if lastErr == nil {
+			break
+		}
+		log.Printf("[CCXT:%s] LoadMarkets attempt %d failed: %v", c.exchangeName, attempt, lastErr)
+		time.Sleep(2 * time.Second)
+	}
+	if lastErr != nil {
+		return fmt.Errorf("failed to load markets after 3 attempts: %w", lastErr)
+	}
 
 	log.Printf("[CCXT:%s] Markets loaded successfully", c.exchangeName)
 	return nil
@@ -163,8 +190,19 @@ func (c *CCXTAdapter) Stop(ctx context.Context) error {
 }
 
 // GetExchangeInfo retrieves market information
-func (c *CCXTAdapter) GetExchangeInfo(ctx context.Context, symbol string) (*ExchangeInfo, error) {
+func (c *CCXTAdapter) GetExchangeInfo(ctx context.Context, symbol string) (info *ExchangeInfo, retErr error) {
+	defer func() {
+		if r := recover(); r != nil {
+			retErr = fmt.Errorf("GetExchangeInfo panic (markets may not be loaded): %v", r)
+		}
+	}()
+
 	ccxtSymbol := convertToCCXTSymbol(symbol)
+
+	// Ensure markets are loaded before calling Market()
+	if _, err := c.rest.LoadMarkets(); err != nil {
+		return nil, fmt.Errorf("failed to load markets: %w", err)
+	}
 
 	marketRaw := c.rest.Market(ccxtSymbol)
 	if marketRaw == nil {
@@ -487,6 +525,52 @@ func (c *CCXTAdapter) GetOpenOrders(ctx context.Context, symbol string) ([]*Orde
 	return result, nil
 }
 
+// FetchClosedOrders retrieves recently closed orders (filled/canceled) via REST API.
+func (c *CCXTAdapter) FetchClosedOrders(ctx context.Context, symbol string, since time.Time, limit int) ([]*Order, error) {
+	ccxtSymbol := convertToCCXTSymbol(symbol)
+	sinceMs := since.UnixMilli()
+
+	if limit <= 0 {
+		limit = 50
+	}
+
+	// Use FetchMyTrades (/v5/execution/list) — returns actual fills, not order status history
+	opts := []ccxt.FetchMyTradesOptions{
+		ccxt.WithFetchMyTradesSymbol(ccxtSymbol),
+		ccxt.WithFetchMyTradesSince(sinceMs),
+		ccxt.WithFetchMyTradesLimit(int64(limit)),
+	}
+
+	trades, err := c.rest.FetchMyTrades(opts...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch trades: %w", err)
+	}
+	log.Printf("[CCXT:%s] FetchMyTrades since=%v returned %d trades",
+		c.exchangeName, since.Format("15:04:05"), len(trades))
+
+	result := make([]*Order, 0, len(trades))
+	for _, t := range trades {
+		tradeTime := time.Now()
+		if t.Timestamp != nil {
+			tradeTime = time.UnixMilli(*t.Timestamp)
+		}
+		result = append(result, &Order{
+			OrderID:            derefString(t.Order),
+			Symbol:             symbol,
+			Side:               strings.ToUpper(derefString(t.Side)),
+			Type:               "LIMIT",
+			Price:              derefFloat(t.Price),
+			Quantity:           derefFloat(t.Amount),
+			ExecutedQty:        derefFloat(t.Amount),
+			CumulativeQuoteQty: derefFloat(t.Cost),
+			Status:             "FILLED",
+			Timestamp:          tradeTime,
+		})
+	}
+
+	return result, nil
+}
+
 // GetTicker returns the last trade price for a symbol
 func (c *CCXTAdapter) GetTicker(ctx context.Context, symbol string) (float64, error) {
 	ccxtSymbol := convertToCCXTSymbol(symbol)
@@ -532,6 +616,7 @@ func (c *CCXTAdapter) SubscribeUserStream(ctx context.Context, handlers UserStre
 	c.ctx, c.cancel = context.WithCancel(ctx)
 	c.wsRunning = true
 	c.orderStateCache = make(map[string]*cachedOrderState)
+	c.emittedFills = make(map[string]bool)
 	c.wsMu.Unlock()
 
 	log.Printf("[CCXT:%s] Starting WebSocket streams for %s", c.exchangeName, c.symbol)
@@ -675,10 +760,18 @@ func (c *CCXTAdapter) updateOrderState(orderID, rawStatus string, filledQty floa
 			seenAt:    now,
 			terminal:  isTerminal,
 		}
-		if isTerminal {
-			// Terminal order we haven't tracked as open → stale replay from exchange.
-			// Don't emit to avoid ghost events after GC.
+		if isTerminal && filledQty <= 0 {
+			// Terminal order with no fill → stale cancel replay. Don't emit.
 			return false, 0
+		}
+		if isTerminal && filledQty > 0 {
+			// Terminal with fill — could be real (Bybit race) or GC replay.
+			// Check emittedFills to prevent duplicate emissions.
+			if c.emittedFills[orderID] {
+				return false, 0 // already emitted this fill before GC cleared it
+			}
+			c.emittedFills[orderID] = true
+			return true, filledQty
 		}
 		return true, filledQty
 	}
@@ -694,6 +787,10 @@ func (c *CCXTAdapter) updateOrderState(orderID, rawStatus string, filledQty floa
 		fillDelta = filledQty - prev.filledQty
 		prev.filledQty = filledQty
 		changed = true
+		// Mark as emitted so GC replay won't re-emit
+		if isTerminal {
+			c.emittedFills[orderID] = true
+		}
 	}
 
 	// Check status change
@@ -768,4 +865,148 @@ func SupportedExchanges() []string {
 		"htx",
 		"bitget",
 	}
+}
+
+// --- WebSocket Order Management (WSOrderExchange interface) ---
+
+// HasWsOrderSupport returns true if the exchange supports WS order placement.
+func (c *CCXTAdapter) HasWsOrderSupport() bool {
+	switch c.exchangeName {
+	case "bybit", "binance", "gate", "gateio", "kucoin", "okx":
+		return true
+	case "mexc":
+		return false // MEXC doesn't support CreateOrderWs
+	default:
+		return false
+	}
+}
+
+// HasWsEditSupport returns true if the exchange supports WS order editing.
+func (c *CCXTAdapter) HasWsEditSupport() bool {
+	switch c.exchangeName {
+	case "bybit", "binance", "gate", "gateio", "kucoin", "okx":
+		return true
+	case "mexc":
+		return true // MEXC supports EditOrderWs but not CreateOrderWs
+	default:
+		return false
+	}
+}
+
+// PlaceOrderWs places an order via WebSocket.
+func (c *CCXTAdapter) PlaceOrderWs(ctx context.Context, order *OrderRequest) (*Order, error) {
+	ccxtSymbol := convertToCCXTSymbol(order.Symbol)
+	orderType := strings.ToLower(order.Type)
+	side := strings.ToLower(order.Side)
+
+	var result ccxt.Order
+	var err error
+
+	if orderType == "limit" {
+		result, err = c.ws.CreateOrderWs(
+			ccxtSymbol,
+			"limit",
+			side,
+			order.Quantity,
+			ccxt.WithCreateOrderWsPrice(order.Price),
+		)
+	} else {
+		result, err = c.ws.CreateOrderWs(
+			ccxtSymbol,
+			"market",
+			side,
+			order.Quantity,
+		)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("WS place order failed: %w", err)
+	}
+
+	clientOrderID := derefString(result.ClientOrderId)
+	if clientOrderID == "" {
+		clientOrderID = order.ClientOrderID
+	}
+	price := derefFloat(result.Price)
+	if price == 0 {
+		price = order.Price
+	}
+	qty := derefFloat(result.Amount)
+	if qty == 0 {
+		qty = order.Quantity
+	}
+
+	return &Order{
+		OrderID:       derefString(result.Id),
+		ClientOrderID: clientOrderID,
+		Symbol:        order.Symbol,
+		Side:          strings.ToUpper(side),
+		Type:          strings.ToUpper(orderType),
+		Price:         price,
+		Quantity:      qty,
+		ExecutedQty:   derefFloat(result.Filled),
+		Status:        mapCCXTStatus(result.Status),
+	}, nil
+}
+
+// EditOrderWs amends an existing order via WebSocket.
+func (c *CCXTAdapter) EditOrderWs(ctx context.Context, orderID, symbol string, newPrice, newQty float64) (*Order, error) {
+	ccxtSymbol := convertToCCXTSymbol(symbol)
+
+	result, err := c.ws.EditOrderWs(
+		orderID,
+		ccxtSymbol,
+		"limit",
+		"",
+		ccxt.WithEditOrderWsAmount(newQty),
+		ccxt.WithEditOrderWsPrice(newPrice),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("WS edit order failed: %w", err)
+	}
+
+	return &Order{
+		OrderID:       derefString(result.Id),
+		ClientOrderID: derefString(result.ClientOrderId),
+		Symbol:        symbol,
+		Side:          strings.ToUpper(derefString(result.Side)),
+		Type:          "LIMIT",
+		Price:         derefFloat(result.Price),
+		Quantity:      derefFloat(result.Amount),
+		ExecutedQty:   derefFloat(result.Filled),
+		Status:        mapCCXTStatus(result.Status),
+	}, nil
+}
+
+// CancelOrderWs cancels an order via WebSocket.
+func (c *CCXTAdapter) CancelOrderWs(ctx context.Context, symbol, orderID string) error {
+	_, err := c.ws.CancelOrderWs(
+		orderID,
+		ccxt.WithCancelOrderWsSymbol(convertToCCXTSymbol(symbol)),
+	)
+	if err != nil {
+		// Order already filled/canceled — not an error
+		errStr := err.Error()
+		if strings.Contains(errStr, "OrderNotFound") || strings.Contains(errStr, "does not exist") {
+			log.Printf("[CCXT:%s] CancelOrderWs %s: order already gone (ignored)", c.exchangeName, orderID)
+			return nil
+		}
+		return fmt.Errorf("WS cancel order failed: %w", err)
+	}
+	return nil
+}
+
+// CancelAllOrdersWs cancels all orders for a symbol via WebSocket.
+func (c *CCXTAdapter) CancelAllOrdersWs(ctx context.Context, symbol string) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("WS cancel all orders not supported: %v", r)
+		}
+	}()
+	_, err = c.ws.CancelAllOrdersWs(
+		ccxt.WithCancelAllOrdersWsSymbol(convertToCCXTSymbol(symbol)),
+	)
+	if err != nil {
+		return fmt.Errorf("WS cancel all orders failed: %w", err)
+	}
+	return nil
 }

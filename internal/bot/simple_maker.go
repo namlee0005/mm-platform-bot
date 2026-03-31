@@ -2,9 +2,6 @@ package bot
 
 import (
 	"mm-platform-engine/internal/config"
-	"mm-platform-engine/internal/core"
-	"mm-platform-engine/internal/exchange"
-	"mm-platform-engine/internal/store"
 	"mm-platform-engine/internal/strategy"
 )
 
@@ -22,53 +19,12 @@ type SimpleMakerConfig struct {
 	// Strategy-specific settings (not in MongoDB)
 	PriceJitterPct      float64 `json:"price_jitter_pct"`
 	SizeJitterPct       float64 `json:"size_jitter_pct"`
-	DrawdownWarnPct     float64 `json:"drawdown_warn_pct"`      // Warning threshold (default 3%)
-	DrawdownReducePct   float64 `json:"drawdown_reduce_pct"`    // Start reducing size (default 2%)
-	RecoveryHours       float64 `json:"recovery_hours"`         // Target recovery time (default 48h)
-	MaxRecoverySizeMult float64 `json:"max_recovery_size_mult"` // Min size during recovery (default 30%)
+	DrawdownWarnPct     float64 `json:"drawdown_warn_pct"`
+	DrawdownReducePct   float64 `json:"drawdown_reduce_pct"`
+	RecoveryHours       float64 `json:"recovery_hours"`
+	MaxRecoverySizeMult float64 `json:"max_recovery_size_mult"`
 
 	// Callbacks
-	OnModeChange strategy.ModeChangeCallback `json:"-"` // Called when drawdown mode changes
-	OnBalanceLow strategy.BalanceLowCallback `json:"-"` // Called when balance is too low
-}
-
-// NewSimpleMaker creates a new SimpleMaker bot using BaseBot + SimpleLadderStrategy.
-// This is a thin factory that wires up the components.
-func NewSimpleMaker(
-	cfg *SimpleMakerConfig,
-	exch exchange.Exchange,
-	redis *store.RedisStore,
-	mongo *store.MongoStore,
-) *core.BaseBot {
-	// Create base bot config
-	baseCfg := &core.BaseBotConfig{
-		Symbol:               cfg.Symbol,
-		BaseAsset:            cfg.BaseAsset,
-		QuoteAsset:           cfg.QuoteAsset,
-		Exchange:             cfg.Exchange,
-		ExchangeID:           cfg.ExchangeID,
-		BotID:                cfg.BotID,
-		BotType:              cfg.BotType,
-		TickIntervalMs:       cfg.TickIntervalMs,
-		SyncOrdersIntervalMs: 0, // Sync every tick (few orders ~6)
-	}
-
-	// Create strategy config - just pass embedded config + strategy-specific fields
-	strategyCfg := &strategy.SimpleLadderConfig{
-		SimpleConfig:        cfg.SimpleConfig, // Pass embedded MongoDB config directly
-		PriceJitterPct:      cfg.PriceJitterPct,
-		SizeJitterPct:       cfg.SizeJitterPct,
-		DrawdownWarnPct:     cfg.DrawdownWarnPct,
-		DrawdownReducePct:   cfg.DrawdownReducePct,
-		RecoveryHours:       cfg.RecoveryHours,
-		MaxRecoverySizeMult: cfg.MaxRecoverySizeMult,
-		OnModeChange:        cfg.OnModeChange, // Pass through for notifications
-		OnBalanceLow:        cfg.OnBalanceLow, // Pass through for balance alerts
-	}
-
-	// Create strategy
-	strat := strategy.NewSimpleLadderStrategy(strategyCfg)
-
-	// Create and return base bot
-	return core.NewBaseBot(baseCfg, strat, exch, redis, mongo)
+	OnModeChange strategy.ModeChangeCallback `json:"-"`
+	OnBalanceLow strategy.BalanceLowCallback `json:"-"`
 }

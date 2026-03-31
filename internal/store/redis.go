@@ -403,6 +403,68 @@ func (s *RedisStore) ClearOrdersByBotID(ctx context.Context, exchange, symbol, b
 	return removed, nil
 }
 
+// --- Hash-based order storage (per bot) ---
+// Key format: order:{exchange}:{symbol}:{botId}
+// Field: orderId → JSON OrderInfo
+// O(1) clear, O(1) per-order upsert, O(N) fetch all — no scanning.
+
+// botOrdersKey returns the Redis Hash key for a specific bot's orders.
+func (s *RedisStore) botOrdersKey(exchange, symbol, botID string) string {
+	return s.k(fmt.Sprintf("order:%s:%s:%s",
+		strings.ToLower(exchange), strings.ToLower(symbol), botID))
+}
+
+// ReplaceOrdersByBot atomically replaces all orders for a bot using a pipeline.
+// DEL + HSET in one pipeline = O(N) with 1 round-trip.
+func (s *RedisStore) ReplaceOrdersByBot(ctx context.Context, exchange, symbol, botID string, orders []*OrderInfo) error {
+	key := s.botOrdersKey(exchange, symbol, botID)
+
+	pipe := s.client.Pipeline()
+	pipe.Del(ctx, key)
+
+	if len(orders) > 0 {
+		fields := make(map[string]interface{}, len(orders))
+		for _, o := range orders {
+			data, err := json.Marshal(o)
+			if err != nil {
+				continue
+			}
+			fields[o.OrderID] = data
+		}
+		if len(fields) > 0 {
+			pipe.HSet(ctx, key, fields)
+		}
+	}
+
+	_, err := pipe.Exec(ctx)
+	return err
+}
+
+// GetOrdersByBot returns all orders for a specific bot. O(N) exact, no filtering.
+func (s *RedisStore) GetOrdersByBot(ctx context.Context, exchange, symbol, botID string) ([]*OrderInfo, error) {
+	key := s.botOrdersKey(exchange, symbol, botID)
+
+	result, err := s.client.HGetAll(ctx, key).Result()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get bot orders: %w", err)
+	}
+
+	orders := make([]*OrderInfo, 0, len(result))
+	for _, val := range result {
+		var order OrderInfo
+		if err := json.Unmarshal([]byte(val), &order); err != nil {
+			continue
+		}
+		orders = append(orders, &order)
+	}
+	return orders, nil
+}
+
+// ClearOrdersByBot removes all orders for a specific bot. O(1).
+func (s *RedisStore) ClearOrdersByBot(ctx context.Context, exchange, symbol, botID string) error {
+	return s.client.Del(ctx, s.botOrdersKey(exchange, symbol, botID)).Err()
+}
+
 // MMOrderEvent represents an MM engine order event for FE
 type MMOrderEvent struct {
 	Type      string  `json:"type"` // "place", "cancel", "amend", "fill"

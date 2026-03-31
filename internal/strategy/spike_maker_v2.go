@@ -16,8 +16,8 @@ import (
 // Config
 // ──────────────────────────────────────────────────────────────────────────────
 
-// SpikeMakerConfig is the configuration for SpikeMakerStrategy
-type SpikeMakerConfig struct {
+// SpikeMakerV2Config is the configuration for SpikeMakerV2Strategy.
+type SpikeMakerV2Config struct {
 	*config.SimpleConfig
 
 	// Risk
@@ -25,16 +25,20 @@ type SpikeMakerConfig struct {
 	DrawdownReducePct   float64 `json:"drawdown_reduce_pct"`
 	MaxRecoverySizeMult float64 `json:"max_recovery_size_mult"`
 	RelistToleranceBps  float64 `json:"relist_tolerance_bps"`
+
+	// V2: Compliance mode — "capital" (default) or "compliance"
+	ComplianceMode string `json:"compliance_mode"`
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Strategy
 // ──────────────────────────────────────────────────────────────────────────────
 
-// SpikeMakerStrategy is a two-sided market maker with spike-adaptive depth
-// generation and toxicity-based fill response.
-type SpikeMakerStrategy struct {
-	cfg *SpikeMakerConfig
+// SpikeMakerV2Strategy is a two-sided market maker with spike-adaptive depth
+// generation, toxicity-based fill response, dynamic requote cooldown,
+// ninja protection, and compliance toggle.
+type SpikeMakerV2Strategy struct {
+	cfg *SpikeMakerV2Config
 
 	// Market info
 	tickSize    float64
@@ -58,45 +62,27 @@ type SpikeMakerStrategy struct {
 	volLastMid   float64
 	volInited    bool
 	volTickCount int
-	lastRet      float64 // most recent log return (for spike score)
+	lastRet      float64
 
 	// Toxicity-based fill response
 	fillHistory      []fillRecord
-	lastFillToxicity int    // 0=normal, 1=moderate, 2=high
-	fillRebuildSide  string // "BUY" or "SELL"
+	lastFillToxicity int
+	fillRebuildSide  string
 	lastFillAt       time.Time
-}
 
-type SpikeMakerMode string
+	// V2: Dynamic requote cooldown
+	lastRequoteAt time.Time
+	lastSpikeS    float64 // cached spike score for cooldown calc
 
-const (
-	smModeNormal   SpikeMakerMode = "NORMAL"
-	smModeWarning  SpikeMakerMode = "WARNING"
-	smModeRecovery SpikeMakerMode = "RECOVERY"
-	smModePaused   SpikeMakerMode = "PAUSED"
-)
-
-// fillRecord tracks a single fill for toxicity scoring
-type fillRecord struct {
-	side      string
-	price     float64
-	qty       float64
-	timestamp time.Time
-	mid       float64
-}
-
-// rebuildScope controls which levels converge() may touch
-type rebuildScope struct {
-	side      string  // "BUY", "SELL"
-	maxLevels int     // only diff top N inner levels
-	mid       float64 // current mid for distance sorting
+	// V2: Emergency pause (tox=2)
+	emergencyPauseUntil time.Time
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Constructor
 // ──────────────────────────────────────────────────────────────────────────────
 
-func NewSpikeMakerStrategy(cfg *SpikeMakerConfig) *SpikeMakerStrategy {
+func NewSpikeMakerV2Strategy(cfg *SpikeMakerV2Config) *SpikeMakerV2Strategy {
 	if cfg.NumLevels == 0 {
 		cfg.NumLevels = 10
 	}
@@ -118,21 +104,24 @@ func NewSpikeMakerStrategy(cfg *SpikeMakerConfig) *SpikeMakerStrategy {
 	if cfg.RelistToleranceBps == 0 {
 		cfg.RelistToleranceBps = 25.0
 	}
+	if cfg.ComplianceMode == "" {
+		cfg.ComplianceMode = "capital"
+	}
 
-	return &SpikeMakerStrategy{
+	return &SpikeMakerV2Strategy{
 		cfg:         cfg,
 		navHistory:  make([]navSnapshot, 0, 1000),
 		currentMode: smModeNormal,
 	}
 }
 
-func (s *SpikeMakerStrategy) Name() string { return "SpikeMaker" }
+func (s *SpikeMakerV2Strategy) Name() string { return "SpikeMakerV2" }
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Init
 // ──────────────────────────────────────────────────────────────────────────────
 
-func (s *SpikeMakerStrategy) Init(ctx context.Context, snap *core.Snapshot, balance *core.BalanceState) error {
+func (s *SpikeMakerV2Strategy) Init(ctx context.Context, snap *core.Snapshot, balance *core.BalanceState) error {
 	s.tickSize = snap.TickSize
 	s.stepSize = snap.StepSize
 	s.minNotional = snap.MinNotional
@@ -158,8 +147,8 @@ func (s *SpikeMakerStrategy) Init(ctx context.Context, snap *core.Snapshot, bala
 			s.Name(), s.cfg.InitBase, s.cfg.InitQuote)
 	}
 
-	log.Printf("[%s] Initialized: tickSize=%.8f, stepSize=%.8f, minNotional=%.2f, maxOrderQty=%.0f",
-		s.Name(), s.tickSize, s.stepSize, s.minNotional, s.maxOrderQty)
+	log.Printf("[%s] Initialized: tickSize=%.8f, stepSize=%.8f, minNotional=%.2f, maxOrderQty=%.0f, compliance=%s",
+		s.Name(), s.tickSize, s.stepSize, s.minNotional, s.maxOrderQty, s.cfg.ComplianceMode)
 	return nil
 }
 
@@ -167,7 +156,7 @@ func (s *SpikeMakerStrategy) Init(ctx context.Context, snap *core.Snapshot, bala
 // Tick — main loop
 // ──────────────────────────────────────────────────────────────────────────────
 
-func (s *SpikeMakerStrategy) Tick(ctx context.Context, input *core.TickInput) (*core.TickOutput, error) {
+func (s *SpikeMakerV2Strategy) Tick(ctx context.Context, input *core.TickInput) (*core.TickOutput, error) {
 	snap := input.Snapshot
 	balance := input.Balance
 
@@ -177,7 +166,15 @@ func (s *SpikeMakerStrategy) Tick(ctx context.Context, input *core.TickInput) (*
 		return &core.TickOutput{Action: core.TickActionCancelAll, Reason: "invalid market data"}, nil
 	}
 
-	// ── EWM vol update (track raw mid, not fair price) ──
+	// ── V2: Emergency pause check (tox=2 → 5s full stop) ──
+	if !s.emergencyPauseUntil.IsZero() && time.Now().Before(s.emergencyPauseUntil) {
+		return &core.TickOutput{
+			Action: core.TickActionCancelAll,
+			Reason: fmt.Sprintf("emergency_pause: tox=2, resume in %.1fs", time.Until(s.emergencyPauseUntil).Seconds()),
+		}, nil
+	}
+
+	// ── EWM vol update ──
 	s.lastRet = 0
 	if s.volInited && s.volLastMid > 0 && mid > 0 {
 		ret := math.Log(mid / s.volLastMid)
@@ -191,16 +188,14 @@ func (s *SpikeMakerStrategy) Tick(ctx context.Context, input *core.TickInput) (*
 	s.volInited = true
 	s.volTickCount++
 
-	// Cold start protection: use minimum variance floor for first 20 ticks
-	// to prevent artificial spike scores from near-zero volatility.
-	const minVolVar = 1e-8 // ~1bps baseline
+	const minVolVar = 1e-8
 	if s.volEwmVar < minVolVar {
 		s.volEwmVar = minVolVar
 	}
 
 	// ── Risk state ──
 	nav := balance.TotalBase()*mid + balance.TotalQuote()
-	drawdown, mode := s.updateRiskState(nav)
+	drawdown, mode := s.updateRiskStateV2(nav)
 
 	if mode == smModePaused {
 		return &core.TickOutput{
@@ -208,6 +203,16 @@ func (s *SpikeMakerStrategy) Tick(ctx context.Context, input *core.TickInput) (*
 			Reason: fmt.Sprintf("PAUSED: drawdown %.2f%%", drawdown*100),
 		}, nil
 	}
+
+	// ── V2: Dynamic requote cooldown ──
+	sigma := math.Sqrt(s.volEwmVar)
+	S := computeSpikeScore(s.lastRet, sigma)
+	s.lastSpikeS = S
+
+	if s.shouldSkipRequote(S) {
+		return &core.TickOutput{Action: core.TickActionKeep, Reason: "cooldown"}, nil
+	}
+	s.lastRequoteAt = time.Now()
 
 	// ── Balance check ──
 	avail := balance.TotalBase()*mid + balance.TotalQuote()
@@ -219,7 +224,7 @@ func (s *SpikeMakerStrategy) Tick(ctx context.Context, input *core.TickInput) (*
 		}, nil
 	}
 
-	sizeMult := s.calculateSizeMultiplier(drawdown, mode)
+	sizeMult := s.calculateSizeMultV2(drawdown, mode)
 
 	// ── Inventory ──
 	inv := calculateInventoryState(
@@ -228,10 +233,10 @@ func (s *SpikeMakerStrategy) Tick(ctx context.Context, input *core.TickInput) (*
 	)
 
 	// ── OFI from orderbook ──
-	ofi := s.computeOFI(snap)
+	ofi := s.computeOFIV2(snap)
 
-	// ── Generate desired orders via v2 spike engine ──
-	sigma := math.Sqrt(s.volEwmVar)
+	// ── V2: Accumulated volumes for Ninja Protection ──
+	accBuyVol, accSellVol := s.computeAccVolumes30s()
 
 	// Best bid/ask sizes from snapshot
 	bestBidSize, bestAskSize := 0.0, 0.0
@@ -242,34 +247,38 @@ func (s *SpikeMakerStrategy) Tick(ctx context.Context, input *core.TickInput) (*
 		bestAskSize = snap.Asks[0].Qty * snap.Asks[0].Price
 	}
 
-	result := generateSpikeAdaptiveOrders(SpikeDepthParams{
-		BestBid:       snap.BestBid,
-		BestAsk:       snap.BestAsk,
-		BestBidSize:   bestBidSize,
-		BestAskSize:   bestAskSize,
-		TickSize:      s.tickSize,
-		StepSize:      s.stepSize,
-		MinNotional:   s.minNotional,
-		MaxOrderQty:   s.maxOrderQty,
-		NLevels:       s.cfg.NumLevels,
-		TotalDepth:    s.cfg.TargetDepthNotional,
-		DepthBps:      s.cfg.DepthBps,
-		SpreadMinBps:  s.cfg.SpreadMinBps,
-		Sigma:         sigma,
-		Ret:           s.lastRet,
-		NormalizedOFI: ofi,
-		InvRatio:      inv.skew / 0.5, // normalize skew [-0.5,0.5] to [-1,1]
-		SizeMult:      sizeMult,
+	// ── Generate desired orders via V2 13-step engine ──
+	result := generateSpikeAdaptiveOrdersV2(SpikeDepthV2Params{
+		BestBid:        snap.BestBid,
+		BestAsk:        snap.BestAsk,
+		BestBidSize:    bestBidSize,
+		BestAskSize:    bestAskSize,
+		TickSize:       s.tickSize,
+		StepSize:       s.stepSize,
+		MinNotional:    s.minNotional,
+		MaxOrderQty:    s.maxOrderQty,
+		NLevels:        s.cfg.NumLevels,
+		TotalDepth:     s.cfg.TargetDepthNotional,
+		DepthBps:       s.cfg.DepthBps,
+		SpreadMinBps:   s.cfg.SpreadMinBps,
+		Sigma:          sigma,
+		Ret:            s.lastRet,
+		NormalizedOFI:  ofi,
+		InvRatio:       inv.skew / 0.5,
+		SizeMult:       sizeMult,
+		AccBuyVol30s:   accBuyVol,
+		AccSellVol30s:  accSellVol,
+		ComplianceMode: s.cfg.ComplianceMode,
 	})
 
 	desired := result.Orders
 
 	// ── Budget constraint ──
-	desired = s.applyBudgetConstraint(desired, balance, result.FairPrice)
+	desired = s.applyBudgetConstraintV2(desired, balance, result.FairPrice)
 
 	// ── Converge with toxicity scope ──
-	scope := s.computeRebuildScope(result.FairPrice)
-	toCancel, toCreate := s.converge(desired, input.LiveOrders, scope)
+	scope := s.computeRebuildScopeV2(result.FairPrice)
+	toCancel, toCreate := s.convergeV2(desired, input.LiveOrders, scope)
 
 	// ── Log ──
 	bidN, askN := 0, 0
@@ -281,16 +290,17 @@ func (s *SpikeMakerStrategy) Tick(ctx context.Context, input *core.TickInput) (*
 		}
 	}
 
-	log.Printf("[%s] fair=%.8f micro=%.8f mid=%.8f S=%.2f ofi=%.2f inv=%.1f%% mode=%s orders=%d (bid=%d ask=%d) cancel=%d create=%d",
+	log.Printf("[%s] fair=%.8f micro=%.8f mid=%.8f S=%.2f ofi=%.2f inv=%.1f%% mode=%s ninja=(buy$%.1f sell$%.1f) orders=%d (bid=%d ask=%d) cancel=%d create=%d | gamma=%.2f spread=%.0fbps skew=%.3f bidScale=%.2f askScale=%.2f w0=%.3f wN=%.3f",
 		s.Name(), result.FairPrice, result.Microprice, result.Mid,
 		result.SpikeScore, ofi, inv.skew*100,
-		mode, len(desired), bidN, askN, len(toCancel), len(toCreate))
+		mode, accBuyVol, accSellVol, len(desired), bidN, askN, len(toCancel), len(toCreate),
+		result.Gamma, result.Spread*10000, result.InvSkew, result.BidScale, result.AskScale, result.WeightL0, result.WeightLast)
 
 	if len(toCancel) == 0 && len(toCreate) == 0 {
 		return &core.TickOutput{Action: core.TickActionKeep, Reason: "ladder_ok"}, nil
 	}
 
-	// Safety: don't cancel orders if we have nothing to create and no live orders would remain
+	// Safety: don't cancel all with no replacements
 	liveCount := len(input.LiveOrders)
 	if len(toCreate) == 0 && len(toCancel) >= liveCount && liveCount > 0 {
 		log.Printf("[%s] WARNING: converge wants to cancel all %d orders with 0 replacements — keeping", s.Name(), liveCount)
@@ -307,16 +317,71 @@ func (s *SpikeMakerStrategy) Tick(ctx context.Context, input *core.TickInput) (*
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
+// V2: Dynamic Requote Cooldown
+// ──────────────────────────────────────────────────────────────────────────────
+
+// getModeCooldownMs returns fixed cooldown per risk mode.
+func (s *SpikeMakerV2Strategy) getModeCooldownMs() float64 {
+	switch s.currentMode {
+	case smModeNormal:
+		return 1000
+	case smModeWarning:
+		return 5000
+	case smModeRecovery:
+		return 30000
+	case smModePaused:
+		return 60000
+	}
+	return 1000
+}
+
+// shouldSkipRequote checks if cooldown should prevent requoting this tick.
+func (s *SpikeMakerV2Strategy) shouldSkipRequote(S float64) bool {
+	if s.lastRequoteAt.IsZero() {
+		return false // first tick always proceeds
+	}
+
+	// Bypass cooldown on fill with toxicity < 2
+	if !s.lastFillAt.IsZero() && s.lastFillAt.After(s.lastRequoteAt) && s.lastFillToxicity < 2 {
+		return false
+	}
+
+	spikeCooldownMs := 100.0 * (1.0 + 4.5*math.Pow(S, 0.7))
+	modeCooldownMs := s.getModeCooldownMs()
+	cooldownMs := math.Max(spikeCooldownMs, modeCooldownMs)
+	cooldownMs = math.Min(cooldownMs, 60000)
+
+	elapsed := time.Since(s.lastRequoteAt).Milliseconds()
+	return float64(elapsed) < cooldownMs
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// V2: Accumulated volumes for Ninja Protection
+// ──────────────────────────────────────────────────────────────────────────────
+
+func (s *SpikeMakerV2Strategy) computeAccVolumes30s() (buyVol, sellVol float64) {
+	cutoff := time.Now().Add(-30 * time.Second)
+	for _, f := range s.fillHistory {
+		if f.timestamp.After(cutoff) {
+			notional := f.price * f.qty
+			if f.side == "BUY" {
+				buyVol += notional
+			} else {
+				sellVol += notional
+			}
+		}
+	}
+	return
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
 // OFI — Order Flow Imbalance from orderbook
 // ──────────────────────────────────────────────────────────────────────────────
 
-// computeOFI returns normalized order flow imbalance in [-1, 1].
-// Positive = buy pressure (more bid depth), negative = sell pressure.
-func (s *SpikeMakerStrategy) computeOFI(snap *core.Snapshot) float64 {
+func (s *SpikeMakerV2Strategy) computeOFIV2(snap *core.Snapshot) float64 {
 	if snap.Mid <= 0 {
 		return 0
 	}
-	// Sum depth within 1% of mid on each side
 	depthRange := snap.Mid * 0.01
 	var bidDepth, askDepth float64
 	for _, lvl := range snap.Bids {
@@ -333,19 +398,18 @@ func (s *SpikeMakerStrategy) computeOFI(snap *core.Snapshot) float64 {
 	if total < 1e-9 {
 		return 0
 	}
-	// Normalize to [-1, 1]: positive = buy pressure
 	return (bidDepth - askDepth) / total
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// OnFill — toxicity scoring
+// OnFill — V2 toxicity scoring with depth % and fill frequency
 // ──────────────────────────────────────────────────────────────────────────────
 
-func (s *SpikeMakerStrategy) OnFill(event *core.FillEvent) {
+func (s *SpikeMakerV2Strategy) OnFill(event *core.FillEvent) {
 	// No-op: all fill handling is done in OnOrderUpdate
 }
 
-func (s *SpikeMakerStrategy) OnOrderUpdate(event *core.OrderEvent) {
+func (s *SpikeMakerV2Strategy) OnOrderUpdate(event *core.OrderEvent) {
 	if event.Status != "FILLED" && event.Status != "PARTIALLY_FILLED" {
 		return
 	}
@@ -383,14 +447,14 @@ func (s *SpikeMakerStrategy) OnOrderUpdate(event *core.OrderEvent) {
 	s.fillRebuildSide = event.Side
 	s.lastFillAt = now
 
-	// ── Compute toxicity ──
+	// ── Compute toxicity (V2: 4 signals) ──
 	toxicity := 0
 
 	// Signal 1: spike score
 	spikeS := computeSpikeScore(s.lastRet, math.Sqrt(s.volEwmVar))
 	if spikeS >= 3.0 {
 		toxicity = 2
-	} else if spikeS >= 1.5 && toxicity < 1 {
+	} else if spikeS >= 1.5 {
 		toxicity = 1
 	}
 
@@ -409,61 +473,85 @@ func (s *SpikeMakerStrategy) OnOrderUpdate(event *core.OrderEvent) {
 		}
 	}
 
-	// Signal 3: repeated same-side fills in 30s
-	sameSideCount := 0
-	window30s := now.Add(-30 * time.Second)
-	for _, f := range s.fillHistory {
-		if f.side == event.Side && f.timestamp.After(window30s) {
-			sameSideCount++
+	// Signal 3 (V2): same-side fills as % of total depth in 30s
+	if s.cfg.TargetDepthNotional > 0 {
+		var sameSideNotional float64
+		window30s := now.Add(-30 * time.Second)
+		for _, f := range s.fillHistory {
+			if f.side == event.Side && f.timestamp.After(window30s) {
+				sameSideNotional += f.price * f.qty
+			}
+		}
+		depthPct := sameSideNotional / s.cfg.TargetDepthNotional
+		if depthPct >= 0.03 {
+			toxicity = 2
+		} else if depthPct >= 0.01 && toxicity < 1 {
+			toxicity = 1
 		}
 	}
-	if sameSideCount >= 3 {
+
+	// Signal 4 (V2 NEW): fill frequency — fills in last 10s
+	window10s := now.Add(-10 * time.Second)
+	fillCount10s := 0
+	for _, f := range s.fillHistory {
+		if f.timestamp.After(window10s) {
+			fillCount10s++
+		}
+	}
+	if fillCount10s > 5 {
 		toxicity = 2
-	} else if sameSideCount >= 2 && toxicity < 1 {
+	} else if fillCount10s > 3 && toxicity < 1 {
 		toxicity = 1
 	}
 
 	s.lastFillToxicity = toxicity
-	log.Printf("[%s] toxicity=%d (S=%.1f, sameSide=%d, side=%s)",
-		s.Name(), toxicity, spikeS, sameSideCount, event.Side)
+
+	// V2: tox=2 triggers 5s emergency pause
+	if toxicity >= 2 {
+		s.emergencyPauseUntil = now.Add(5 * time.Second)
+		log.Printf("[%s] 🚨 EMERGENCY PAUSE 5s: toxicity=%d (S=%.1f, fillFreq=%d/10s, side=%s)",
+			s.Name(), toxicity, spikeS, fillCount10s, event.Side)
+	} else {
+		log.Printf("[%s] toxicity=%d (S=%.1f, fillFreq=%d/10s, side=%s)",
+			s.Name(), toxicity, spikeS, fillCount10s, event.Side)
+	}
 }
 
-func (s *SpikeMakerStrategy) UpdateConfig(newCfg interface{}) error {
+func (s *SpikeMakerV2Strategy) UpdateConfig(newCfg interface{}) error {
 	log.Printf("[%s] Config update not yet implemented", s.Name())
 	return nil
 }
 
-func (s *SpikeMakerStrategy) UpdatePrevSnapshot(liveOrders []core.LiveOrder, balance *core.BalanceState) {
+func (s *SpikeMakerV2Strategy) UpdatePrevSnapshot(liveOrders []core.LiveOrder, balance *core.BalanceState) {
 	// No-op — stateless convergence
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Converge — scoped order diffing with queue priority preservation
+// Converge — V2 scoped order diffing
 // ──────────────────────────────────────────────────────────────────────────────
 
-// computeRebuildScope decides how much of the book to rebuild based on fill toxicity.
-func (s *SpikeMakerStrategy) computeRebuildScope(mid float64) *rebuildScope {
-	// No recent fill or high toxicity → full rebuild
+func (s *SpikeMakerV2Strategy) computeRebuildScopeV2(mid float64) *rebuildScope {
 	if s.lastFillAt.IsZero() || time.Since(s.lastFillAt) > 10*time.Second {
-		return nil // full
+		return nil // full rebuild
 	}
 	switch s.lastFillToxicity {
-	case 0: // normal: only top 2 levels on fill side
+	case 0:
 		return &rebuildScope{side: s.fillRebuildSide, maxLevels: 2, mid: mid}
-	case 1: // moderate: top 3 levels
+	case 1:
 		return &rebuildScope{side: s.fillRebuildSide, maxLevels: 3, mid: mid}
-	default: // high: full rebuild
+	default:
+		// tox=2: emergency pause handles this (cancel all in Tick), but if we
+		// somehow get here, do a full rebuild
 		return nil
 	}
 }
 
-func (s *SpikeMakerStrategy) converge(desired []core.DesiredOrder, live []core.LiveOrder, scope *rebuildScope) (toCancel []string, toCreate []core.DesiredOrder) {
+func (s *SpikeMakerV2Strategy) convergeV2(desired []core.DesiredOrder, live []core.LiveOrder, scope *rebuildScope) (toCancel []string, toCreate []core.DesiredOrder) {
 	tolerance := s.cfg.RelistToleranceBps / 10000.0
 	if tolerance <= 0 {
 		tolerance = 25.0 / 10000.0
 	}
 
-	// Split by side
 	var dBuys, dSells []core.DesiredOrder
 	for _, d := range desired {
 		if d.Side == "BUY" {
@@ -482,16 +570,12 @@ func (s *SpikeMakerStrategy) converge(desired []core.DesiredOrder, live []core.L
 	}
 
 	matchSide := func(desiredSide []core.DesiredOrder, liveSide []core.LiveOrder, side string) {
-		// If scope restricts to a different side, keep everything on this side
 		if scope != nil && scope.side != side {
-			return // all live orders auto-kept, no creates
+			return
 		}
 
-		// If scope limits levels, split live into "in scope" and "protected"
 		var inScope []core.LiveOrder
-		var protectedIDs []string
 		if scope != nil && scope.mid > 0 {
-			// Sort live by distance from mid (inner first)
 			type distOrder struct {
 				lo   core.LiveOrder
 				dist float64
@@ -505,12 +589,9 @@ func (s *SpikeMakerStrategy) converge(desired []core.DesiredOrder, live []core.L
 			for i, do := range dos {
 				if i < scope.maxLevels {
 					inScope = append(inScope, do.lo)
-				} else {
-					protectedIDs = append(protectedIDs, do.lo.OrderID)
 				}
 			}
 			liveSide = inScope
-			_ = protectedIDs // protected orders are simply not in liveSide → not cancelled
 		}
 
 		used := make([]bool, len(liveSide))
@@ -531,18 +612,13 @@ func (s *SpikeMakerStrategy) converge(desired []core.DesiredOrder, live []core.L
 
 			if bestIdx >= 0 && bestDiff <= tolerance {
 				used[bestIdx] = true
-				// Price matches within tolerance → keep the order regardless of qty drift.
-				// Replacing for qty changes destroys queue priority and causes churn
-				// when size throttle oscillates with spike score.
 			} else {
 				toCreate = append(toCreate, d)
 			}
 		}
 
-		// Cancel unmatched live orders in scope
 		for j, lo := range liveSide {
 			if !used[j] {
-				// Find closest desired to explain why unmatched
 				closestDist := math.MaxFloat64
 				closestPrice := 0.0
 				for _, d := range desiredSide {
@@ -571,10 +647,10 @@ func (s *SpikeMakerStrategy) converge(desired []core.DesiredOrder, live []core.L
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Risk management (drawdown modes)
+// Risk management (drawdown modes) — same as V1
 // ──────────────────────────────────────────────────────────────────────────────
 
-func (s *SpikeMakerStrategy) updateRiskState(nav float64) (float64, SpikeMakerMode) {
+func (s *SpikeMakerV2Strategy) updateRiskStateV2(nav float64) (float64, SpikeMakerMode) {
 	now := time.Now()
 
 	s.navHistory = append(s.navHistory, navSnapshot{timestamp: now, nav: nav})
@@ -582,7 +658,6 @@ func (s *SpikeMakerStrategy) updateRiskState(nav float64) (float64, SpikeMakerMo
 	for len(s.navHistory) > 0 && s.navHistory[0].timestamp.Before(cutoff) {
 		s.navHistory = s.navHistory[1:]
 	}
-	// Hard cap to prevent unbounded growth (24h at 1 tick/s ≈ 86400)
 	if len(s.navHistory) > 100000 {
 		s.navHistory = s.navHistory[len(s.navHistory)-100000:]
 	}
@@ -630,7 +705,7 @@ func (s *SpikeMakerStrategy) updateRiskState(nav float64) (float64, SpikeMakerMo
 	return drawdown, s.currentMode
 }
 
-func (s *SpikeMakerStrategy) calculateSizeMultiplier(drawdown float64, mode SpikeMakerMode) float64 {
+func (s *SpikeMakerV2Strategy) calculateSizeMultV2(drawdown float64, mode SpikeMakerMode) float64 {
 	switch mode {
 	case smModeNormal:
 		return 1.0
@@ -653,10 +728,10 @@ func (s *SpikeMakerStrategy) calculateSizeMultiplier(drawdown float64, mode Spik
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Budget constraint
+// Budget constraint — same as V1
 // ──────────────────────────────────────────────────────────────────────────────
 
-func (s *SpikeMakerStrategy) applyBudgetConstraint(desired []core.DesiredOrder, balance *core.BalanceState, mid float64) []core.DesiredOrder {
+func (s *SpikeMakerV2Strategy) applyBudgetConstraintV2(desired []core.DesiredOrder, balance *core.BalanceState, mid float64) []core.DesiredOrder {
 	var bidTotal, askTotal float64
 	for _, d := range desired {
 		if d.Side == "BUY" {

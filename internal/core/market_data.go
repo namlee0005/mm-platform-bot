@@ -4,13 +4,19 @@ import (
 	"fmt"
 	"math"
 	"strconv"
+	"sync"
 	"time"
 
 	"mm-platform-engine/internal/exchange"
 )
 
-// MarketDataCache caches market info (tick size, step size, etc.) and builds snapshots
+const defaultStaleness = 10 * time.Second
+
+// MarketDataCache caches market info (tick size, step size, etc.) and builds snapshots.
+// Thread-safe: WS goroutines write, tick() reads.
 type MarketDataCache struct {
+	mu sync.RWMutex
+
 	// Cached market constraints
 	tickSize    float64
 	stepSize    float64
@@ -28,17 +34,85 @@ type MarketDataCache struct {
 
 	// Last update time
 	lastUpdate time.Time
+
+	// WS-cached data with staleness tracking
+	cachedDepth    *exchange.Depth
+	lastDepthTime  time.Time
+	lastTickerTime time.Time
+	cachedTrades   []exchange.Trade
+	lastTradesTime time.Time
+	stalenessLimit time.Duration
 }
 
 // NewMarketDataCache creates a new market data cache
 func NewMarketDataCache() *MarketDataCache {
 	return &MarketDataCache{
-		minNotional: 5.0, // Default fallback
+		minNotional:    5.0, // Default fallback
+		stalenessLimit: defaultStaleness,
 	}
 }
 
+// ── WS cache update methods (called from WS goroutines) ──
+
+// UpdateDepth stores a fresh orderbook from WS.
+func (m *MarketDataCache) UpdateDepth(depth *exchange.Depth) {
+	m.mu.Lock()
+	m.cachedDepth = depth
+	m.lastDepthTime = time.Now()
+	m.mu.Unlock()
+}
+
+// UpdateRecentTrades stores recent public trades from WS.
+func (m *MarketDataCache) UpdateRecentTrades(trades []exchange.Trade) {
+	m.mu.Lock()
+	m.cachedTrades = trades
+	m.lastTradesTime = time.Now()
+	// Also update last trade price from most recent trade
+	if len(trades) > 0 {
+		m.lastTradePrice = trades[len(trades)-1].Price
+		m.lastTickerTime = time.Now()
+	}
+	m.mu.Unlock()
+}
+
+// ── WS cache read methods (called from tick) ──
+
+// GetCachedDepth returns cached depth and whether it is fresh.
+func (m *MarketDataCache) GetCachedDepth() (*exchange.Depth, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.cachedDepth == nil {
+		return nil, false
+	}
+	fresh := time.Since(m.lastDepthTime) < m.stalenessLimit
+	return m.cachedDepth, fresh
+}
+
+// GetCachedTrades returns cached trades and whether they are fresh.
+func (m *MarketDataCache) GetCachedTrades() ([]exchange.Trade, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.cachedTrades == nil {
+		return nil, false
+	}
+	fresh := time.Since(m.lastTradesTime) < m.stalenessLimit
+	return m.cachedTrades, fresh
+}
+
+// IsTickerFresh returns true if last trade price was updated recently.
+func (m *MarketDataCache) IsTickerFresh() bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.lastTradePrice > 0 && time.Since(m.lastTickerTime) < m.stalenessLimit
+}
+
+// ── Existing methods (now thread-safe) ──
+
 // UpdateFromExchangeInfo updates cached market info from exchange info response
 func (m *MarketDataCache) UpdateFromExchangeInfo(info *exchange.ExchangeInfo, symbol string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
 	for _, sym := range info.Symbols {
 		if sym.Symbol == symbol {
 			m.tickSize = math.Pow10(-sym.QuoteAssetPrecision)
@@ -54,7 +128,6 @@ func (m *MarketDataCache) UpdateFromExchangeInfo(info *exchange.ExchangeInfo, sy
 						}
 					}
 				}
-				// Extract max order quantity from LOT_SIZE filter
 				if f.FilterType == "LOT_SIZE" {
 					if f.MaxQty != "" {
 						if val, err := strconv.ParseFloat(f.MaxQty, 64); err == nil {
@@ -67,10 +140,8 @@ func (m *MarketDataCache) UpdateFromExchangeInfo(info *exchange.ExchangeInfo, sy
 			if m.minNotional <= 0 {
 				m.minNotional = 5.0
 			}
-
-			// Default max order qty if not set
 			if m.maxOrderQty <= 0 {
-				m.maxOrderQty = 1000000 // Conservative default: 1M
+				m.maxOrderQty = 1000000
 			}
 
 			m.lastUpdate = time.Now()
@@ -83,63 +154,52 @@ func (m *MarketDataCache) UpdateFromExchangeInfo(info *exchange.ExchangeInfo, sy
 
 // BuildSnapshot creates a Snapshot from depth data
 func (m *MarketDataCache) BuildSnapshot(depth *exchange.Depth) (*Snapshot, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
 	var bestBid, bestAsk, mid float64
 	var bids, asks []PriceLevel
 
-	// Check if we have valid bid/ask data
 	hasBids := len(depth.Bids) > 0
 	hasAsks := len(depth.Asks) > 0
 
 	if hasBids && hasAsks {
-		// Normal case: both sides available
 		bestBid, _ = strconv.ParseFloat(depth.Bids[0][0], 64)
 		bestAsk, _ = strconv.ParseFloat(depth.Asks[0][0], 64)
 		mid = (bestBid + bestAsk) / 2.0
-
-		// Update cached values
 		m.lastBestBid = bestBid
 		m.lastBestAsk = bestAsk
 		m.lastMid = mid
-
 	} else if hasBids && !hasAsks {
-		// Only bids available - use bid as reference
 		bestBid, _ = strconv.ParseFloat(depth.Bids[0][0], 64)
 		if m.lastBestAsk > 0 {
 			bestAsk = m.lastBestAsk
 		} else {
-			// Estimate ask as bid + min spread (10 bps)
 			bestAsk = bestBid * 1.001
 		}
 		mid = (bestBid + bestAsk) / 2.0
 		m.lastBestBid = bestBid
 		m.lastMid = mid
-
 	} else if !hasBids && hasAsks {
-		// Only asks available - use ask as reference
 		bestAsk, _ = strconv.ParseFloat(depth.Asks[0][0], 64)
 		if m.lastBestBid > 0 {
 			bestBid = m.lastBestBid
 		} else {
-			// Estimate bid as ask - min spread (10 bps)
 			bestBid = bestAsk * 0.999
 		}
 		mid = (bestBid + bestAsk) / 2.0
 		m.lastBestAsk = bestAsk
 		m.lastMid = mid
-
 	} else {
-		// Both empty - use cached values
 		if m.lastMid <= 0 {
 			return nil, fmt.Errorf("empty order book and no cached price")
 		}
 		bestBid = m.lastBestBid
 		bestAsk = m.lastBestAsk
 		mid = m.lastMid
-		// Log warning
 		fmt.Printf("[MarketData] WARNING: Using cached mid=%.8f (empty orderbook)\n", mid)
 	}
 
-	// Parse bids
 	bids = make([]PriceLevel, 0, len(depth.Bids))
 	for _, b := range depth.Bids {
 		p, _ := strconv.ParseFloat(b[0], 64)
@@ -147,7 +207,6 @@ func (m *MarketDataCache) BuildSnapshot(depth *exchange.Depth) (*Snapshot, error
 		bids = append(bids, PriceLevel{Price: p, Qty: q})
 	}
 
-	// Parse asks
 	asks = make([]PriceLevel, 0, len(depth.Asks))
 	for _, a := range depth.Asks {
 		p, _ := strconv.ParseFloat(a[0], 64)
@@ -155,7 +214,6 @@ func (m *MarketDataCache) BuildSnapshot(depth *exchange.Depth) (*Snapshot, error
 		asks = append(asks, PriceLevel{Price: p, Qty: q})
 	}
 
-	// If useLastTrade is enabled and we have a valid lastTradePrice, use it instead of mid
 	if m.useLastTrade && m.lastTradePrice > 0 {
 		mid = m.lastTradePrice
 	}
@@ -174,72 +232,97 @@ func (m *MarketDataCache) BuildSnapshot(depth *exchange.Depth) (*Snapshot, error
 	}, nil
 }
 
-// SetLastPrice allows setting the last known price from external source (e.g., trades)
+// SetLastPrice allows setting the last known price from external source
 func (m *MarketDataCache) SetLastPrice(price float64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if price > 0 {
 		m.lastMid = price
-		// Estimate bid/ask with 10bps spread
 		m.lastBestBid = price * 0.9995
 		m.lastBestAsk = price * 1.0005
 	}
 }
 
-// SetLastTradePrice sets the last trade price (from fills or public trades)
+// SetLastTradePrice sets the last trade price
 func (m *MarketDataCache) SetLastTradePrice(price float64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if price > 0 {
 		m.lastTradePrice = price
+		m.lastTickerTime = time.Now()
 	}
 }
 
 // UseLastTradePrice enables using last trade price instead of calculated mid
 func (m *MarketDataCache) UseLastTradePrice(enable bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.useLastTrade = enable
 }
 
 // GetLastMid returns the last known mid price
 func (m *MarketDataCache) GetLastMid() float64 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	return m.lastMid
 }
 
 // GetLastTradePrice returns the last trade price
 func (m *MarketDataCache) GetLastTradePrice() float64 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	return m.lastTradePrice
 }
 
 // GetTickSize returns the cached tick size
 func (m *MarketDataCache) GetTickSize() float64 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	return m.tickSize
 }
 
 // GetStepSize returns the cached step size
 func (m *MarketDataCache) GetStepSize() float64 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	return m.stepSize
 }
 
 // GetMinNotional returns the cached minimum notional
 func (m *MarketDataCache) GetMinNotional() float64 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	return m.minNotional
 }
 
 // RoundToTick rounds price to tick size
 func (m *MarketDataCache) RoundToTick(price float64) float64 {
-	if m.tickSize <= 0 {
+	m.mu.RLock()
+	ts := m.tickSize
+	m.mu.RUnlock()
+	if ts <= 0 {
 		return price
 	}
-	return math.Round(price/m.tickSize) * m.tickSize
+	return math.Round(price/ts) * ts
 }
 
 // RoundToStep rounds quantity to step size (floors)
 func (m *MarketDataCache) RoundToStep(qty float64) float64 {
-	if m.stepSize <= 0 {
+	m.mu.RLock()
+	ss := m.stepSize
+	m.mu.RUnlock()
+	if ss <= 0 {
 		return qty
 	}
-	return math.Floor(qty/m.stepSize) * m.stepSize
+	return math.Floor(qty/ss) * ss
 }
 
 // IsValidNotional checks if the order notional meets minimum requirements
 func (m *MarketDataCache) IsValidNotional(price, qty float64) bool {
-	return price*qty >= m.minNotional
+	m.mu.RLock()
+	mn := m.minNotional
+	m.mu.RUnlock()
+	return price*qty >= mn
 }
 
 // CalculateSpread returns spread in basis points

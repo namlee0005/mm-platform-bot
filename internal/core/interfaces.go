@@ -204,37 +204,10 @@ type OrderDiff struct {
 	Reason  string        // Human-readable reason for this action
 }
 
-// BaseBotConfig contains configuration for BaseBot
-type BaseBotConfig struct {
-	Symbol         string
-	BaseAsset      string
-	QuoteAsset     string
-	Exchange       string // exchange name (mexc, gate, etc.)
-	ExchangeID     string // exchange ObjectID for finding partner
-	BotID          string // unique bot instance ID
-	BotType        string // bot type identifier
-	TickIntervalMs int    // tick interval in milliseconds
-
-	// Rate limiting
-	RateLimitOrdersPerSec int
-	BatchSize             int
-
-	// Config check interval (in ticks)
-	ConfigCheckInterval int
-
-	// Price source
-	UseLastTradePrice bool // Use last trade price instead of mid (bid+ask)/2
-
-	// Order sync interval (ms). 0 = sync every tick, >0 = sync every N ms
-	// Use 0 for strategies with few orders (simple_ladder ~6 orders)
-	// Use 300000 (5min) for strategies with many orders (depth_filler ~50 orders)
-	SyncOrdersIntervalMs int
-}
-
 // FillNotifier sends notifications when orders are filled.
 // Implemented by notify.TelegramNotifier.
 type FillNotifier interface {
-	NotifyFill(side string, price, qty, notional float64, isFull bool)
+	NotifyFill(side string, price, qty, notional float64, isFull bool, orderID string)
 }
 
 // ComputeInventory computes inventory metrics based on balance and mid price

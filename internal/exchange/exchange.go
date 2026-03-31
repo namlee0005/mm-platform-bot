@@ -23,6 +23,10 @@ type Exchange interface {
 	CancelAllOrders(ctx context.Context, symbol string) error
 	GetOpenOrders(ctx context.Context, symbol string) ([]*Order, error)
 
+	// FetchClosedOrders retrieves recently closed (filled/canceled) orders.
+	// since: only return orders after this timestamp. limit: max orders to return.
+	FetchClosedOrders(ctx context.Context, symbol string, since time.Time, limit int) ([]*Order, error)
+
 	// SubscribeUserStream WebSocket operations
 	SubscribeUserStream(ctx context.Context, handlers UserStreamHandlers) error
 
@@ -53,16 +57,17 @@ type Balance struct {
 
 // Order represents an exchange order
 type Order struct {
-	OrderID            string  `json:"orderId"`
-	ClientOrderID      string  `json:"clientOrderId"`
-	Symbol             string  `json:"symbol"`
-	Side               string  `json:"side"`   // BUY or SELL
-	Type               string  `json:"type"`   // LIMIT, MARKET
-	Status             string  `json:"status"` // NEW, FILLED, CANCELED, etc
-	Price              float64 `json:"price"`
-	Quantity           float64 `json:"quantity"`
-	ExecutedQty        float64 `json:"executedQty"`
-	CumulativeQuoteQty float64 `json:"cumulativeQuoteQty"`
+	OrderID            string    `json:"orderId"`
+	ClientOrderID      string    `json:"clientOrderId"`
+	Symbol             string    `json:"symbol"`
+	Side               string    `json:"side"`   // BUY or SELL
+	Type               string    `json:"type"`   // LIMIT, MARKET
+	Status             string    `json:"status"` // NEW, FILLED, CANCELED, etc
+	Price              float64   `json:"price"`
+	Quantity           float64   `json:"quantity"`
+	ExecutedQty        float64   `json:"executedQty"`
+	CumulativeQuoteQty float64   `json:"cumulativeQuoteQty"`
+	Timestamp          time.Time `json:"timestamp"`
 }
 
 // OrderRequest represents a request to place an order
@@ -123,4 +128,30 @@ type Trade struct {
 	Quantity     float64   `json:"quantity"`
 	Timestamp    time.Time `json:"timestamp"`
 	IsBuyerMaker bool      `json:"isBuyerMaker"` // true if buyer placed order (sell was aggressive)
+}
+
+// WSOrderExchange extends Exchange with WebSocket-based order management.
+// Exchanges that support WS orders (Bybit, Binance, Gate, KuCoin) implement this.
+// The engine checks for this interface via type assertion and falls back to REST if unavailable.
+type WSOrderExchange interface {
+	Exchange
+
+	// PlaceOrderWs places an order via WebSocket (lower latency than REST).
+	PlaceOrderWs(ctx context.Context, order *OrderRequest) (*Order, error)
+
+	// EditOrderWs amends an existing order's price/qty via WebSocket.
+	// This avoids cancel+place roundtrip.
+	EditOrderWs(ctx context.Context, orderID, symbol string, newPrice, newQty float64) (*Order, error)
+
+	// CancelOrderWs cancels an order via WebSocket.
+	CancelOrderWs(ctx context.Context, symbol, orderID string) error
+
+	// CancelAllOrdersWs cancels all orders for a symbol via WebSocket.
+	CancelAllOrdersWs(ctx context.Context, symbol string) error
+
+	// HasWsOrderSupport returns true if the exchange supports WS order placement.
+	HasWsOrderSupport() bool
+
+	// HasWsEditSupport returns true if the exchange supports WS order editing.
+	HasWsEditSupport() bool
 }

@@ -13,6 +13,7 @@ import (
 	"mm-platform-engine/internal/bot"
 	"mm-platform-engine/internal/config"
 	"mm-platform-engine/internal/core"
+	"mm-platform-engine/internal/engine"
 	"mm-platform-engine/internal/exchange"
 	"mm-platform-engine/internal/notify"
 	"mm-platform-engine/internal/store"
@@ -35,7 +36,7 @@ func main() {
 		botType = cfg.SimpleConfig.BotType
 	}
 	if botType == "" {
-		botType = "simple-maker" // Default to simple-maker (2-sided)
+		botType = "simple-maker"
 	}
 
 	log.Printf("Loaded config for %s on %s, bot_type=%s",
@@ -85,32 +86,12 @@ func main() {
 		BotID:    botID,
 	})
 
-	// Create bot based on type
-	var maker *core.BaseBot
+	// Setup context
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-	switch strings.ToLower(botType) {
-	case "simple-maker":
-		// All simple/one-sided types now use 2-sided simple-maker
-		maker = createSimpleMaker(cfg, exch, redis, mongo, exchangeName, botID, telegram)
-		log.Println("Mode: SIMPLE-MAKER (2-sided market maker)")
-
-	case "spike-maker":
-		maker = createSpikeMaker(cfg, exch, redis, mongo, exchangeName, botID)
-		log.Println("Mode: SPIKE-MAKER (spike-adaptive market maker)")
-
-	case "depth-filler":
-		maker = createDepthFiller(cfg, exch, redis, mongo, exchangeName, botID)
-		log.Println("Mode: DEPTH-FILLER (order book depth filler)")
-
-	default:
-		log.Fatalf("Invalid bot_type: %s (must be 'simple-maker', 'spike-maker', or 'depth-filler')", botType)
-	}
-
-	// Wire up fill notifications (Telegram) — co-located with SaveFill in BaseBot
-	maker.SetFillNotifier(telegram)
-
-	// Wire up Redis Stream for order events
-	maker.SetOrderEventCallback(func(event core.BotOrderEvent) {
+	// Order event callback for Redis Stream
+	orderEventCb := func(event core.BotOrderEvent) {
 		redis.PublishMMOrderEvent(context.Background(), &store.MMOrderEvent{
 			Type:      string(event.Type),
 			Exchange:  exchangeName,
@@ -124,65 +105,72 @@ func main() {
 			Timestamp: event.Timestamp,
 			BotID:     botID,
 		})
-	})
-
-	// Setup context
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	// Start bot
-	if err := maker.Start(ctx); err != nil {
-		log.Fatalf("Failed to start bot: %v", err)
 	}
 
-	// Send Telegram notification for bot start
+	// Create engine based on bot type
+	var eng *engine.Engine
+
+	switch strings.ToLower(botType) {
+	case "simple-maker":
+		eng = createSimpleMakerEngine(cfg, exch, redis, mongo, exchangeName, botID, telegram)
+		log.Println("Mode: SIMPLE-MAKER (event-driven)")
+	case "spike-maker":
+		eng = createSpikeMakerEngine(cfg, exch, redis, mongo, exchangeName, botID)
+		log.Println("Mode: SPIKE-MAKER (event-driven)")
+	case "spike-maker-v2":
+		eng = createSpikeMakerV2Engine(cfg, exch, redis, mongo, exchangeName, botID)
+		log.Println("Mode: SPIKE-MAKER-V2 (event-driven)")
+	case "depth-filler":
+		eng = createDepthFillerEngine(cfg, exch, redis, mongo, exchangeName, botID)
+		log.Println("Mode: DEPTH-FILLER (event-driven)")
+	default:
+		log.Fatalf("Invalid bot_type: %s (must be 'simple-maker', 'spike-maker', 'spike-maker-v2', or 'depth-filler')", botType)
+	}
+
+	eng.SetFillNotifier(telegram)
+	eng.SetOrderEventCallback(orderEventCb)
+
+	if err := eng.Start(ctx); err != nil {
+		log.Fatalf("Failed to start engine: %v", err)
+	}
+
 	startTime := time.Now()
 	telegram.NotifyBotStarted(botType, map[string]interface{}{
 		"symbol": cfg.SimpleConfig.Symbol,
 	})
 
-	// Update status in Redis
 	statusKey := fmt.Sprintf("%s:%s", cfg.SimpleConfig.Symbol, botType)
 	if err := redis.SetStatus(ctx, statusKey, "running"); err != nil {
 		log.Printf("Failed to set status: %v", err)
 	}
 
-	// Wait for shutdown signal
+	// Wait for shutdown
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-
 	log.Printf("Bot [%s] is running. Press Ctrl+C to stop.", botType)
 
-	// Wait for first signal
 	sig := <-sigCh
 	log.Printf("Received signal: %v", sig)
-	log.Println("Shutting down... (please wait for orders to be cancelled)")
-
-	// Ignore further signals during shutdown
 	signal.Stop(sigCh)
 
-	// Update status
 	if err := redis.SetStatus(context.Background(), statusKey, "stopped"); err != nil {
 		log.Printf("Failed to set status: %v", err)
 	}
 
-	// Stop bot with timeout
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer shutdownCancel()
 
-	if err := maker.Stop(shutdownCtx); err != nil {
+	if err := eng.Stop(shutdownCtx); err != nil {
 		log.Printf("Error during shutdown: %v", err)
 	}
 
-	// Send Telegram notification for bot stop
-	runtime := time.Since(startTime)
-	telegram.NotifyBotStopped("graceful shutdown", runtime)
-
+	telegram.NotifyBotStopped("graceful shutdown", time.Since(startTime))
 	log.Println("Bot stopped successfully")
 }
 
-// createSimpleMaker creates a SimpleMaker bot (2-sided)
-func createSimpleMaker(
+// ===== Engine Factories =====
+
+func createSimpleMakerEngine(
 	cfg *config.Config,
 	exch exchange.Exchange,
 	redis *store.RedisStore,
@@ -190,10 +178,9 @@ func createSimpleMaker(
 	exchangeName string,
 	botID string,
 	telegram *notify.TelegramNotifier,
-) *core.BaseBot {
+) *engine.Engine {
 	simpleConfig := &cfg.SimpleConfig
 
-	// Set defaults for embedded config
 	if simpleConfig.SpreadMinBps == 0 {
 		simpleConfig.SpreadMinBps = 40
 	}
@@ -222,58 +209,44 @@ func createSimpleMaker(
 		simpleConfig.FillCooldownMs = 5000
 	}
 
-	// Create simplified config - just embed MongoDB config + bot metadata
 	makerCfg := &bot.SimpleMakerConfig{
-		SimpleConfig:   simpleConfig, // Embed entire MongoDB config
-		Exchange:       exchangeName,
-		ExchangeID:     cfg.ExchangeID,
-		BotID:          botID,
-		BotType:        "simple-maker",
-		TickIntervalMs: simpleConfig.TickIntervalMs,
-		// Strategy-specific (not in MongoDB)
+		SimpleConfig:        simpleConfig,
+		Exchange:            exchangeName,
+		ExchangeID:          cfg.ExchangeID,
+		BotID:               botID,
+		BotType:             "simple-maker",
+		TickIntervalMs:      simpleConfig.TickIntervalMs,
 		DrawdownWarnPct:     simpleConfig.DrawdownLimitPct * 0.6,
 		DrawdownReducePct:   simpleConfig.DrawdownLimitPct * 0.4,
 		RecoveryHours:       48,
 		MaxRecoverySizeMult: 0.3,
-		// Telegram notifications for mode changes
 		OnModeChange: func(oldMode, newMode string, nav, peakNAV, drawdownPct float64) {
-			// Determine reason for mode change
 			reason := fmt.Sprintf("Drawdown: %.2f%%", drawdownPct*100)
-
-			// Send mode change notification
 			telegram.NotifyModeChange(oldMode, newMode, reason)
-
-			// Send specific drawdown alerts based on severity
 			if newMode == "WARNING" {
 				telegram.NotifyDrawdownWarning(drawdownPct, nav, peakNAV)
 			} else if newMode == "PAUSED" {
 				telegram.NotifyDrawdownCritical(drawdownPct, nav, peakNAV)
 			}
 		},
-		// Telegram notification for low balance
 		OnBalanceLow: func(available, required float64) {
 			telegram.NotifyBalanceLow("Total Notional", available, required)
 		},
 	}
 
-	log.Printf("SimpleMaker config: spread=%.0fbps, levels=%d, depth=$%.0f, cooldown=%dms",
-		simpleConfig.SpreadMinBps, simpleConfig.NumLevels, simpleConfig.TargetDepthNotional, simpleConfig.FillCooldownMs)
-
-	return bot.NewSimpleMaker(makerCfg, exch, redis, mongo)
+	return bot.NewSimpleMakerEngine(makerCfg, exch, redis, mongo)
 }
 
-// createSpikeMaker creates a SpikeMaker bot (spike-adaptive 2-sided market maker)
-func createSpikeMaker(
+func createSpikeMakerEngine(
 	cfg *config.Config,
 	exch exchange.Exchange,
 	redis *store.RedisStore,
 	mongo *store.MongoStore,
 	exchangeName string,
 	botID string,
-) *core.BaseBot {
+) *engine.Engine {
 	simpleConfig := &cfg.SimpleConfig
 
-	// Set defaults
 	if simpleConfig.NumLevels == 0 {
 		simpleConfig.NumLevels = 10
 	}
@@ -299,37 +272,69 @@ func createSpikeMaker(
 		MaxRecoverySizeMult: 0.3,
 	}
 
-	log.Printf("SpikeMaker config: levels=%d, depth=$%.0f, depthBps=%.0f, tick=%dms",
-		simpleConfig.NumLevels, simpleConfig.TargetDepthNotional, simpleConfig.DepthBps, simpleConfig.TickIntervalMs)
-
-	return bot.NewSpikeMaker(spikeCfg, exch, redis, mongo)
+	return bot.NewSpikeMakerEngine(spikeCfg, exch, redis, mongo)
 }
 
-// createDepthFiller creates a DepthFiller bot (order book depth filler)
-func createDepthFiller(
+func createSpikeMakerV2Engine(
 	cfg *config.Config,
 	exch exchange.Exchange,
 	redis *store.RedisStore,
 	mongo *store.MongoStore,
 	exchangeName string,
 	botID string,
-) *core.BaseBot {
+) *engine.Engine {
+	simpleConfig := &cfg.SimpleConfig
+
+	if simpleConfig.NumLevels == 0 {
+		simpleConfig.NumLevels = 10
+	}
+	if simpleConfig.TargetDepthNotional == 0 {
+		simpleConfig.TargetDepthNotional = 5800
+	}
+	if simpleConfig.TickIntervalMs == 0 {
+		simpleConfig.TickIntervalMs = 5000
+	}
+	if simpleConfig.DepthBps == 0 {
+		simpleConfig.DepthBps = 200
+	}
+
+	spikeCfg := &bot.SpikeMakerV2BotConfig{
+		SimpleConfig:        simpleConfig,
+		Exchange:            exchangeName,
+		ExchangeID:          cfg.ExchangeID,
+		BotID:               botID,
+		BotType:             "spike-maker-v2",
+		TickIntervalMs:      simpleConfig.TickIntervalMs,
+		DrawdownWarnPct:     simpleConfig.DrawdownLimitPct * 0.6,
+		DrawdownReducePct:   simpleConfig.DrawdownLimitPct * 0.4,
+		MaxRecoverySizeMult: 0.3,
+		ComplianceMode:      "capital",
+	}
+
+	return bot.NewSpikeMakerV2Engine(spikeCfg, exch, redis, mongo)
+}
+
+func createDepthFillerEngine(
+	cfg *config.Config,
+	exch exchange.Exchange,
+	redis *store.RedisStore,
+	mongo *store.MongoStore,
+	exchangeName string,
+	botID string,
+) *engine.Engine {
 	simpleConfig := cfg.SimpleConfig
 
-	// Read depth range from config, with defaults
 	minDepthPct := simpleConfig.MinDepthPct
 	if minDepthPct == 0 {
-		minDepthPct = 5 // 5% from mid
+		minDepthPct = 5
 	}
 	maxDepthPct := simpleConfig.MaxDepthPct
 	if maxDepthPct == 0 {
-		maxDepthPct = 50 // 50% from mid
+		maxDepthPct = 50
 	}
-
-	// Read min order size pct from config, with default
 	minOrderSizePct := simpleConfig.MinOrderSizePct
 	if minOrderSizePct == 0 {
-		minOrderSizePct = 1 // 1% of balance per order
+		minOrderSizePct = 1
 	}
 
 	fillerCfg := &bot.DepthFillerConfig{
@@ -346,36 +351,25 @@ func createDepthFiller(
 		MaxDepthPct:         maxDepthPct,
 		NumLevels:           simpleConfig.NumLevels,
 		TargetDepthNotional: simpleConfig.TargetDepthNotional,
-		TimeSleepMs:         200, // 200ms between orders
+		TimeSleepMs:         200,
 		RemoveThresholdPct:  minDepthPct,
 		LadderRegenBps:      simpleConfig.LadderRegenBps,
-
-		// Full balance mode
-		UseFullBalance:  simpleConfig.UseFullBalance,
-		MinOrderSizePct: minOrderSizePct,
+		UseFullBalance:      simpleConfig.UseFullBalance,
+		MinOrderSizePct:     minOrderSizePct,
 	}
 
-	// Set defaults
 	if fillerCfg.TickIntervalMs == 0 {
 		fillerCfg.TickIntervalMs = 5000
 	}
 	if fillerCfg.LadderRegenBps == 0 {
-		fillerCfg.LadderRegenBps = 100 // Regen when mid moves 1%
+		fillerCfg.LadderRegenBps = 100
 	}
 	if !fillerCfg.UseFullBalance && fillerCfg.TargetDepthNotional == 0 {
-		fillerCfg.TargetDepthNotional = 100 // $100 per side default
+		fillerCfg.TargetDepthNotional = 100
 	}
 	if !fillerCfg.UseFullBalance && fillerCfg.NumLevels == 0 {
-		fillerCfg.NumLevels = 10 // 10 levels per side default
+		fillerCfg.NumLevels = 10
 	}
 
-	if fillerCfg.UseFullBalance {
-		log.Printf("DepthFiller config: depth=%.1f%%-%.1f%%, useFullBalance=true, minOrderSizePct=%.1f%%",
-			fillerCfg.MinDepthPct, fillerCfg.MaxDepthPct, fillerCfg.MinOrderSizePct)
-	} else {
-		log.Printf("DepthFiller config: depth=%.1f%%-%.1f%%, levels=%d, notional=$%.0f",
-			fillerCfg.MinDepthPct, fillerCfg.MaxDepthPct, fillerCfg.NumLevels, fillerCfg.TargetDepthNotional)
-	}
-
-	return bot.NewDepthFiller(fillerCfg, exch, redis, mongo)
+	return bot.NewDepthFillerEngine(fillerCfg, exch, redis, mongo)
 }

@@ -60,14 +60,13 @@ func NewMongoStore(uri, database string) (*MongoStore, error) {
 	}, nil
 }
 
-// SaveFill saves a fill event to MongoDB (upsert by orderId to avoid duplicates)
+// SaveFill saves a fill event to MongoDB.
+// Uses InsertOne to preserve all partial fills (not upsert which overwrites).
+// Each fill is a separate document — partial fills for the same orderId
+// are stored as individual records with different quantities.
 func (s *MongoStore) SaveFill(ctx context.Context, fill *types.FillEvent) error {
 	collection := s.database.Collection(CollectionOrderHistory)
-	filter := bson.M{"orderId": fill.OrderID}
-	update := bson.M{"$set": fill}
-	opts := options.Update().SetUpsert(true)
-
-	_, err := collection.UpdateOne(ctx, filter, update, opts)
+	_, err := collection.InsertOne(ctx, fill)
 	if err != nil {
 		return fmt.Errorf("failed to save fill: %w", err)
 	}
@@ -84,14 +83,38 @@ func (s *MongoStore) SaveDeal(ctx context.Context, deal *types.DealEvent) error 
 	return nil
 }
 
-// SaveOrderUpdate saves an order update to MongoDB
-func (s *MongoStore) SaveOrderUpdate(ctx context.Context, order *types.OrderEvent) error {
+// UpsertFilledOrder saves or updates a filled order in MongoDB.
+// Uses orderId as unique key to avoid duplicates from repeated syncs.
+func (s *MongoStore) UpsertFilledOrder(ctx context.Context, order *types.OrderEvent) error {
 	collection := s.database.Collection(CollectionOrders)
-	_, err := collection.InsertOne(ctx, order)
+	filter := bson.M{"orderId": order.OrderID}
+	update := bson.M{"$set": order}
+	opts := options.Update().SetUpsert(true)
+	_, err := collection.UpdateOne(ctx, filter, update, opts)
 	if err != nil {
-		return fmt.Errorf("failed to save order update: %w", err)
+		return fmt.Errorf("failed to upsert filled order: %w", err)
 	}
 	return nil
+}
+
+// GetLatestOrderTimestamp returns the timestamp of the most recent order in the orders collection.
+// Used to determine the `since` parameter for FetchClosedOrders.
+func (s *MongoStore) GetLatestOrderTimestamp(ctx context.Context, symbol string) (time.Time, error) {
+	collection := s.database.Collection(CollectionOrders)
+	filter := bson.M{}
+	if symbol != "" {
+		filter["symbol"] = symbol
+	}
+	opts := options.FindOne().SetSort(bson.D{{Key: "timestamp", Value: -1}})
+
+	var result struct {
+		Timestamp time.Time `bson:"timestamp"`
+	}
+	err := collection.FindOne(ctx, filter, opts).Decode(&result)
+	if err != nil {
+		return time.Time{}, err
+	}
+	return result.Timestamp, nil
 }
 
 // GetRecentFills retrieves recent fills from MongoDB

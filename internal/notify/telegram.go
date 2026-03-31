@@ -158,7 +158,7 @@ func (t *TelegramNotifier) formatHeader(level AlertLevel) string {
 
 // NotifyFill sends fill notification
 // Case: Order was filled (partial or full)
-func (t *TelegramNotifier) NotifyFill(side string, price, qty, notional float64, isFull bool) {
+func (t *TelegramNotifier) NotifyFill(side string, price, qty, notional float64, isFull bool, orderID string) {
 	if !t.shouldSend("fill") {
 		return
 	}
@@ -181,11 +181,13 @@ func (t *TelegramNotifier) NotifyFill(side string, price, qty, notional float64,
 %s %s @ %.8f
 Qty: %.6f
 Notional: $%.2f
+Order: <code>%s</code>
 Time: %s`,
 		t.formatHeader(AlertInfo),
 		emoji, fillType, sideEmoji,
 		sideEmoji, side, price,
 		qty, notional,
+		orderID,
 		time.Now().Format("15:04:05"))
 
 	if err := t.send(msg); err != nil {
