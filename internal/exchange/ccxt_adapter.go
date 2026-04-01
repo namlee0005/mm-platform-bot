@@ -52,6 +52,10 @@ type CCXTAdapter struct {
 	// after GC clears orderStateCache. Bybit resends filled orders in snapshots.
 	emittedFills map[string]bool
 
+	// WatchMyTrades dedup: track seen trade IDs to prevent duplicate fill emissions.
+	// WatchMyTrades returns snapshots — same trade can appear multiple times.
+	seenTradeIDs map[string]bool
+
 	// Cached market info
 	market *ccxt.Market
 }
@@ -536,45 +540,87 @@ func (c *CCXTAdapter) GetOpenOrders(ctx context.Context, symbol string) ([]*Orde
 // FetchClosedOrders retrieves recently closed orders (filled/canceled) via REST API.
 func (c *CCXTAdapter) FetchClosedOrders(ctx context.Context, symbol string, since time.Time, limit int) ([]*Order, error) {
 	ccxtSymbol := convertToCCXTSymbol(symbol)
-	sinceMs := since.UnixMilli()
+	now := time.Now()
 
-	if limit <= 0 {
-		limit = 50
-	}
+	// Bybit /v5/execution/list only supports 7-day windows.
+	// Split the range into 7-day windows and paginate within each.
+	const windowDays = 7
+	const pageSize int64 = 100
+	const maxPagesPerWindow = 50
 
-	// Use FetchMyTrades (/v5/execution/list) — returns actual fills, not order status history
-	opts := []ccxt.FetchMyTradesOptions{
-		ccxt.WithFetchMyTradesSymbol(ccxtSymbol),
-		ccxt.WithFetchMyTradesSince(sinceMs),
-		ccxt.WithFetchMyTradesLimit(int64(limit)),
-	}
+	var result []*Order
+	windowStart := since
 
-	trades, err := c.rest.FetchMyTrades(opts...)
-	if err != nil {
-		return nil, fmt.Errorf("failed to fetch trades: %w", err)
-	}
-	log.Printf("[CCXT:%s] FetchMyTrades since=%v returned %d trades",
-		c.exchangeName, since.Format("15:04:05"), len(trades))
-
-	result := make([]*Order, 0, len(trades))
-	for _, t := range trades {
-		tradeTime := time.Now()
-		if t.Timestamp != nil {
-			tradeTime = time.UnixMilli(*t.Timestamp)
+	for windowStart.Before(now) {
+		windowEnd := windowStart.Add(windowDays * 24 * time.Hour)
+		if windowEnd.After(now) {
+			windowEnd = now
 		}
-		result = append(result, &Order{
-			OrderID:            derefString(t.Order),
-			Symbol:             symbol,
-			Side:               strings.ToUpper(derefString(t.Side)),
-			Type:               "LIMIT",
-			Price:              derefFloat(t.Price),
-			Quantity:           derefFloat(t.Amount),
-			ExecutedQty:        derefFloat(t.Amount),
-			CumulativeQuoteQty: derefFloat(t.Cost),
-			Status:             "FILLED",
-			Timestamp:          tradeTime,
-		})
+
+		startMs := windowStart.UnixMilli()
+		endMs := windowEnd.UnixMilli()
+
+		for page := 0; page < maxPagesPerWindow; page++ {
+			params := map[string]interface{}{
+				"endTime": endMs,
+			}
+			opts := []ccxt.FetchMyTradesOptions{
+				ccxt.WithFetchMyTradesSymbol(ccxtSymbol),
+				ccxt.WithFetchMyTradesSince(startMs),
+				ccxt.WithFetchMyTradesLimit(pageSize),
+				ccxt.WithFetchMyTradesParams(params),
+			}
+
+			trades, err := c.rest.FetchMyTrades(opts...)
+			if err != nil {
+				return nil, fmt.Errorf("failed to fetch trades (window %s-%s): %w",
+					windowStart.Format("01-02"), windowEnd.Format("01-02"), err)
+			}
+
+			if len(trades) == 0 {
+				break
+			}
+
+			for _, t := range trades {
+				tradeTime := time.Now()
+				if t.Timestamp != nil {
+					tradeTime = time.UnixMilli(*t.Timestamp)
+				}
+				result = append(result, &Order{
+					OrderID:            derefString(t.Order),
+					ClientOrderID:      derefString(t.Id), // trade ID for dedup
+					Symbol:             symbol,
+					Side:               strings.ToUpper(derefString(t.Side)),
+					Type:               "LIMIT",
+					Price:              derefFloat(t.Price),
+					Quantity:           derefFloat(t.Amount),
+					ExecutedQty:        derefFloat(t.Amount),
+					CumulativeQuoteQty: derefFloat(t.Cost),
+					Status:             "FILLED",
+					Timestamp:          tradeTime,
+				})
+			}
+
+			// Move cursor past the last trade's timestamp
+			lastTrade := trades[len(trades)-1]
+			if lastTrade.Timestamp != nil {
+				startMs = *lastTrade.Timestamp + 1
+			} else {
+				break
+			}
+
+			if int64(len(trades)) < pageSize {
+				break
+			}
+
+			time.Sleep(100 * time.Millisecond) // rate limit
+		}
+
+		windowStart = windowEnd
 	}
+
+	log.Printf("[CCXT:%s] FetchMyTrades %s → %s returned %d trades",
+		c.exchangeName, since.Format("2006-01-02"), now.Format("2006-01-02"), len(result))
 
 	return result, nil
 }
@@ -625,6 +671,7 @@ func (c *CCXTAdapter) SubscribeUserStream(ctx context.Context, handlers UserStre
 	c.wsRunning = true
 	c.orderStateCache = make(map[string]*cachedOrderState)
 	c.emittedFills = make(map[string]bool)
+	c.seenTradeIDs = make(map[string]bool)
 	c.wsMu.Unlock()
 
 	log.Printf("[CCXT:%s] Starting WebSocket streams for %s", c.exchangeName, c.symbol)
@@ -632,8 +679,11 @@ func (c *CCXTAdapter) SubscribeUserStream(ctx context.Context, handlers UserStre
 	// Load markets for WS client
 	c.ws.LoadMarkets()
 
-	// WatchOrders via WS for real-time order/fill events
+	// WatchOrders via WS for order status updates
 	go c.watchOrders()
+
+	// WatchMyTrades via WS for real-time fill events (Bybit "execution" topic)
+	go c.watchMyTrades()
 
 	return nil
 }
@@ -674,7 +724,7 @@ func (c *CCXTAdapter) watchOrders() {
 
 				// Dedup: only process orders whose state actually changed.
 				// Bybit sends full snapshots — skip unchanged orders.
-				changed, fillDelta := c.updateOrderState(orderID, rawStatus, filledQty)
+				changed, _ := c.updateOrderState(orderID, rawStatus, filledQty)
 				if !changed {
 					continue
 				}
@@ -688,18 +738,9 @@ func (c *CCXTAdapter) watchOrders() {
 					fillPrice = derefFloat(order.Price)
 				}
 
-				// Emit OnFill for any new filled qty delta
-				if fillDelta > 0 && c.handlers.OnFill != nil {
-					c.handlers.OnFill(&types.FillEvent{
-						OrderID:   orderID,
-						Symbol:    c.nativeSymbol,
-						Side:      strings.ToUpper(derefString(order.Side)),
-						Price:     fillPrice,
-						Quantity:  fillDelta,
-						TradeID:   fmt.Sprintf("%s_order", orderID),
-						Timestamp: time.UnixMilli(derefInt64(order.Timestamp)),
-					})
-				}
+				// NOTE: OnFill is NOT emitted here — fills come from watchMyTrades()
+				// which subscribes to Bybit "execution" topic for real-time fill events.
+				// WatchOrders ("order" topic) can delay fills by minutes on Bybit.
 
 				// Emit OnOrderUpdate only when state changed
 				if c.handlers.OnOrderUpdate != nil {
@@ -720,6 +761,85 @@ func (c *CCXTAdapter) watchOrders() {
 						ExecutedQty:        derefFloat(order.Filled),
 						CumulativeQuoteQty: derefFloat(order.Cost),
 						Timestamp:          time.UnixMilli(derefInt64(order.Timestamp)),
+					})
+				}
+			}
+		}()
+	}
+}
+
+// watchMyTrades watches for trade executions via WebSocket ("execution" topic).
+// This is the primary source for fill events — much faster than WatchOrders on Bybit.
+func (c *CCXTAdapter) watchMyTrades() {
+	log.Printf("[CCXT:%s] Starting my trades watcher for %s", c.exchangeName, c.symbol)
+
+	for {
+		select {
+		case <-c.ctx.Done():
+			log.Printf("[CCXT:%s] My trades watcher stopped", c.exchangeName)
+			return
+		default:
+		}
+
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("[CCXT:%s] watchMyTrades panic: %v — restarting in 1s", c.exchangeName, r)
+					time.Sleep(time.Second)
+				}
+			}()
+
+			trades, err := c.ws.WatchMyTrades(ccxt.WithWatchMyTradesSymbol(c.symbol))
+			if err != nil {
+				log.Printf("[CCXT:%s] WatchMyTrades error: %v", c.exchangeName, err)
+				if c.handlers.OnError != nil {
+					c.handlers.OnError(err)
+				}
+				time.Sleep(time.Second)
+				return
+			}
+
+			for _, trade := range trades {
+				tradeID := derefString(trade.Id)
+				if tradeID == "" {
+					continue
+				}
+
+				// Dedup: WatchMyTrades can return snapshots with previously seen trades
+				c.orderStateMu.Lock()
+				if c.seenTradeIDs[tradeID] {
+					c.orderStateMu.Unlock()
+					continue
+				}
+				c.seenTradeIDs[tradeID] = true
+				c.orderStateMu.Unlock()
+
+				orderID := derefString(trade.Order)
+				side := strings.ToUpper(derefString(trade.Side))
+				price := derefFloat(trade.Price)
+				qty := derefFloat(trade.Amount)
+				var commission float64
+				if trade.Fee.Cost != nil {
+					commission = *trade.Fee.Cost
+				}
+				ts := time.Now()
+				if trade.Timestamp != nil {
+					ts = time.UnixMilli(*trade.Timestamp)
+				}
+
+				log.Printf("[CCXT:%s] Trade fill: %s %s @ %.8f x %.6f (order=%s trade=%s)",
+					c.exchangeName, side, c.nativeSymbol, price, qty, orderID, tradeID)
+
+				if c.handlers.OnFill != nil {
+					c.handlers.OnFill(&types.FillEvent{
+						OrderID:    orderID,
+						Symbol:     c.nativeSymbol,
+						Side:       side,
+						Price:      price,
+						Quantity:   qty,
+						Commission: commission,
+						TradeID:    tradeID,
+						Timestamp:  ts,
 					})
 				}
 			}

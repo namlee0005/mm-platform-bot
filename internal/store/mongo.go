@@ -58,10 +58,13 @@ func (s *MongoStore) SaveDeal(ctx context.Context, deal *types.DealEvent) error 
 	return nil
 }
 
-// InsertFilledOrder inserts a filled order into order_history.
+// InsertFilledOrder inserts a filled order into order_history if not already exists (deduped by tradeId in clientOrderId).
 func (s *MongoStore) InsertFilledOrder(ctx context.Context, order *types.OrderEvent) error {
 	collection := s.database.Collection(CollectionOrderHistory)
-	_, err := collection.InsertOne(ctx, order)
+	filter := bson.M{"clientOrderId": order.ClientOrderID}
+	update := bson.M{"$setOnInsert": order}
+	opts := options.Update().SetUpsert(true)
+	_, err := collection.UpdateOne(ctx, filter, update, opts)
 	if err != nil {
 		return fmt.Errorf("failed to insert filled order: %w", err)
 	}
@@ -70,11 +73,17 @@ func (s *MongoStore) InsertFilledOrder(ctx context.Context, order *types.OrderEv
 
 // GetLatestOrderTimestamp returns the timestamp of the most recent order in the orders collection.
 // Used to determine the `since` parameter for FetchClosedOrders.
-func (s *MongoStore) GetLatestOrderTimestamp(ctx context.Context, symbol string) (time.Time, error) {
+func (s *MongoStore) GetLatestOrderTimestamp(ctx context.Context, exchange, symbol, botID string) (time.Time, error) {
 	collection := s.database.Collection(CollectionOrderHistory)
 	filter := bson.M{}
+	if exchange != "" {
+		filter["exchange"] = exchange
+	}
 	if symbol != "" {
 		filter["symbol"] = symbol
+	}
+	if botID != "" {
+		filter["botId"] = botID
 	}
 	opts := options.FindOne().SetSort(bson.D{{Key: "timestamp", Value: -1}})
 

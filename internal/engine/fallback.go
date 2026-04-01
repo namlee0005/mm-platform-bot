@@ -114,51 +114,59 @@ func (e *Engine) orderHistorySyncLoop(ctx context.Context) {
 	defer ticker.Stop()
 
 	// Get latest order timestamp from MongoDB as starting point
-	lastSync, err := e.mongo.GetLatestOrderTimestamp(ctx, e.cfg.Symbol)
+	lastSync, err := e.mongo.GetLatestOrderTimestamp(ctx, e.cfg.Exchange, e.cfg.Symbol, e.cfg.BotID)
 	if err != nil {
-		lastSync = time.Now().Add(-24 * time.Hour) // fallback: look back 24h
-		log.Printf("[ENGINE] No previous orders in DB, syncing from %v", lastSync.Format("15:04:05"))
+		lastSync = time.Now().Add(-30 * 24 * time.Hour) // fallback: look back 30 days
+		log.Printf("[ENGINE] No previous orders in DB, syncing from %v", lastSync.Format("2006-01-02"))
 	} else {
-		log.Printf("[ENGINE] Order history sync starting from %v", lastSync.Format("15:04:05"))
+		log.Printf("[ENGINE] Order history sync starting from %v", lastSync.Format("2006-01-02 15:04:05"))
 	}
 
 	for {
+		e.syncOrderHistory(ctx, &lastSync)
+
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			orders, err := e.exch.FetchClosedOrders(ctx, e.cfg.Symbol, lastSync, 50)
-			if err != nil {
-				log.Printf("[ENGINE] Order history sync error: %v", err)
-				continue
-			}
+		}
+	}
+}
 
-			saved := 0
-			for _, o := range orders {
-				if err := e.mongo.InsertFilledOrder(ctx, &types.OrderEvent{
-					OrderID:            o.OrderID,
-					ClientOrderID:      o.ClientOrderID,
-					Symbol:             o.Symbol,
-					Side:               o.Side,
-					Status:             o.Status,
-					Price:              o.Price,
-					Quantity:           o.Quantity,
-					ExecutedQty:        o.ExecutedQty,
-					CumulativeQuoteQty: o.CumulativeQuoteQty,
-					Timestamp:          o.Timestamp,
-				}); err != nil {
-					log.Printf("[ENGINE] Failed to save filled order %s: %v", o.OrderID, err)
-				} else {
-					saved++
-					if o.Timestamp.After(lastSync) {
-						lastSync = o.Timestamp
-					}
-				}
-			}
+// syncOrderHistory fetches closed orders from exchange and saves to MongoDB.
+func (e *Engine) syncOrderHistory(ctx context.Context, lastSync *time.Time) {
+	orders, err := e.exch.FetchClosedOrders(ctx, e.cfg.Symbol, *lastSync, 0)
+	if err != nil {
+		log.Printf("[ENGINE] Order history sync error: %v", err)
+		return
+	}
 
-			if saved > 0 {
-				log.Printf("[ENGINE] Synced %d filled orders to DB", saved)
+	saved := 0
+	for _, o := range orders {
+		if err := e.mongo.InsertFilledOrder(ctx, &types.OrderEvent{
+			OrderID:            o.OrderID,
+			ClientOrderID:      o.ClientOrderID,
+			Symbol:             o.Symbol,
+			Side:               o.Side,
+			Status:             o.Status,
+			Price:              o.Price,
+			Quantity:           o.Quantity,
+			ExecutedQty:        o.ExecutedQty,
+			CumulativeQuoteQty: o.CumulativeQuoteQty,
+			Timestamp:          o.Timestamp,
+			BotID:              e.cfg.BotID,
+			Exchange:           e.cfg.Exchange,
+		}); err != nil {
+			log.Printf("[ENGINE] Failed to save filled order %s: %v", o.OrderID, err)
+		} else {
+			saved++
+			if o.Timestamp.After(*lastSync) {
+				*lastSync = o.Timestamp
 			}
 		}
+	}
+
+	if saved > 0 {
+		log.Printf("[ENGINE] Synced %d filled orders to DB", saved)
 	}
 }
