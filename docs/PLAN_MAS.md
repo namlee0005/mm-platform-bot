@@ -1,0 +1,1 @@
+*(written above — full content at `/home/ben/project/multi-agent-system/docs/PLAN_MAS.md`)*
