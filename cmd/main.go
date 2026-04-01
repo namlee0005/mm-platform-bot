@@ -48,7 +48,9 @@ func main() {
 	if logDir == "" {
 		logDir = "logs"
 	}
-	if logDir != "none" {
+	if logDir == "none" {
+		log.Println("Log output: stdout only (LOG_DIR=none)")
+	} else {
 		if err := os.MkdirAll(logDir, 0755); err != nil {
 			log.Fatalf("Failed to create log directory: %v", err)
 		}

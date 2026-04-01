@@ -9,7 +9,7 @@ COPY mm-bot .
 
 # Disable file logging by default in container (stdout captured by K8s)
 # Override with LOG_DIR=/data/logs + volume mount if needed
-ENV LOG_DIR=none
+ENV LOG_DIR=/data/logs
 
 EXPOSE 8080
 CMD ["./mm-bot"]
