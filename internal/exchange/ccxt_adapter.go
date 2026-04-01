@@ -44,6 +44,9 @@ type CCXTAdapter struct {
 	wsRunning bool
 	wsMu      sync.RWMutex
 
+	// Global CCXT lock to prevent internal map race conditions in go-ccxt
+	ccxtLock sync.Mutex
+
 	// Order state dedup: track status + filledQty per orderID.
 	// Only emit OnOrderUpdate/OnFill when state actually changes.
 	orderStateMu    sync.Mutex
@@ -726,7 +729,9 @@ func (c *CCXTAdapter) watchOrders() {
 					time.Sleep(time.Second)
 				}
 			}()
+			c.ccxtLock.Lock()
 			orders, err := c.wsOrders.WatchOrders(ccxt.WithWatchOrdersSymbol(c.symbol))
+			c.ccxtLock.Unlock()
 			if err != nil {
 				log.Printf("[CCXT:%s] WatchOrders error: %v", c.exchangeName, err)
 				if c.handlers.OnError != nil {
@@ -808,7 +813,9 @@ func (c *CCXTAdapter) watchMyTrades() {
 				}
 			}()
 
+			c.ccxtLock.Lock()
 			trades, err := c.wsTrades.WatchMyTrades(ccxt.WithWatchMyTradesSymbol(c.symbol))
+			c.ccxtLock.Unlock()
 			if err != nil {
 				log.Printf("[CCXT:%s] WatchMyTrades error: %v", c.exchangeName, err)
 				if c.handlers.OnError != nil {
@@ -1055,6 +1062,7 @@ func (c *CCXTAdapter) PlaceOrderWs(ctx context.Context, order *OrderRequest) (*O
 				"timeInForce": order.TimeInForce,
 			}))
 		}
+		c.ccxtLock.Lock()
 		result, err = c.ws.CreateOrderWs(
 			ccxtSymbol,
 			"limit",
@@ -1063,6 +1071,7 @@ func (c *CCXTAdapter) PlaceOrderWs(ctx context.Context, order *OrderRequest) (*O
 			opts...,
 		)
 	} else {
+		c.ccxtLock.Lock()
 		result, err = c.ws.CreateOrderWs(
 			ccxtSymbol,
 			"market",
@@ -1131,6 +1140,7 @@ func (c *CCXTAdapter) EditOrderWs(ctx context.Context, orderID, symbol string, n
 
 // CancelOrderWs cancels an order via WebSocket.
 func (c *CCXTAdapter) CancelOrderWs(ctx context.Context, symbol, orderID string) error {
+	c.ccxtLock.Lock()
 	_, err := c.ws.CancelOrderWs(
 		orderID,
 		ccxt.WithCancelOrderWsSymbol(convertToCCXTSymbol(symbol)),
