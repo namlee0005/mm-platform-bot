@@ -30,7 +30,9 @@ type cachedOrderState struct {
 // Uses ccxt for REST API and ccxtpro for WebSocket
 type CCXTAdapter struct {
 	rest         ccxt.IExchange    // REST API client
-	ws           ccxtpro.IExchange // Single WS client for WatchOrders + trading
+	ws           ccxtpro.IExchange // WS client for creating/canceling orders
+	wsOrders     ccxtpro.IExchange // Dedicated WS client for WatchOrders
+	wsTrades     ccxtpro.IExchange // Dedicated WS client for WatchMyTrades
 	exchangeName string
 	symbol       string // CCXT format: BASE/QUOTE
 	nativeSymbol string // Exchange format: BASEQUOTE
@@ -75,46 +77,61 @@ func NewCCXTExchange(exchangeName, apiKey, secret, symbol string, sandbox bool) 
 	case "bybit":
 		rest = ccxt.NewBybit(nil)
 		ws = ccxtpro.NewBybit(nil)
+		wsOrders = ccxtpro.NewBybit(nil)
+		wsTrades = ccxtpro.NewBybit(nil)
 	case "binance":
 		rest = ccxt.NewBinance(nil)
 		ws = ccxtpro.NewBinance(nil)
+		wsOrders = ccxtpro.NewBinance(nil)
+		wsTrades = ccxtpro.NewBinance(nil)
 	case "okx":
 		rest = ccxt.NewOkx(nil)
 		ws = ccxtpro.NewOkx(nil)
+		wsOrders = ccxtpro.NewOkx(nil)
+		wsTrades = ccxtpro.NewOkx(nil)
 	case "gate", "gateio":
 		rest = ccxt.NewGate(nil)
 		ws = ccxtpro.NewGate(nil)
+		wsOrders = ccxtpro.NewGate(nil)
+		wsTrades = ccxtpro.NewGate(nil)
 	case "kucoin":
 		rest = ccxt.NewKucoin(nil)
 		ws = ccxtpro.NewKucoin(nil)
+		wsOrders = ccxtpro.NewKucoin(nil)
+		wsTrades = ccxtpro.NewKucoin(nil)
 	case "mexc":
 		rest = ccxt.NewMexc(nil)
 		ws = ccxtpro.NewMexc(nil)
+		wsOrders = ccxtpro.NewMexc(nil)
+		wsTrades = ccxtpro.NewMexc(nil)
 	case "htx", "huobi":
 		rest = ccxt.NewHtx(nil)
 		ws = ccxtpro.NewHtx(nil)
+		wsOrders = ccxtpro.NewHtx(nil)
+		wsTrades = ccxtpro.NewHtx(nil)
 	case "bitget":
 		rest = ccxt.NewBitget(nil)
 		ws = ccxtpro.NewBitget(nil)
+		wsOrders = ccxtpro.NewBitget(nil)
+		wsTrades = ccxtpro.NewBitget(nil)
 	default:
 		return nil, fmt.Errorf("unsupported exchange: %s", exchangeName)
 	}
 
 	// Set credentials
-	rest.SetApiKey(apiKey)
-	rest.SetSecret(secret)
-	ws.SetApiKey(apiKey)
-	ws.SetSecret(secret)
-
-	// Set sandbox mode if needed
-	if sandbox {
-		rest.SetSandboxMode(true)
-		ws.SetSandboxMode(true)
+	for _, client := range []ccxt.IExchange{rest, ws, wsOrders, wsTrades} {
+		client.SetApiKey(apiKey)
+		client.SetSecret(secret)
+		if sandbox {
+			client.SetSandboxMode(true)
+		}
 	}
 
 	adapter := &CCXTAdapter{
 		rest:         rest,
 		ws:           ws,
+		wsOrders:     wsOrders,
+		wsTrades:     wsTrades,
 		exchangeName: exName,
 		symbol:       ccxtSymbol,
 		nativeSymbol: symbol,
@@ -678,6 +695,8 @@ func (c *CCXTAdapter) SubscribeUserStream(ctx context.Context, handlers UserStre
 
 	// Load markets for WS client
 	c.ws.LoadMarkets()
+	c.wsOrders.LoadMarkets()
+	c.wsTrades.LoadMarkets()
 
 	// WatchOrders via WS for order status updates
 	go c.watchOrders()
@@ -707,7 +726,7 @@ func (c *CCXTAdapter) watchOrders() {
 					time.Sleep(time.Second)
 				}
 			}()
-			orders, err := c.ws.WatchOrders(ccxt.WithWatchOrdersSymbol(c.symbol))
+			orders, err := c.wsOrders.WatchOrders(ccxt.WithWatchOrdersSymbol(c.symbol))
 			if err != nil {
 				log.Printf("[CCXT:%s] WatchOrders error: %v", c.exchangeName, err)
 				if c.handlers.OnError != nil {
@@ -789,7 +808,7 @@ func (c *CCXTAdapter) watchMyTrades() {
 				}
 			}()
 
-			trades, err := c.ws.WatchMyTrades(ccxt.WithWatchMyTradesSymbol(c.symbol))
+			trades, err := c.wsTrades.WatchMyTrades(ccxt.WithWatchMyTradesSymbol(c.symbol))
 			if err != nil {
 				log.Printf("[CCXT:%s] WatchMyTrades error: %v", c.exchangeName, err)
 				if c.handlers.OnError != nil {

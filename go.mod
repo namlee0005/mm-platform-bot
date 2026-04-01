@@ -1,15 +1,17 @@
 module mm-platform-engine
 
-go 1.25
+go 1.24.0
+
+toolchain go1.24.13
 
 require (
 	github.com/ccxt/ccxt/go/v4 v4.5.44
-	github.com/gorilla/websocket v1.5.1
 	github.com/joho/godotenv v1.5.1
+	github.com/prometheus/client_golang v1.23.2
 	github.com/redis/go-redis/v9 v9.3.0
+	github.com/shopspring/decimal v1.4.0
 	go.mongodb.org/mongo-driver v1.13.1
 	golang.org/x/crypto v0.45.0
-	google.golang.org/protobuf v1.36.11
 )
 
 require (
@@ -27,12 +29,12 @@ require (
 	github.com/ethereum/go-ethereum v1.17.0 // indirect
 	github.com/golang/snappy v1.0.0 // indirect
 	github.com/google/uuid v1.6.0 // indirect
+	github.com/gorilla/websocket v1.5.1 // indirect
 	github.com/holiman/uint256 v1.3.2 // indirect
 	github.com/klauspost/compress v1.18.0 // indirect
 	github.com/mitchellh/mapstructure v1.4.1 // indirect
 	github.com/montanaflynn/stats v0.0.0-20171201202039-1bf9dbcd8cbe // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
-	github.com/prometheus/client_golang v1.23.2 // indirect
 	github.com/prometheus/client_model v0.6.2 // indirect
 	github.com/prometheus/common v0.66.1 // indirect
 	github.com/prometheus/procfs v0.16.1 // indirect
@@ -48,4 +50,5 @@ require (
 	golang.org/x/sync v0.18.0 // indirect
 	golang.org/x/sys v0.39.0 // indirect
 	golang.org/x/text v0.31.0 // indirect
+	google.golang.org/protobuf v1.36.11 // indirect
 )
