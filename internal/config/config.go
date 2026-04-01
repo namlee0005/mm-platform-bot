@@ -145,15 +145,11 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("failed to decrypt API key: %w", err)
 	}
 
-	log.Printf("apiKey: %s\n", apiKey)
-
 	// Step 3: Decrypt API secret using user secret
 	apiSecret, err := DecryptPrivateKey(userExchangeKey.APISecret, userSecret)
 	if err != nil {
 		return nil, fmt.Errorf("failed to decrypt API secret: %w", err)
 	}
-
-	log.Printf("apiSecret: %s\n", apiSecret)
 
 	log.Printf("REDIS_ADDR: %s\n", getEnv("REDIS_ADDR", "array"))
 

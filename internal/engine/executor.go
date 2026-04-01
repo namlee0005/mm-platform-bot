@@ -233,6 +233,7 @@ func (ex *Executor) placeOrderWs(ctx context.Context, wsExch exchange.WSOrderExc
 		Symbol:        ex.symbol,
 		Side:          desired.Side,
 		Type:          "LIMIT",
+		TimeInForce:   "GTX", // PostOnly: reject if would cross book (anti-self-trade)
 		Price:         desired.Price,
 		Quantity:      desired.Qty,
 		ClientOrderID: desired.Tag,
@@ -255,6 +256,7 @@ func (ex *Executor) placeOrderREST(ctx context.Context, desired *core.DesiredOrd
 		Symbol:        ex.symbol,
 		Side:          desired.Side,
 		Type:          "LIMIT",
+		TimeInForce:   "GTX", // PostOnly: reject if would cross book (anti-self-trade)
 		Price:         desired.Price,
 		Quantity:      desired.Qty,
 		ClientOrderID: desired.Tag,

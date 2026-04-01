@@ -128,18 +128,11 @@ func (b *Bot) handleFill(event *types.FillEvent) {
 		b.telegram.NotifyFill(event.Side, event.Price, event.Quantity, notional, isFull, event.OrderID)
 	}
 
-	// Set bot metadata before saving
+	// Publish to Redis
 	event.BotID = b.userExchangeKeyID
 	event.Exchange = b.cfg.ExchangeName
-
-	// Publish to Redis
 	if err := b.redis.PublishFill(b.ctx, event); err != nil {
 		log.Printf("Failed to publish fill: %v", err)
-	}
-
-	// Save to MongoDB
-	if err := b.mongo.SaveFill(b.ctx, event); err != nil {
-		log.Printf("Failed to save fill: %v", err)
 	}
 
 	// Check for completed grid deals (matched buy-sell pairs)

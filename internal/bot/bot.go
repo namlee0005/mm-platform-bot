@@ -245,21 +245,21 @@ func (b *Bot) loadFillHistory(ctx context.Context, windowMs int64) error {
 
 	log.Printf("Loading fill history for %s since %s...", symbol, sinceTime.Format("15:04:05"))
 
-	fills, err := b.mongo.GetFillsInWindow(ctx, symbol, sinceTime)
+	orders, err := b.mongo.GetFillsInWindow(ctx, symbol, sinceTime)
 	if err != nil {
 		return fmt.Errorf("failed to get fills from MongoDB: %w", err)
 	}
 
 	// Add fills to metrics aggregator
-	for _, fill := range fills {
+	for _, o := range orders {
 		side := types.OrderSideBuy
-		if fill.Side == "SELL" {
+		if o.Side == "SELL" {
 			side = types.OrderSideSell
 		}
-		b.metricsAgg.RecordFill(side, fill.Price, fill.Quantity, fill.Timestamp.UnixMilli())
+		b.metricsAgg.RecordFill(side, o.Price, o.ExecutedQty, o.Timestamp.UnixMilli())
 	}
 
-	log.Printf("Loaded %d fills from history into metrics aggregator", len(fills))
+	log.Printf("Loaded %d fills from history into metrics aggregator", len(orders))
 	return nil
 }
 

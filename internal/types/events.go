@@ -33,17 +33,19 @@ type Balance struct {
 
 // OrderEvent represents an order state change event
 type OrderEvent struct {
-	OrderID            string    `json:"orderId"`
-	ClientOrderID      string    `json:"clientOrderId"`
-	Symbol             string    `json:"symbol"`
-	Side               string    `json:"side"`   // BUY or SELL
-	Type               string    `json:"type"`   // LIMIT, MARKET, etc
-	Status             string    `json:"status"` // NEW, FILLED, CANCELED, etc
-	Price              float64   `json:"price"`
-	Quantity           float64   `json:"quantity"`
-	ExecutedQty        float64   `json:"executedQty"`
-	CumulativeQuoteQty float64   `json:"cumulativeQuoteQty"`
-	Timestamp          time.Time `json:"timestamp"`
+	OrderID            string    `json:"orderId" bson:"orderId"`
+	ClientOrderID      string    `json:"clientOrderId" bson:"clientOrderId"`
+	Symbol             string    `json:"symbol" bson:"symbol"`
+	Side               string    `json:"side" bson:"side"`     // BUY or SELL
+	Type               string    `json:"type" bson:"type"`     // LIMIT, MARKET, etc
+	Status             string    `json:"status" bson:"status"` // NEW, FILLED, CANCELED, etc
+	Price              float64   `json:"price" bson:"price"`
+	Quantity           float64   `json:"quantity" bson:"quantity"`
+	ExecutedQty        float64   `json:"executedQty" bson:"executedQty"`
+	CumulativeQuoteQty float64   `json:"cumulativeQuoteQty" bson:"cumulativeQuoteQty"`
+	Timestamp          time.Time `json:"timestamp" bson:"timestamp"`
+	BotID              string    `json:"botId" bson:"botId"`
+	Exchange           string    `json:"exchange" bson:"exchange"`
 }
 
 // DealEvent represents a completed grid deal (matched buy-sell pair)

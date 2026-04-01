@@ -75,14 +75,15 @@ type TickOutput struct {
 
 // Snapshot is a point-in-time market data snapshot
 type Snapshot struct {
-	BestBid     float64
-	BestAsk     float64
-	Mid         float64
-	TickSize    float64
-	StepSize    float64
-	MinNotional float64
-	MaxOrderQty float64 // Maximum quantity per single order (exchange limit)
-	Timestamp   time.Time
+	BestBid       float64
+	BestAsk       float64
+	Mid           float64
+	TickSize      float64
+	StepSize      float64
+	MinNotional   float64
+	MaxOrderQty   float64 // Maximum quantity per single order (exchange limit)
+	MaxOpenOrders int     // Maximum total open orders allowed (0 = unlimited)
+	Timestamp     time.Time
 	// Full orderbook for sweep detection
 	Bids []PriceLevel // sorted best→worst
 	Asks []PriceLevel // sorted best→worst

@@ -3,9 +3,11 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -20,11 +22,9 @@ import (
 )
 
 func main() {
-	log.Println("========================================")
-	log.Println("    Unified Market Making Bot")
-	log.Println("========================================")
+	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds)
 
-	// Load config from MongoDB
+	// Load config from MongoDB first (needed for log file naming)
 	cfg, err := config.Load()
 	if err != nil {
 		log.Fatalf("Failed to load config: %v", err)
@@ -39,11 +39,41 @@ func main() {
 		botType = "simple-maker"
 	}
 
+	exchangeName := strings.ToLower(cfg.ExchangeName)
+
+	// Setup file logging: write to both stdout and log file
+	// LOG_DIR env controls where logs go (default: ./logs, set "none" to disable)
+	// File name format: <exchange>_<symbol>_<bottype>_<timestamp>.log
+	logDir := os.Getenv("LOG_DIR")
+	if logDir == "" {
+		logDir = "logs"
+	}
+	if logDir != "none" {
+		if err := os.MkdirAll(logDir, 0755); err != nil {
+			log.Fatalf("Failed to create log directory: %v", err)
+		}
+		safeSymbol := strings.ReplaceAll(cfg.TradingConfig.Symbol, "/", "-")
+		logFileName := filepath.Join(logDir, fmt.Sprintf("%s_%s_%s_%s.log",
+			exchangeName, safeSymbol, botType,
+			time.Now().Format("2006-01-02_15-04-05"),
+		))
+		logFile, err := os.OpenFile(logFileName, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+		if err != nil {
+			log.Fatalf("Failed to open log file: %v", err)
+		}
+		defer logFile.Close()
+		log.SetOutput(io.MultiWriter(os.Stdout, logFile))
+		log.Printf("Log file: %s", logFileName)
+	}
+
+	log.Println("========================================")
+	log.Println("    Unified Market Making Bot")
+	log.Println("========================================")
+
 	log.Printf("Loaded config for %s on %s, bot_type=%s",
 		cfg.TradingConfig.Symbol, cfg.ExchangeName, botType)
 
 	// Create exchange client using CCXT
-	exchangeName := strings.ToLower(cfg.ExchangeName)
 	sandbox := cfg.ExchangeBaseURL != "" && strings.Contains(cfg.ExchangeBaseURL, "testnet")
 
 	exch, err := exchange.NewCCXTExchange(

@@ -365,23 +365,6 @@ func (e *Engine) applyEvent(ctx context.Context, evt Event) {
 					Timestamp:     data.Timestamp,
 				})
 
-				// Persist fill to MongoDB
-				if e.mongo != nil {
-					if err := e.mongo.SaveFill(ctx, &types.FillEvent{
-						OrderID:       data.OrderID,
-						ClientOrderID: data.ClientOrderID,
-						Symbol:        data.Symbol,
-						Side:          data.Side,
-						Price:         data.Price,
-						Quantity:      fillDelta,
-						Timestamp:     data.Timestamp,
-						BotID:         e.cfg.BotID,
-						Exchange:      e.cfg.Exchange,
-					}); err != nil {
-						log.Printf("[ENGINE] SaveFill failed: %v", err)
-					}
-				}
-
 				// Telegram notification
 				if e.fillNotifier != nil {
 					notional := data.Price * fillDelta
@@ -478,6 +461,11 @@ func (e *Engine) executeRecalc(ctx context.Context) {
 		balance = &core.BalanceState{}
 	}
 
+	// Fetch public trades via REST for VWAP
+	if trades, err := e.exch.GetRecentTrades(ctx, e.cfg.Symbol, 100); err == nil {
+		e.state.SetRecentTrades(trades)
+	}
+
 	log.Printf("[ENGINE] DEBUG: Recalc input — mid=%.8f bid=%.8f ask=%.8f orders=%d trades=%d mode=%s",
 		snap.Mid, snap.BestBid, snap.BestAsk, len(liveOrders), len(e.state.recentTrades), e.state.mode)
 
@@ -528,11 +516,10 @@ func (e *Engine) executeRecalc(ctx context.Context) {
 	// Update strategy's prev snapshot
 	e.strategy.UpdatePrevSnapshot(liveOrders, balance)
 
-	// Only sync orders to Redis when orders actually changed
+	// Sync orders to Redis after execute — use fresh tracker state, not stale snapshot
 	if output.Action != core.TickActionKeep {
-		ordersCopy := make([]core.LiveOrder, len(liveOrders))
-		copy(ordersCopy, liveOrders)
-		go e.syncOrdersToRedis(ctx, ordersCopy)
+		freshOrders := e.state.GetLiveOrders()
+		go e.syncOrdersToRedis(ctx, freshOrders)
 	}
 }
 
@@ -767,6 +754,14 @@ func (e *Engine) reconcileFromREST(ctx context.Context) {
 		if wsBefore != restCount {
 			log.Printf("[RECONCILE] Order count drift: WS=%d REST=%d — corrected (likely missed fill)", wsBefore, restCount)
 			drifted = true
+
+			// Detect exchange max open orders limit:
+			// If WS thinks we have more orders than REST consistently shows,
+			// the exchange likely has a max open orders cap we're exceeding.
+			//if wsBefore > restCount && restCount > 0 && e.state.maxOpenOrders == 0 {
+			//	log.Printf("[RECONCILE] ⚠️  Detected exchange max open orders limit: %d (was placing %d). Capping future orders.", restCount, wsBefore)
+			//	e.state.maxOpenOrders = restCount
+			//}
 		}
 	}
 
@@ -774,6 +769,9 @@ func (e *Engine) reconcileFromREST(ctx context.Context) {
 	e.refreshMarketData(ctx)
 
 	log.Printf("[RECONCILE] Synced balance + %d orders from REST (took %v)", e.state.OrderCount(), time.Since(start))
+
+	// Sync fresh order state to Redis after reconcile
+	go e.syncOrdersToRedis(ctx, e.state.GetLiveOrders())
 
 	// 4. If drift detected, trigger immediate recalc to replace missing orders
 	if drifted {

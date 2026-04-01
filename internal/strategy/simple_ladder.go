@@ -142,10 +142,6 @@ const (
 )
 
 // navSnapshot stores NAV at a point in time
-type navSnapshot struct {
-	timestamp time.Time
-	nav       float64
-}
 
 // NewSimpleLadderStrategy creates a new SimpleLadderStrategy
 func NewSimpleLadderStrategy(cfg *SimpleLadderConfig) *SimpleLadderStrategy {

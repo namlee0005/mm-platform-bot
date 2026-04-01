@@ -17,7 +17,6 @@ import (
 const (
 	CollectionOrderHistory = "order_history"
 	CollectionDeals        = "deals"
-	CollectionOrders       = "orders"
 )
 
 // MongoStore handles persisting data to MongoDB
@@ -43,34 +42,10 @@ func NewMongoStore(uri, database string) (*MongoStore, error) {
 
 	db := client.Database(database)
 
-	// Ensure unique index on orderId for order_history collection
-	orderHistoryCollection := db.Collection(CollectionOrderHistory)
-	indexModel := mongo.IndexModel{
-		Keys:    bson.D{{Key: "orderId", Value: 1}},
-		Options: options.Index().SetUnique(true),
-	}
-	if _, err := orderHistoryCollection.Indexes().CreateOne(ctx, indexModel); err != nil {
-		log.Printf("Warning: failed to create unique index on orderId: %v", err)
-		// Continue despite error - index might already exist
-	}
-
 	return &MongoStore{
 		client:   client,
 		database: db,
 	}, nil
-}
-
-// SaveFill saves a fill event to MongoDB.
-// Uses InsertOne to preserve all partial fills (not upsert which overwrites).
-// Each fill is a separate document — partial fills for the same orderId
-// are stored as individual records with different quantities.
-func (s *MongoStore) SaveFill(ctx context.Context, fill *types.FillEvent) error {
-	collection := s.database.Collection(CollectionOrderHistory)
-	_, err := collection.InsertOne(ctx, fill)
-	if err != nil {
-		return fmt.Errorf("failed to save fill: %w", err)
-	}
-	return nil
 }
 
 // SaveDeal saves a completed deal to MongoDB
@@ -83,16 +58,12 @@ func (s *MongoStore) SaveDeal(ctx context.Context, deal *types.DealEvent) error 
 	return nil
 }
 
-// UpsertFilledOrder saves or updates a filled order in MongoDB.
-// Uses orderId as unique key to avoid duplicates from repeated syncs.
-func (s *MongoStore) UpsertFilledOrder(ctx context.Context, order *types.OrderEvent) error {
-	collection := s.database.Collection(CollectionOrders)
-	filter := bson.M{"orderId": order.OrderID}
-	update := bson.M{"$set": order}
-	opts := options.Update().SetUpsert(true)
-	_, err := collection.UpdateOne(ctx, filter, update, opts)
+// InsertFilledOrder inserts a filled order into order_history.
+func (s *MongoStore) InsertFilledOrder(ctx context.Context, order *types.OrderEvent) error {
+	collection := s.database.Collection(CollectionOrderHistory)
+	_, err := collection.InsertOne(ctx, order)
 	if err != nil {
-		return fmt.Errorf("failed to upsert filled order: %w", err)
+		return fmt.Errorf("failed to insert filled order: %w", err)
 	}
 	return nil
 }
@@ -100,7 +71,7 @@ func (s *MongoStore) UpsertFilledOrder(ctx context.Context, order *types.OrderEv
 // GetLatestOrderTimestamp returns the timestamp of the most recent order in the orders collection.
 // Used to determine the `since` parameter for FetchClosedOrders.
 func (s *MongoStore) GetLatestOrderTimestamp(ctx context.Context, symbol string) (time.Time, error) {
-	collection := s.database.Collection(CollectionOrders)
+	collection := s.database.Collection(CollectionOrderHistory)
 	filter := bson.M{}
 	if symbol != "" {
 		filter["symbol"] = symbol
@@ -117,28 +88,8 @@ func (s *MongoStore) GetLatestOrderTimestamp(ctx context.Context, symbol string)
 	return result.Timestamp, nil
 }
 
-// GetRecentFills retrieves recent fills from MongoDB
-func (s *MongoStore) GetRecentFills(ctx context.Context, symbol string, limit int64) ([]*types.FillEvent, error) {
-	collection := s.database.Collection(CollectionOrderHistory)
-	filter := bson.M{"symbol": symbol}
-	opts := options.Find().SetSort(bson.D{{Key: "timestamp", Value: -1}}).SetLimit(limit)
-
-	cursor, err := collection.Find(ctx, filter, opts)
-	if err != nil {
-		return nil, fmt.Errorf("failed to query fills: %w", err)
-	}
-	defer cursor.Close(ctx)
-
-	var fills []*types.FillEvent
-	if err := cursor.All(ctx, &fills); err != nil {
-		return nil, fmt.Errorf("failed to decode fills: %w", err)
-	}
-
-	return fills, nil
-}
-
-// GetFillsInWindow retrieves fills within a time window (from sinceTime to now)
-func (s *MongoStore) GetFillsInWindow(ctx context.Context, symbol string, sinceTime time.Time) ([]*types.FillEvent, error) {
+// GetFillsInWindow retrieves filled orders within a time window (from sinceTime to now)
+func (s *MongoStore) GetFillsInWindow(ctx context.Context, symbol string, sinceTime time.Time) ([]*types.OrderEvent, error) {
 	collection := s.database.Collection(CollectionOrderHistory)
 	filter := bson.M{
 		"symbol": symbol,
@@ -154,12 +105,12 @@ func (s *MongoStore) GetFillsInWindow(ctx context.Context, symbol string, sinceT
 	}
 	defer cursor.Close(ctx)
 
-	var fills []*types.FillEvent
-	if err := cursor.All(ctx, &fills); err != nil {
-		return nil, fmt.Errorf("failed to decode fills: %w", err)
+	var orders []*types.OrderEvent
+	if err := cursor.All(ctx, &orders); err != nil {
+		return nil, fmt.Errorf("failed to decode orders: %w", err)
 	}
 
-	return fills, nil
+	return orders, nil
 }
 
 // Close closes the MongoDB connection

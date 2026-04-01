@@ -1,6 +1,8 @@
 package engine
 
 import (
+	"log"
+	"sort"
 	"time"
 
 	"mm-platform-engine/internal/core"
@@ -21,10 +23,11 @@ type EngineState struct {
 	lastTradePrice float64
 
 	// Market constraints (loaded once at startup via REST)
-	tickSize    float64
-	stepSize    float64
-	minNotional float64
-	maxOrderQty float64
+	tickSize      float64
+	stepSize      float64
+	minNotional   float64
+	maxOrderQty   float64
+	maxOpenOrders int // Detected max open orders (from exchange or reconcile drift)
 
 	// Balance (reuse existing tracker — mutexes are harmless, accessed single-threaded)
 	balanceTracker *core.BalanceTracker
@@ -95,16 +98,17 @@ func (s *EngineState) BuildSnapshot() *core.Snapshot {
 	}
 
 	return &core.Snapshot{
-		BestBid:     s.bestBid,
-		BestAsk:     s.bestAsk,
-		Mid:         mid,
-		TickSize:    s.tickSize,
-		StepSize:    s.stepSize,
-		MinNotional: s.minNotional,
-		MaxOrderQty: s.maxOrderQty,
-		Bids:        s.bids,
-		Asks:        s.asks,
-		Timestamp:   time.Now(),
+		BestBid:       s.bestBid,
+		BestAsk:       s.bestAsk,
+		Mid:           mid,
+		TickSize:      s.tickSize,
+		StepSize:      s.stepSize,
+		MinNotional:   s.minNotional,
+		MaxOrderQty:   s.maxOrderQty,
+		MaxOpenOrders: s.maxOpenOrders,
+		Bids:          s.bids,
+		Asks:          s.asks,
+		Timestamp:     time.Now(),
 	}
 }
 
@@ -140,6 +144,14 @@ func (s *EngineState) ApplyPublicTrade(data *PublicTradeData) {
 		s.recentTrades[len(s.recentTrades)-1] = trade
 	} else {
 		s.recentTrades = append(s.recentTrades, trade)
+	}
+}
+
+// SetRecentTrades replaces the buffer with trades fetched from REST API.
+func (s *EngineState) SetRecentTrades(trades []exchange.Trade) {
+	s.recentTrades = trades
+	if len(trades) > 0 {
+		s.lastTradePrice = trades[len(trades)-1].Price
 	}
 }
 
@@ -232,24 +244,60 @@ func (s *EngineState) UpdateFromRESTAccount(acct *exchange.Account) {
 }
 
 // SyncOrdersFromREST replaces order tracker state from REST GetOpenOrders.
+// Assigns LevelIndex by sorting orders by distance from mid per side (closest = L0).
+// This is robust regardless of whether the exchange returns clientOrderId.
 func (s *EngineState) SyncOrdersFromREST(orders []*exchange.Order) {
+	mid := (s.bestBid + s.bestAsk) / 2.0
+
 	s.orderTracker.Clear()
+
+	// Collect active orders by side
+	type orderWithRemaining struct {
+		order     *exchange.Order
+		remaining float64
+	}
+	var buys, sells []orderWithRemaining
 	for _, o := range orders {
 		remaining := o.Quantity - o.ExecutedQty
 		if remaining <= 0 {
 			continue
 		}
-		s.orderTracker.Add(&core.LiveOrder{
-			OrderID:       o.OrderID,
-			ClientOrderID: o.ClientOrderID,
-			Side:          o.Side,
-			Price:         o.Price,
-			Qty:           o.Quantity,
-			RemainingQty:  remaining,
-			LevelIndex:    parseLevelFromTag(o.ClientOrderID),
-			PlacedAt:      time.Now(), // REST doesn't return placement time
-		})
+		if o.Side == "BUY" {
+			buys = append(buys, orderWithRemaining{o, remaining})
+		} else {
+			sells = append(sells, orderWithRemaining{o, remaining})
+		}
 	}
+
+	// Sort by distance from mid: closest first = L0
+	sort.Slice(buys, func(i, j int) bool {
+		return buys[i].order.Price > buys[j].order.Price // highest bid = closest to mid
+	})
+	sort.Slice(sells, func(i, j int) bool {
+		return sells[i].order.Price < sells[j].order.Price // lowest ask = closest to mid
+	})
+
+	addOrders := func(side []orderWithRemaining) {
+		for i, ow := range side {
+			o := ow.order
+			log.Printf("[RECONCILE] Assign %s L%d: %.8f x %.1f (id=%s)",
+				o.Side, i, o.Price, ow.remaining, o.OrderID)
+			s.orderTracker.Add(&core.LiveOrder{
+				OrderID:       o.OrderID,
+				ClientOrderID: o.ClientOrderID,
+				Side:          o.Side,
+				Price:         o.Price,
+				Qty:           o.Quantity,
+				RemainingQty:  ow.remaining,
+				LevelIndex:    i,
+				PlacedAt:      time.Now(),
+			})
+		}
+	}
+
+	addOrders(buys)
+	addOrders(sells)
+	_ = mid // mid available for future use
 }
 
 // GetBalance returns current balance state.

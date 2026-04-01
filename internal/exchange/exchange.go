@@ -73,8 +73,9 @@ type Order struct {
 // OrderRequest represents a request to place an order
 type OrderRequest struct {
 	Symbol        string  `json:"symbol"`
-	Side          string  `json:"side"` // BUY or SELL
-	Type          string  `json:"type"` // LIMIT, MARKET
+	Side          string  `json:"side"`                  // BUY or SELL
+	Type          string  `json:"type"`                  // LIMIT, MARKET
+	TimeInForce   string  `json:"timeInForce,omitempty"` // GTC, GTX (PostOnly), IOC, FOK
 	Price         float64 `json:"price,omitempty"`
 	Quantity      float64 `json:"quantity"`
 	ClientOrderID string  `json:"clientOrderId,omitempty"`

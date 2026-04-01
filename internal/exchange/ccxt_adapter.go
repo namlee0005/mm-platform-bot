@@ -30,7 +30,7 @@ type cachedOrderState struct {
 // Uses ccxt for REST API and ccxtpro for WebSocket
 type CCXTAdapter struct {
 	rest         ccxt.IExchange    // REST API client
-	ws           ccxtpro.IExchange // WebSocket client (private: orders)
+	ws           ccxtpro.IExchange // Single WS client for WatchOrders + trading
 	exchangeName string
 	symbol       string // CCXT format: BASE/QUOTE
 	nativeSymbol string // Exchange format: BASEQUOTE
@@ -63,7 +63,7 @@ func NewCCXTExchange(exchangeName, apiKey, secret, symbol string, sandbox bool) 
 	ccxtSymbol := convertToCCXTSymbol(symbol)
 	exName := strings.ToLower(exchangeName)
 
-	// Create REST and WS clients
+	// REST + single WS client for both WatchOrders and trading.
 	var rest ccxt.IExchange
 	var ws ccxtpro.IExchange
 
@@ -363,12 +363,20 @@ func (c *CCXTAdapter) PlaceOrder(ctx context.Context, order *OrderRequest) (*Ord
 	var err error
 
 	if orderType == "limit" {
+		opts := []ccxt.CreateOrderOptions{
+			ccxt.WithCreateOrderPrice(order.Price),
+		}
+		if order.TimeInForce != "" {
+			opts = append(opts, ccxt.WithCreateOrderParams(map[string]interface{}{
+				"timeInForce": order.TimeInForce,
+			}))
+		}
 		result, err = c.rest.CreateOrder(
 			ccxtSymbol,
 			"limit",
 			side,
 			order.Quantity,
-			ccxt.WithCreateOrderPrice(order.Price),
+			opts...,
 		)
 	} else {
 		result, err = c.rest.CreateOrder(
@@ -502,7 +510,7 @@ func (c *CCXTAdapter) CancelAllOrders(ctx context.Context, symbol string) error 
 func (c *CCXTAdapter) GetOpenOrders(ctx context.Context, symbol string) ([]*Order, error) {
 	ccxtSymbol := convertToCCXTSymbol(symbol)
 
-	orders, err := c.rest.FetchOpenOrders(ccxt.WithFetchOpenOrdersSymbol(ccxtSymbol))
+	orders, err := c.rest.FetchOpenOrders(ccxt.WithFetchOpenOrdersSymbol(ccxtSymbol), ccxt.WithFetchOpenOrdersLimit(100))
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch open orders: %w", err)
 	}
@@ -624,10 +632,7 @@ func (c *CCXTAdapter) SubscribeUserStream(ctx context.Context, handlers UserStre
 	// Load markets for WS client
 	c.ws.LoadMarkets()
 
-	// Start WebSocket watchers in separate goroutines
-	// watchBalance and watchMyTrades removed: both share the same c.ws instance
-	// which causes fatal CCXT internal concurrent-map races. watchOrders handles
-	// fills via delta tracking; balance is fetched via REST in getBalanceState().
+	// WatchOrders via WS for real-time order/fill events
 	go c.watchOrders()
 
 	return nil
@@ -903,12 +908,20 @@ func (c *CCXTAdapter) PlaceOrderWs(ctx context.Context, order *OrderRequest) (*O
 	var err error
 
 	if orderType == "limit" {
+		opts := []ccxt.CreateOrderWsOptions{
+			ccxt.WithCreateOrderWsPrice(order.Price),
+		}
+		if order.TimeInForce != "" {
+			opts = append(opts, ccxt.WithCreateOrderWsParams(map[string]interface{}{
+				"timeInForce": order.TimeInForce,
+			}))
+		}
 		result, err = c.ws.CreateOrderWs(
 			ccxtSymbol,
 			"limit",
 			side,
 			order.Quantity,
-			ccxt.WithCreateOrderWsPrice(order.Price),
+			opts...,
 		)
 	} else {
 		result, err = c.ws.CreateOrderWs(
@@ -984,7 +997,6 @@ func (c *CCXTAdapter) CancelOrderWs(ctx context.Context, symbol, orderID string)
 		ccxt.WithCancelOrderWsSymbol(convertToCCXTSymbol(symbol)),
 	)
 	if err != nil {
-		// Order already filled/canceled — not an error
 		errStr := err.Error()
 		if strings.Contains(errStr, "OrderNotFound") || strings.Contains(errStr, "does not exist") {
 			log.Printf("[CCXT:%s] CancelOrderWs %s: order already gone (ignored)", c.exchangeName, orderID)

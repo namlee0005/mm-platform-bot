@@ -67,6 +67,11 @@ type SpikeMakerStrategy struct {
 	lastFillAt       time.Time
 }
 
+type navSnapshot struct {
+	timestamp time.Time
+	nav       float64
+}
+
 type SpikeMakerMode string
 
 const (

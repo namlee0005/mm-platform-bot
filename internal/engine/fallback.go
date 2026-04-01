@@ -135,7 +135,7 @@ func (e *Engine) orderHistorySyncLoop(ctx context.Context) {
 
 			saved := 0
 			for _, o := range orders {
-				if err := e.mongo.UpsertFilledOrder(ctx, &types.OrderEvent{
+				if err := e.mongo.InsertFilledOrder(ctx, &types.OrderEvent{
 					OrderID:            o.OrderID,
 					ClientOrderID:      o.ClientOrderID,
 					Symbol:             o.Symbol,

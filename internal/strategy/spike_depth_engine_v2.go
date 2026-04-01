@@ -5,6 +5,7 @@ import (
 	"log"
 	"math"
 	"math/rand"
+	"time"
 
 	"mm-platform-engine/internal/core"
 )
@@ -14,8 +15,8 @@ import (
 // ──────────────────────────────────────────────────────────────────────────────
 
 const (
-	// Step 6: v2 size weight base
-	v2SizeBase = 1.2
+	// Step 6: v2 size weight base (1.5 = L9/L0 ratio ~38x, thin inner / thick outer)
+	v2SizeBase = 1.3
 
 	// Step 9: ninja protection scaling (100bps = 0.01)
 	ninjaSpreadScale = 0.01
@@ -58,12 +59,21 @@ type SpikeDepthV2Params struct {
 	// Scaling
 	SizeMult float64 // drawdown/recovery multiplier
 
-	// Queue awareness (optional, 0 = not available)
-	QueuePositionRatio float64 // 0 = front, 1 = back
+	// V2.2: Pass live orders and snapshot for internal queue ratio calculation
+	LiveOrders   []core.LiveOrder
+	Snapshot     *core.Snapshot
+	SizeAheadMap map[string]float64 // OrderID -> SizeAhead
 
-	// V2: Ninja Protection — accumulated volumes in 30s window
-	AccBuyVol30s  float64
-	AccSellVol30s float64
+	// V2: VWAP Anchor — 0 means not available (fallback to simple mid)
+	VWAP float64
+
+	// V2: Ninja Protection — accumulated volumes & counts in 30s window
+	AccBuyVol30s    float64
+	AccSellVol30s   float64
+	AccBuyCount30s  int
+	AccSellCount30s int
+	AccBuyMicro30s  int // fills < $2.0
+	AccSellMicro30s int // fills < $2.0
 
 	// V2: Compliance Toggle — "capital" or "compliance"
 	ComplianceMode string
@@ -108,10 +118,14 @@ func generateSpikeAdaptiveOrdersV2(p SpikeDepthV2Params) SpikeDepthV2Result {
 		maxDist = safeMaxDist
 	}
 
-	// ── Step 1: Mid & Microprice ──
-	mid := (p.BestBid + p.BestAsk) / 2.0
+	// ── Step 1: VWAP Anchor & Microprice ──
+	simpleMid := (p.BestBid + p.BestAsk) / 2.0
+	mid := simpleMid
+	if p.VWAP > 0 {
+		mid = p.VWAP // Use VWAP as anchor when available (resists spoofed orderbooks)
+	}
 	totalTopSize := p.BestBidSize + p.BestAskSize
-	microprice := mid
+	microprice := simpleMid
 	if totalTopSize > 1e-9 {
 		microprice = (p.BestAsk*p.BestBidSize + p.BestBid*p.BestAskSize) / totalTopSize
 	}
@@ -164,7 +178,8 @@ func generateSpikeAdaptiveOrdersV2(p SpikeDepthV2Params) SpikeDepthV2Result {
 	}
 
 	// Deterministic jitter
-	rng := rand.New(rand.NewSource(int64(fairPrice * 1e8)))
+	seed := time.Now().Unix() / 10
+	rng := rand.New(rand.NewSource(seed))
 	for i := range distances {
 		jitter := 1.0 + (rng.Float64()*0.04 - 0.02)
 		distances[i] *= jitter
@@ -218,13 +233,64 @@ func generateSpikeAdaptiveOrdersV2(p SpikeDepthV2Params) SpikeDepthV2Result {
 		askDistances[i] = clamp(askDistances[i], spread, maxDist)
 	}
 
-	// ── Step 9: Ninja Protection (V2 NEW) ──
-	// Widen spread on side that's being nibbled by accumulated small fills
+	// ── Step 8b: Asymmetric Defense (Anti-Dump/Anti-Pump) ──
+	// Widen the vulnerable side during directional spikes.
+	// OFI handles normal flow; this catches fast directional moves where OFI lags.
+	if S > 1.0 {
+		if p.Ret > 0 {
+			// Price pumped: widen ASKS significantly to capture the move and avoid being picked off
+			multiplier := 1.0 + 1.5*S
+			for i := range askDistances {
+				askDistances[i] *= multiplier
+				askDistances[i] = clamp(askDistances[i], spread, maxDist)
+			}
+		} else if p.Ret < 0 {
+			// Price dumped: widen BIDS significantly to capture the bottom
+			multiplier := 1.0 + 1.5*S
+			for i := range bidDistances {
+				bidDistances[i] *= multiplier
+				bidDistances[i] = clamp(bidDistances[i], spread, maxDist)
+			}
+		}
+	}
+
+	// ── Step 9: Ninja Protection (V2.1: Count + Volume) ──
+	// Widen spread on side that's being nibbled by accumulated small fills or high frequency.
 	addSpreadBid := 0.0
 	addSpreadAsk := 0.0
 	if p.TotalDepth > 0 {
 		addSpreadAsk = (p.AccBuyVol30s / p.TotalDepth) * ninjaSpreadScale
 		addSpreadBid = (p.AccSellVol30s / p.TotalDepth) * ninjaSpreadScale
+	}
+
+	// NEW: Count-based penalty for "nibbling" (50bps = 0.005 per trade above threshold)
+	const (
+		countThreshold = 5
+		countPenalty   = 0.005 // 50bps
+		microThreshold = 3
+		microPenalty   = 0.003 // 30bps per micro-fill above threshold
+	)
+	if p.AccBuyCount30s > countThreshold {
+		penalty := float64(p.AccBuyCount30s-countThreshold) * countPenalty
+		addSpreadAsk += penalty
+		log.Printf("[NINJA] BUY Spread Penalty: %d trades (+%.1f bps)", p.AccBuyCount30s, penalty*10000)
+	}
+	if p.AccSellCount30s > countThreshold {
+		penalty := float64(p.AccSellCount30s-countThreshold) * countPenalty
+		addSpreadBid += penalty
+		log.Printf("[NINJA] SELL Spread Penalty: %d trades (+%.1f bps)", p.AccSellCount30s, penalty*10000)
+	}
+
+	// Micro-fill penalty (specific to sub-$2 fills)
+	if p.AccBuyMicro30s > microThreshold {
+		penalty := float64(p.AccBuyMicro30s-microThreshold) * microPenalty
+		addSpreadAsk += penalty
+		log.Printf("[NINJA] BUY Micro Penalty: %d fills (+%.1f bps)", p.AccBuyMicro30s, penalty*10000)
+	}
+	if p.AccSellMicro30s > microThreshold {
+		penalty := float64(p.AccSellMicro30s-microThreshold) * microPenalty
+		addSpreadBid += penalty
+		log.Printf("[NINJA] SELL Micro Penalty: %d fills (+%.1f bps)", p.AccSellMicro30s, penalty*10000)
 	}
 
 	// ── Step 10: Price generation (with Ninja spread) ──
@@ -255,15 +321,69 @@ func generateSpikeAdaptiveOrdersV2(p SpikeDepthV2Params) SpikeDepthV2Result {
 		}
 	}
 
-	// ── Step 11: Queue awareness ──
-	queuePriceImprove := 0.0
-	if p.QueuePositionRatio > 0.7 {
-		queuePriceImprove = p.TickSize * (1.0 + (p.QueuePositionRatio-0.7)*3.0)
-	}
-	if queuePriceImprove > 0 {
-		for i := 0; i < minInt(2, n); i++ {
-			bidPrices[i] = sdeRoundToTick(bidPrices[i]+queuePriceImprove, p.TickSize)
-			askPrices[i] = sdeRoundToTick(askPrices[i]-queuePriceImprove, p.TickSize)
+	// ── Step 11: Queue awareness (V2.2: Internal Lookup) ──
+	if p.Snapshot != nil {
+		for i := 0; i < n; i++ {
+			// BID Queue
+			bp := bidPrices[i]
+			var qRatioBuy float64
+			var orderIDBuy string
+			for _, lo := range p.LiveOrders {
+				if lo.Side == "BUY" && math.Abs(lo.Price-bp) < 1e-9 {
+					orderIDBuy = lo.OrderID
+					break
+				}
+			}
+			if orderIDBuy != "" {
+				sizeAhead := p.SizeAheadMap[orderIDBuy]
+				var totalLvl float64
+				for _, ent := range p.Snapshot.Bids {
+					if math.Abs(ent.Price-bp) < 1e-9 {
+						totalLvl = ent.Qty
+						break
+					}
+				}
+				if totalLvl > 0 {
+					qRatioBuy = sizeAhead / totalLvl
+				}
+			}
+
+			// ASK Queue
+			ap := askPrices[i]
+			var qRatioSell float64
+			var orderIDSell string
+			for _, lo := range p.LiveOrders {
+				if lo.Side == "SELL" && math.Abs(lo.Price-ap) < 1e-9 {
+					orderIDSell = lo.OrderID
+					break
+				}
+			}
+			if orderIDSell != "" {
+				sizeAhead := p.SizeAheadMap[orderIDSell]
+				var totalLvl float64
+				for _, ent := range p.Snapshot.Asks {
+					if math.Abs(ent.Price-ap) < 1e-9 {
+						totalLvl = ent.Qty
+						break
+					}
+				}
+				if totalLvl > 0 {
+					qRatioSell = sizeAhead / totalLvl
+				}
+			}
+
+			if qRatioBuy > 0.7 {
+				improve := p.TickSize * (1.0 + (qRatioBuy-0.7)*3.0)
+				oldPrice := bidPrices[i]
+				bidPrices[i] = sdeRoundToTick(bidPrices[i]+improve, p.TickSize)
+				log.Printf("[QUEUE] L%d BID Jump: ratio=%.2f, price %.8f -> %.8f (+%.1f ticks)", i, qRatioBuy, oldPrice, bidPrices[i], improve/p.TickSize)
+			}
+			if qRatioSell > 0.7 {
+				improve := p.TickSize * (1.0 + (qRatioSell-0.7)*3.0)
+				oldPrice := askPrices[i]
+				askPrices[i] = sdeRoundToTick(askPrices[i]-improve, p.TickSize)
+				log.Printf("[QUEUE] L%d ASK Jump: ratio=%.2f, price %.8f -> %.8f (-%.1f ticks)", i, qRatioSell, oldPrice, askPrices[i], improve/p.TickSize)
+			}
 		}
 	}
 
@@ -309,13 +429,16 @@ func generateSpikeAdaptiveOrdersV2(p SpikeDepthV2Params) SpikeDepthV2Result {
 		}
 		for i := range bidSizes {
 			bidSizes[i] *= sizeMultiplier
-			if bidSizes[i] > 0 && bidSizes[i] < p.MinNotional*1.1 {
-				bidSizes[i] = p.MinNotional * 1.1
-			}
+			// REMOVED floor: allow scaling to zero or sub-min size (result will be filtered in build loop)
+			// if bidSizes[i] > 0 && bidSizes[i] < p.MinNotional*1.1 {
+			// 	bidSizes[i] = p.MinNotional * 1.1
+			// }
+
 			askSizes[i] *= sizeMultiplier
-			if askSizes[i] > 0 && askSizes[i] < p.MinNotional*1.1 {
-				askSizes[i] = p.MinNotional * 1.1
-			}
+			// REMOVED floor: allow scaling to zero or sub-min size
+			// if askSizes[i] > 0 && askSizes[i] < p.MinNotional*1.1 {
+			// 	askSizes[i] = p.MinNotional * 1.1
+			// }
 		}
 	}
 
