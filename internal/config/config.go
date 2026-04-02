@@ -406,6 +406,10 @@ type SimpleConfig struct {
 	DrawdownLimitPct   float64 `json:"drawdown_limit_pct,omitempty" bson:"drawdown_limit_pct,omitempty"`
 	MaxFillsPerMin     float64 `json:"max_fills_per_min,omitempty" bson:"max_fills_per_min,omitempty"`
 	SkewK              float64 `json:"skew_k,omitempty" bson:"skew_k,omitempty"`
+
+	// MAS Strategy specific configuration (loaded from JSON field in Mongo)
+	MASConfig string `json:"mas_config,omitempty" bson:"mas_config,omitempty"`
+
 	MaxSkewBps         int     `json:"max_skew_bps,omitempty" bson:"max_skew_bps,omitempty"`
 	ImbalanceThreshold float64 `json:"imbalance_threshold,omitempty" bson:"imbalance_threshold,omitempty"`
 	TickIntervalMs     int     `json:"tick_interval_ms,omitempty" bson:"tick_interval_ms,omitempty"`
