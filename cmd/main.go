@@ -75,20 +75,36 @@ func main() {
 	log.Printf("Loaded config for %s on %s, bot_type=%s",
 		cfg.TradingConfig.Symbol, cfg.ExchangeName, botType)
 
-	// Create exchange client using CCXT
+	// Create exchange client — native adapter for Bybit, CCXT for everything else
 	sandbox := cfg.ExchangeBaseURL != "" && strings.Contains(cfg.ExchangeBaseURL, "testnet")
 
-	exch, err := exchange.NewCCXTExchange(
-		exchangeName,
-		cfg.ExchangeAPIKey,
-		cfg.ExchangeAPISecret,
-		cfg.TradingConfig.Symbol,
-		sandbox,
-	)
-	if err != nil {
-		log.Fatalf("Failed to create exchange client: %v", err)
+	var exch exchange.Exchange
+	if exchangeName == "bybit" {
+		nativeExch, nativeErr := exchange.NewBybitNativeExchange(
+			cfg.ExchangeAPIKey,
+			cfg.ExchangeAPISecret,
+			cfg.TradingConfig.Symbol,
+			sandbox,
+		)
+		if nativeErr != nil {
+			log.Fatalf("Failed to create Bybit native client: %v", nativeErr)
+		}
+		exch = nativeExch
+		log.Printf("Using NATIVE adapter for Bybit exchange (no CCXT)")
+	} else {
+		ccxtExch, ccxtErr := exchange.NewCCXTExchange(
+			exchangeName,
+			cfg.ExchangeAPIKey,
+			cfg.ExchangeAPISecret,
+			cfg.TradingConfig.Symbol,
+			sandbox,
+		)
+		if ccxtErr != nil {
+			log.Fatalf("Failed to create exchange client: %v", ccxtErr)
+		}
+		exch = ccxtExch
+		log.Printf("Using CCXT adapter for %s exchange", exchangeName)
 	}
-	log.Printf("Using CCXT adapter for %s exchange", exchangeName)
 
 	// Create Redis store
 	redis, err := store.NewRedisStore(cfg.RedisAddr, cfg.RedisPassword, cfg.RedisDB, cfg.Env)
