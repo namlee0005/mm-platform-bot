@@ -1,4 +1,4 @@
-package strategy
+package mas
 
 import (
 	"log/slog"
