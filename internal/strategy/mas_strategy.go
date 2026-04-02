@@ -92,16 +92,16 @@ func (s *MASStrategy) Tick(book OrderBook, trades []TradeEvent, now time.Time) T
 		s.ofi.Update(t.Side == Bid, t.Qty)
 	}
 
-	// --- 2. Compute fair value: micro-price + OFI adjustment ---
-	microPrice := ComputeMicroPrice(book.BestBid, book.BestAsk, book.BidQty, book.AskQty)
+	// --- 2. Compute fair value: EWMA Mid-Price + OFI adjustment ---
+	midPrice := book.BestBid.Add(book.BestAsk).Div(decimal.NewFromInt(2))
+	ewmaMid := s.midTracker.Update(midPrice, now)
 	ofiNorm := s.ofi.Normalized()
-	fairValue := ComputeFairValue(microPrice, ofiNorm, cfg.FairValue)
+	fairValue := ComputeFairValue(ewmaMid, ofiNorm, cfg.FairValue)
 
 	s.state.FairValue = fairValue
 	s.state.OFINormalized = ofiNorm
 
 	// Record mid-price for toxicity lookback.
-	midPrice := book.BestBid.Add(book.BestAsk).Div(decimal.NewFromInt(2))
 	s.priceHist.Add(PriceSnapshot{Mid: midPrice, Timestamp: now})
 
 	// --- 3. Update EWMA volatility and classify regime ---

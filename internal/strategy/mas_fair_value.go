@@ -7,16 +7,55 @@ import (
 	"github.com/shopspring/decimal"
 )
 
-// ComputeMicroPrice returns the quantity-weighted mid-price.
-// Formula: (bestAsk*bidQty + bestBid*askQty) / (bidQty + askQty)
-// Falls back to arithmetic mid when total qty is zero.
-func ComputeMicroPrice(bestBid, bestAsk, bidQty, askQty decimal.Decimal) decimal.Decimal {
-	totalQty := bidQty.Add(askQty)
-	if totalQty.IsZero() {
-		return bestBid.Add(bestAsk).Div(decimal.NewFromInt(2))
-	}
-	return bestAsk.Mul(bidQty).Add(bestBid.Mul(askQty)).Div(totalQty)
+// EWMAMidTracker maintains an Exponential Weighted Moving Average of the Mid-Price.
+// This is highly resistant to spoofing on low-liquidity books.
+type EWMAMidTracker struct {
+	mu           sync.Mutex
+	ewmaPrice    decimal.Decimal
+	lastUpdate   time.Time
+	halflife     time.Duration
+	isInitialized bool
 }
+
+func NewEWMAMidTracker(halflife time.Duration) *EWMAMidTracker {
+	return &EWMAMidTracker{
+		halflife: halflife,
+	}
+}
+
+// Update incorporates a new mid-price observation into the EWMA.
+func (t *EWMAMidTracker) Update(mid decimal.Decimal, now time.Time) decimal.Decimal {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if !t.isInitialized {
+		t.ewmaPrice = mid
+		t.lastUpdate = now
+		t.isInitialized = true
+		return t.ewmaPrice
+	}
+
+	dt := now.Sub(t.lastUpdate).Seconds()
+	if dt <= 0 {
+		return t.ewmaPrice
+	}
+
+	// lambda = ln(2) / halflife
+	halflifeSec := t.halflife.Seconds()
+	if halflifeSec <= 0 {
+		halflifeSec = 60.0 // fallback 60s
+	}
+	lambda := math.Ln2 / halflifeSec
+	weight := math.Exp(-lambda * dt)
+	decWeight := decimal.NewFromFloat(weight)
+	invWeight := decimal.NewFromInt(1).Sub(decWeight)
+
+	// EWMA_new = EWMA_old * weight + Mid_new * (1 - weight)
+	t.ewmaPrice = t.ewmaPrice.Mul(decWeight).Add(mid.Mul(invWeight))
+	t.lastUpdate = now
+	return t.ewmaPrice
+}
+
 
 // OFITracker accumulates order-flow imbalance from the trade tape.
 // Internal state is float64 (hot path). Normalized() is the only public exit

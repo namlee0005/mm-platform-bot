@@ -88,6 +88,7 @@ type HistoricalTick struct {
 // FairValueConfig controls fair-value computation parameters.
 type FairValueConfig struct {
 	OFIAlpha decimal.Decimal `yaml:"ofi_alpha"`
+	EWMAMidWindow time.Duration `yaml:"ewma_mid_window"`
 	TickSize decimal.Decimal `yaml:"tick_size"`
 }
 
