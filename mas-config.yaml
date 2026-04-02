@@ -1,0 +1,44 @@
+
+mas:
+  fair_value:
+    ofi_window: 10s
+    ofi_alpha: 3.0
+    ewma_mid_window: 60s
+    tick_size: 0.001
+  volatility:
+    vol_threshold: 0.0025
+    vol_exit_threshold: 0.0015
+    vol_window: 60s
+    base_spread_bps: 10
+    level_step_bps: 5
+    spike_near_spread_multiplier: 5.0
+    spike_near_size_ratio: 0.1
+    spike_deep_offset_bps: 150
+    spike_deep_size_ratio: 2.0
+  compliance:
+    target_depth_usd: 1000
+    fat_tail_boundary: 0.0195
+    enforce_in_spike: true
+  inventory:
+    max_inventory: 50000
+    max_skew_ticks: 5
+    emergency_cap: 60000
+    emergency_side_cancel: true
+  toxicity:
+    toxic_move_ticks: 3
+    toxic_detection_window: 8s
+    tier1_count: 2
+    tier1_pause: 15s
+    tier2_count: 4
+    tier2_pause: 45s
+    tier3_count: 6
+    tier3_pause: 120s
+    rolling_window: 300s
+  circuit_breaker:
+    max_loss_per_session: 100
+    max_drift_threshold: 5
+    drift_consecutive_limit: 3
+    stale_feed_timeout_ms: 5000
+  reconciler:
+    poll_interval: 5s
+    max_retries: 3
