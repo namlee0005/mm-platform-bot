@@ -171,8 +171,11 @@ func main() {
 	case "depth-filler":
 		eng = createDepthFillerEngine(cfg, exch, redis, mongo, exchangeName, botID)
 		log.Println("Mode: DEPTH-FILLER (event-driven)")
+	case "mas":
+		eng = createMASEngine(cfg, exch, redis, mongo, exchangeName, botID)
+		log.Println("Mode: MAS (Capital Preservation)")
 	default:
-		log.Fatalf("Invalid bot_type: %s (must be 'simple-maker', 'spike-maker', 'spike-maker-v2', or 'depth-filler')", botType)
+		log.Fatalf("Invalid bot_type: %s (must be 'simple-maker', 'spike-maker', 'spike-maker-v2', 'depth-filler', or 'mas')", botType)
 	}
 
 	eng.SetFillNotifier(telegram)
@@ -420,4 +423,25 @@ func createDepthFillerEngine(
 	}
 
 	return bot.NewDepthFillerEngine(fillerCfg, exch, redis, mongo)
+}
+
+func createMASEngine(
+	cfg *config.Config,
+	exch exchange.Exchange,
+	redis *store.RedisStore,
+	mongo *store.MongoStore,
+	exchangeName string,
+	botID string,
+) *engine.Engine {
+	// For now, load default config. In a real scenario, this would come from a YAML unmarshal
+	// mapping to strategy.MASConfig
+	
+	// Create strategy
+	// strat := strategy.NewMASStrategy(masCfg)
+	
+	// Create engine
+	// engineCfg := engine.Config{ ... }
+	// return engine.NewEngine(engineCfg, strat, exch, executor, redis, mongo)
+	log.Fatalf("MAS Engine Factory not yet fully implemented in bot package")
+	return nil
 }
