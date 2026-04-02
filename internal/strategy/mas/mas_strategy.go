@@ -136,7 +136,7 @@ func (s *MASStrategy) Tick(book OrderBook, trades []TradeEvent, now time.Time) T
 	orders = ApplyInventorySkew(orders, s.state.InventoryRatio, cfg.Inventory, cfg.FairValue.TickSize)
 
 	// --- 7. Compliance fat-tail: force L9 to exactly 1.95% from mid ---
-	orders = s.applyComplianceFatTail(orders, midPrice)
+	orders = s.applyComplianceFatTail(orders, midPrice, cfg, s.state.Regime)
 
 	// --- 8. Toxicity pauses: remove paused side except L9 anchor ---
 	bidPaused := s.toxicity.IsPaused(Bid)
@@ -244,13 +244,19 @@ func (s *MASStrategy) buildSpikeQuotes(fairValue decimal.Decimal, cfg *MASConfig
 }
 
 // applyComplianceFatTail overrides L9 bid/ask to sit exactly at
-// ComplianceFatTailPct (default 1.95%) from mid-price.
+// ComplianceFatTailPct (default 1.95%) from mid-price during normal regimes.
+// If EnforceInSpike is false and we are in a Spike, it pushes L9 out to 5% (safety net).
 // L9 is the compliance anchor and survives toxicity pauses.
 // Only the circuit breaker or emergency cap may remove it.
-func (s *MASStrategy) applyComplianceFatTail(orders []Order, midPrice decimal.Decimal) []Order {
+func (s *MASStrategy) applyComplianceFatTail(orders []Order, midPrice decimal.Decimal, cfg *MASConfig, regime VolatilityRegime) []Order {
 	pct := s.quoteCfg.ComplianceFatTailPct
 	if pct.IsZero() {
 		pct = decimal.NewFromFloat(0.0195)
+	}
+
+	// If in spike and we don't enforce compliance, throw L9 way out of bounds (e.g., 5%) to avoid getting filled
+	if regime == RegimeSpike && !cfg.Compliance.EnforceInSpike {
+		pct = decimal.NewFromFloat(0.05) // Push out to 5%
 	}
 
 	offset := midPrice.Mul(pct)
