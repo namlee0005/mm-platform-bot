@@ -101,10 +101,17 @@ type VolatilityConfig struct {
 }
 
 // InventoryConfig controls position sizing and skew behaviour.
+// Caps are expressed as fractions of the initial base-asset balance, making
+// the strategy portable across tokens with different notional scales.
+// Example: MaxInventoryPct=0.5 on a 100-unit balance → max position = 50 units.
 type InventoryConfig struct {
-	MaxInventory decimal.Decimal `yaml:"max_inventory"`
-	EmergencyCap decimal.Decimal `yaml:"emergency_cap"`
-	MaxSkewTicks int             `yaml:"max_skew_ticks"`
+	// MaxInventoryPct: max net position as a fraction of initial balance [0, 1].
+	MaxInventoryPct decimal.Decimal `yaml:"max_inventory_pct"`
+	// EmergencyCapPct: hard-stop position as a fraction of initial balance [0, 1].
+	// Must be ≥ MaxInventoryPct. Only active when EmergencySideCancel=true.
+	EmergencyCapPct     decimal.Decimal `yaml:"emergency_cap_pct"`
+	EmergencySideCancel bool            `yaml:"emergency_side_cancel"`
+	MaxSkewTicks        int             `yaml:"max_skew_ticks"`
 }
 
 // ToxicityConfig controls adverse-selection detection and pause tiers.
@@ -156,6 +163,22 @@ type MASState struct {
 	SessionLoss       decimal.Decimal
 	LastFeedTimestamp time.Time
 	CBTripCondition   string
+}
+
+// Order is a single resting quote sent to the exchange.
+type Order struct {
+	Side  Side
+	Level DepthLevel
+	Price decimal.Decimal
+	Size  decimal.Decimal
+}
+
+// TradeEvent is a single aggressor trade from the live tape, used for OFI ingestion.
+type TradeEvent struct {
+	Side      Side
+	Qty       decimal.Decimal
+	Price     decimal.Decimal
+	Timestamp time.Time
 }
 
 // PriceAtLevel returns the absolute price for a quote at the given depth level.

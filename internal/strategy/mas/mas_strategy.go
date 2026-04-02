@@ -31,7 +31,9 @@ type TickOutput struct {
 // Strategy is the interface the execution layer calls each tick.
 type Strategy interface {
 	Name() string
-	Init(cfg *MASConfig, quoteCfg *QuoteConfig) error
+	// Init wires config and sets the initial base-asset balance used for
+	// percentage-based inventory caps (MaxInventoryPct, EmergencyCapPct).
+	Init(cfg *MASConfig, quoteCfg *QuoteConfig, initialBalance decimal.Decimal) error
 	Tick(book OrderBook, trades []TradeEvent, now time.Time) TickOutput
 	OnFill(fill Fill)
 	OnOrderUpdate(orderID string, status string)
@@ -41,13 +43,15 @@ type Strategy interface {
 // MASStrategy is the capital-preservation market-making strategy.
 // Single-goroutine tick pipeline: no concurrent field access during Tick.
 type MASStrategy struct {
-	state     MASState
-	ofi       OFITracker
-	vol       *VolatilityTracker
-	toxicity  ToxicityPauseManager
-	priceHist *PriceHistory
-	quoteCfg  QuoteConfig
-	logger    *slog.Logger
+	state          MASState
+	ofi            OFITracker
+	midTracker     *EWMAMidTracker
+	vol            *VolatilityTracker
+	toxicity       ToxicityPauseManager
+	priceHist      *PriceHistory
+	quoteCfg       QuoteConfig
+	initialBalance decimal.Decimal
+	logger         *slog.Logger
 }
 
 // Compile-time interface check.
@@ -64,15 +68,19 @@ func NewMASStrategy(logger *slog.Logger) *MASStrategy {
 func (s *MASStrategy) Name() string { return "MAS-CapitalPreservation" }
 
 // Init wires config, creates sub-components, resets state.
-func (s *MASStrategy) Init(cfg *MASConfig, quoteCfg *QuoteConfig) error {
+// initialBalance is the base-asset balance at session start; used for
+// percentage-based inventory caps (MaxInventoryPct, EmergencyCapPct).
+func (s *MASStrategy) Init(cfg *MASConfig, quoteCfg *QuoteConfig, initialBalance decimal.Decimal) error {
 	MASConfigPtr.Store(cfg)
 	s.quoteCfg = *quoteCfg
+	s.initialBalance = initialBalance
+	s.midTracker = NewEWMAMidTracker(cfg.FairValue.EWMAMidWindow)
 	s.vol = NewVolatilityTracker(cfg.Volatility.EWMAHalflifeSeconds)
 	s.priceHist = NewPriceHistory(4096)
 	s.ofi.Reset()
 	s.toxicity.Reset()
 	s.state = MASState{
-		Regime:           RegimeSideways,
+		Regime:            RegimeSideways,
 		LastFeedTimestamp: time.Now(),
 	}
 	return nil
@@ -113,7 +121,7 @@ func (s *MASStrategy) Tick(book OrderBook, trades []TradeEvent, now time.Time) T
 	s.state.Regime = ClassifyRegime(ewmaVol, s.state.Regime, cfg.Volatility)
 
 	// --- 4. Inventory ratio for skew ---
-	s.state.InventoryRatio = ComputeInventoryRatio(s.state.NetPosition, cfg.Inventory)
+	s.state.InventoryRatio = ComputeInventoryRatio(s.state.NetPosition, cfg.Inventory, s.initialBalance)
 
 	// --- 5. Generate L0-L9 quotes based on regime ---
 	var orders []Order
@@ -146,7 +154,7 @@ func (s *MASStrategy) Tick(book OrderBook, trades []TradeEvent, now time.Time) T
 	}
 
 	// --- 9. Emergency hard caps: removes ALL including L9 ---
-	cancelBids, cancelAsks := CheckEmergencyCap(s.state.NetPosition, cfg.Inventory)
+	cancelBids, cancelAsks := CheckEmergencyCap(s.state.NetPosition, cfg.Inventory, s.initialBalance)
 	if cancelBids {
 		orders = removeSide(orders, Bid)
 	}
